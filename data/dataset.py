@@ -23,7 +23,7 @@ class RetinalVesselDataset(Dataset):
         'DRIVE': {
             'image_dir': 'images',
             'mask_dir': 'mask',
-            'vessel_dir': '1st_manual',  # or '2nd_manual'
+            'vessel_dir': '1st_manual',
             'image_ext': '.tif',
             'mask_ext': '_mask.gif',
             'vessel_ext': '.gif'

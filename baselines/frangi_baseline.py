@@ -6,7 +6,7 @@ from scipy import ndimage
 from skimage import filters, morphology
 from skimage.morphology import skeletonize, remove_small_objects
 from typing import Tuple, Dict, Optional
-from preprocessing.fundus_preprocessor import FundusPreprocessor
+from data.fundus_preprocessor import FundusPreprocessor
 
 class FrangiBaseline:
     """
