@@ -1,0 +1,45 @@
+# --- Python Bytecode & Cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# --- Environments & Dependencies ---
+.venv/
+venv/
+env/
+.env
+bin/
+lib/
+develop-eggs/
+dist/
+eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+
+# --- IDE & Editor Settings ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# --- Project Specific: Data & Results ---
+# It is best practice to keep large datasets out of Git
+data/
+results/
+logs/
+
+# Optional: If you want to keep the folder structure but not the files:
+# !data/.gitkeep
+# !results/.gitkeep
+
+# --- OS specific files ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
