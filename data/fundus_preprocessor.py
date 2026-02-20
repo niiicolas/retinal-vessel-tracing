@@ -8,17 +8,22 @@ class FundusPreprocessor:
     Preprocessing pipeline for blood vessel centerline extraction:
     1. Green channel extraction
     2. Gamma Correction
-    3. CLAHE
+    3. Median Blur (Denoising)
     4. FOV mask (external or internally created)
+    5. Apply mask BEFORE CLAHE → prevents FOV border being detected as vessel
+    6. CLAHE + ROI-based normalization to 0-1
     """
 
-    def __init__(self, clahe_clip_limit: float = 2.5,
+    def __init__(self, 
+                 clahe_clip_limit: float = 2.5,
                  clahe_tile_size: int = 8,
-                 gamma: float = 0.8):
+                 gamma: float = 0.8,
+                 median_kernel: int = 3):
 
         self.clahe_clip_limit = clahe_clip_limit
         self.clahe_tile_size = clahe_tile_size
         self.gamma = gamma
+        self.median_kernel = median_kernel
 
         self.clahe = cv2.createCLAHE(
             clipLimit=clahe_clip_limit,
@@ -42,14 +47,25 @@ class FundusPreprocessor:
             ((i / 255.0) ** invGamma) * 255
             for i in np.arange(0, 256)
         ]).astype("uint8")
-
         return cv2.LUT(image, table)
 
     # --------------------------------------------------
-    # CLAHE
+    # NOISE REDUCTION
     # --------------------------------------------------
-    def apply_clahe(self, image: np.ndarray) -> np.ndarray:
-        return self.clahe.apply(image)
+    def apply_median_blur(self, image: np.ndarray) -> np.ndarray:
+        """Removes salt-and-pepper noise while preserving vessel edges."""
+        if self.median_kernel > 0:
+            return cv2.medianBlur(image, self.median_kernel)
+        return image
+
+    # --------------------------------------------------
+    # DYNAMIC SCALING
+    # --------------------------------------------------
+    def _get_dynamic_kernel_size(self, image: np.ndarray, base_size: int = 5) -> int:
+        """Scales kernel sizes based on image resolution (normalized to DRIVE)."""
+        diag = np.sqrt(image.shape[0]**2 + image.shape[1]**2)
+        scale = diag / 812.0  # DRIVE diagonal is approx 812px
+        return int(max(1, round(base_size * scale)))
 
     # --------------------------------------------------
     # INTERNAL FOV CREATION
@@ -58,7 +74,7 @@ class FundusPreprocessor:
                         image: np.ndarray,
                         block_size: int = 51,
                         C: int = 10,
-                        erosion_size: int = 5) -> np.ndarray:
+                        erosion_size: Optional[int] = None) -> np.ndarray:
 
         binary = cv2.adaptiveThreshold(
             image, 255,
@@ -67,7 +83,9 @@ class FundusPreprocessor:
             block_size, -C
         )
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        kernel_size = self._get_dynamic_kernel_size(image, 5)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        
         mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
@@ -78,10 +96,11 @@ class FundusPreprocessor:
             mask = np.zeros_like(mask)
             cv2.drawContours(mask, [largest], -1, 255, -1)
 
-        if erosion_size > 0:
+        e_size = erosion_size if erosion_size is not None else kernel_size
+        if e_size > 0:
             erosion_kernel = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE,
-                (erosion_size * 2 + 1, erosion_size * 2 + 1)
+                (e_size * 2 + 1, e_size * 2 + 1)
             )
             mask = cv2.erode(mask, erosion_kernel, iterations=1)
 
@@ -90,14 +109,22 @@ class FundusPreprocessor:
     # --------------------------------------------------
     # EXTERNAL FOV HANDLING
     # --------------------------------------------------
-    def load_external_mask(self, mask: np.ndarray) -> np.ndarray:
-        """
-        Accepts already loaded mask and ensures correct format.
-        """
+    def load_external_mask(self, mask: np.ndarray, erosion_size: Optional[int] = None) -> np.ndarray:
         if len(mask.shape) == 3:
             mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-
-        mask = (mask > 0).astype(np.uint8) * 255
+        
+        # Binarize
+        mask = (mask > 128).astype(np.uint8) * 255
+        
+        # Eroding external masks ensures we avoid the sharp high-contrast boundary
+        e_size = erosion_size if erosion_size is not None else self._get_dynamic_kernel_size(mask, 5)
+        if e_size > 0:
+            erosion_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, 
+                (e_size * 2 + 1, e_size * 2 + 1)
+            )
+            mask = cv2.erode(mask, erosion_kernel, iterations=1)
+            
         return mask
 
     # --------------------------------------------------
@@ -114,23 +141,36 @@ class FundusPreprocessor:
                    external_mask: Optional[np.ndarray] = None,
                    return_intermediate: bool = False) -> Tuple:
 
-        # 1️⃣ Green channel
+        # 1. Green channel
         green = self.extract_green_channel(image)
 
-        # 2️⃣ Gamma
+        # 2. Gamma
         gamma_corrected = self.apply_gamma_correction(green)
 
-        # 3️⃣ CLAHE
-        clahe_enhanced = self.apply_clahe(gamma_corrected)
+        # 3. Median Blur (Denoising)
+        denoised = self.apply_median_blur(gamma_corrected)
 
-        # 4️⃣ Mask selection
+        # 4. Mask selection
         if external_mask is not None:
             mask = self.load_external_mask(external_mask)
         else:
-            mask = self.create_fov_mask(green)
+            mask = self.create_fov_mask(gamma_corrected)
 
-        # 5️⃣ Apply mask
-        preprocessed = self.apply_mask(clahe_enhanced, mask)
+        # 5. Apply mask BEFORE CLAHE 
+        gamma_masked = self.apply_mask(denoised, mask)
+
+        # 6. CLAHE 
+        clahe_enhanced = self.clahe.apply(gamma_masked)
+
+        # 7. ROI-Aware Normalize to 0–1
+        roi_pixels = clahe_enhanced[mask > 0]
+        if roi_pixels.size > 0:
+            vmin, vmax = np.percentile(roi_pixels, [1.0, 99.0])
+            preprocessed = np.clip((clahe_enhanced - vmin) / (vmax - vmin + 1e-8), 0, 1)
+        else:
+            preprocessed = clahe_enhanced.astype(np.float32) / 255.0
+        
+        preprocessed = preprocessed.astype(np.float32)
 
         if return_intermediate:
             return (
@@ -151,7 +191,6 @@ class FundusPreprocessor:
                          masks: Optional[list] = None) -> list:
 
         results = []
-
         if masks is not None:
             for img, m in zip(images, masks):
                 results.append(self.preprocess(img, external_mask=m))

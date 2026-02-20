@@ -49,7 +49,7 @@ print(f"clDice:    {metrics.get('clDice', 0.0):.4f}")
 print("="*30)
 
 # ==========================================
-# 4. SAVE IMAGES (UPDATED FOR BA QUALITY)
+# 4. SAVE IMAGES
 # ==========================================
 
 # Extract metrics for easier access
