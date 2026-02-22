@@ -5,7 +5,7 @@ import numpy as np
 from scipy import ndimage
 from skimage import filters, morphology
 from skimage.morphology import skeletonize, remove_small_objects
-from typing import Dict, Optional
+from typing import Optional
 from data.fundus_preprocessor import FundusPreprocessor
 
 class FrangiBaseline:
@@ -36,7 +36,7 @@ class FrangiBaseline:
         self.min_size = min_size
         self.prune_length = prune_length
         
-        self.preprocessor = FundusPreprocessor( )
+        self.preprocessor = FundusPreprocessor()
 
     # ------------------------------------------------------------------
     # Centerline extraction
@@ -99,7 +99,6 @@ class FrangiBaseline:
         endpoints = (skeleton > 0) & (neighbour_count == 2)
 
         labeled, num_features = ndimage.label(skeleton)
-
         pruned = skeleton.copy()
         endpoint_coords = np.argwhere(endpoints)
 
@@ -112,65 +111,3 @@ class FrangiBaseline:
                 pruned[labeled == label_id] = 0
 
         return pruned
-
-    # ------------------------------------------------------------------
-    # Evaluation
-    # ------------------------------------------------------------------
-
-    def evaluate(self, image: np.ndarray,
-                 gt_skeleton: np.ndarray,
-                 gt_vessel_mask: Optional[np.ndarray] = None,
-                 external_fov_mask: Optional[np.ndarray] = None) -> Dict[str, float]:  # ← added
-        """
-        Evaluate predicted skeleton against ground truth.
-        If external_fov_mask is provided, uses external FOV mask.
-        Otherwise falls back to self-generated FOV mask.
-        """
-        pred_skeleton, _ = self.extract_centerline(
-            image,
-            external_fov_mask=external_fov_mask  # ← passed through
-        )
-        return self._compute_metrics(pred_skeleton, gt_skeleton, gt_vessel_mask)
-
-    def _compute_metrics(self,
-                         pred: np.ndarray,
-                         gt: np.ndarray,
-                         gt_mask: Optional[np.ndarray] = None) -> Dict[str, float]:
-        """
-        Computes metrics with a 2-pixel tolerance.
-        """
-        pred_bin = pred > 0
-        gt_bin   = gt > 0
-
-        tolerance = 2
-        struct = ndimage.generate_binary_structure(2, 2)
-
-        # Precision: did prediction land near GT?
-        gt_dilated   = ndimage.binary_dilation(gt_bin, structure=struct, iterations=tolerance)
-        tp_precision = np.logical_and(pred_bin, gt_dilated).sum()
-        precision    = tp_precision / (np.sum(pred_bin) + 1e-8)
-
-        # Recall: was GT captured by prediction?
-        pred_dilated = ndimage.binary_dilation(pred_bin, structure=struct, iterations=tolerance)
-        tp_recall    = np.logical_and(gt_bin, pred_dilated).sum()
-        recall       = tp_recall / (np.sum(gt_bin) + 1e-8)
-
-        f1 = 2 * precision * recall / (precision + recall + 1e-8)
-
-        metrics = {
-            "precision": float(precision),
-            "recall":    float(recall),
-            "f1":        float(f1),
-        }
-
-        # clDice
-        if gt_mask is not None:
-            gt_mask_bin = gt_mask > 0
-
-            tprec = np.logical_and(pred_bin, gt_mask_bin).sum() / (np.sum(pred_bin) + 1e-8)
-            tsens = np.logical_and(gt_bin, pred_dilated).sum() / (np.sum(gt_bin) + 1e-8)
-
-            cldice = 2 * tprec * tsens / (tprec + tsens + 1e-8)
-            metrics["clDice"] = float(cldice)
-
-        return metrics
