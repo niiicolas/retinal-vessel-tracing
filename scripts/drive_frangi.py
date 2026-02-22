@@ -77,7 +77,6 @@ for fname in image_files:
         return_vesselness=True,
         external_fov_mask=external_mask
     )
-    pred_skeleton = skeletonize(pred_skeleton > 0) & fov_mask_bool
 
     # --- Skeletonize GT ---
     gt_skeleton = skeletonize(gt_binary)

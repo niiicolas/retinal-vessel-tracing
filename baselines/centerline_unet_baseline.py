@@ -1,554 +1,582 @@
 """
-Lightweight U-Net + clDice Loss + Greedy Tracing for Centerline Extraction
-A simple baseline for vessel centerline prediction from vesselness maps.
+centerline_unet.py
+==================
+Lightweight Centerline UNet for retinal vessel centerline probability estimation.
 
-Usage:
-    python centerline_baseline.py --mode train --epochs 50
-    python centerline_baseline.py --mode inference --input vesselness.npy
+Architecture:
+  - Depthwise-separable convolutions for efficiency
+  - 4-level encoder/decoder with skip connections
+  - Single-channel sigmoid output → centerline probability map
+
+Loss:
+  - clDice  (topology-aware, skeleton overlap)
+  - Binary Cross-Entropy (pixel-level)
+  - Combined: total = BCE_weight * BCE + clDice_weight * (1 - clDice)
+
+Extras:
+  - GreedyTracer: converts probability map → binary skeleton via
+    seeded greedy traversal following local maxima
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from scipy.ndimage import distance_transform_edt, binary_dilation
+from skimage.morphology import skeletonize
 import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
-from tqdm import tqdm
-import argparse
-from fundus_preprocessor import FundusPreprocessor
+from typing import Optional, Tuple, List
 
 
-# ============================================================================
-# MODEL: Lightweight U-Net
-# ============================================================================
+# ─────────────────────────────────────────────────────────────
+# BUILDING BLOCKS
+# ─────────────────────────────────────────────────────────────
 
-class UNet(nn.Module):
-    """Lightweight U-Net for centerline probability prediction"""
-    
-    def __init__(self, in_channels=1, out_channels=1, base_channels=32):
+class DSConvBlock(nn.Module):
+    """Depthwise-Separable Conv → BN → ReLU (x2)."""
+
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        
-        # Encoder
-        self.enc1 = self.conv_block(in_channels, base_channels)
-        self.enc2 = self.conv_block(base_channels, base_channels * 2)
-        self.enc3 = self.conv_block(base_channels * 2, base_channels * 4)
-        self.enc4 = self.conv_block(base_channels * 4, base_channels * 8)
-        
-        # Decoder
-        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, 2, stride=2)
-        self.dec3 = self.conv_block(base_channels * 8, base_channels * 4)
-        
-        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 2, stride=2)
-        self.dec2 = self.conv_block(base_channels * 4, base_channels * 2)
-        
-        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, 2, stride=2)
-        self.dec1 = self.conv_block(base_channels * 2, base_channels)
-        
-        # Output
-        self.out = nn.Conv2d(base_channels, out_channels, 1)
-        
-        self.pool = nn.MaxPool2d(2)
-    
-    def conv_block(self, in_ch, out_ch):
-        return nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+        self.block = nn.Sequential(
+            # first DS conv
+            nn.Conv2d(in_ch, in_ch, 3, padding=1, groups=in_ch, bias=False),
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            # second DS conv
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, groups=out_ch, bias=False),
+            nn.Conv2d(out_ch, out_ch, 1, bias=False),
             nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
         )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class DownBlock(nn.Module):
+    """MaxPool → DSConvBlock."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.pool = nn.MaxPool2d(2)
+        self.conv = DSConvBlock(in_ch, out_ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(self.pool(x))
+
+
+class UpBlock(nn.Module):
+    """Bilinear upsample → cat skip → DSConvBlock."""
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv = DSConvBlock(in_ch + skip_ch, out_ch)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        # handle odd spatial dims
+        if x.shape != skip.shape:
+            x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+        return self.conv(torch.cat([x, skip], dim=1))
+
+
+# ─────────────────────────────────────────────────────────────
+# CENTERLINE UNET
+# ─────────────────────────────────────────────────────────────
+
+class CenterlineUNet(nn.Module):
+    """
+    Lightweight UNet for centerline probability estimation.
+
+    Input:  (B, in_channels, H, W)  - float32, normalised 0-1
+    Output: (B, 1, H, W)            - sigmoid probability map
     
-    def forward(self, x):
+    Default channel widths keep the model ~0.5 M parameters.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        base_ch: int = 16,           # multiply for wider network
+        depth: int = 4,              # number of encoder levels (max 4)
+    ):
+        super().__init__()
+        assert depth in (3, 4), "depth must be 3 or 4"
+
+        ch = [base_ch * (2 ** i) for i in range(depth + 1)]
+        # e.g. depth=4, base=16 → [16, 32, 64, 128, 256]
+
         # Encoder
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
-        e4 = self.enc4(self.pool(e3))
-        
+        self.enc0 = DSConvBlock(in_channels, ch[0])
+        self.enc1 = DownBlock(ch[0], ch[1])
+        self.enc2 = DownBlock(ch[1], ch[2])
+        self.enc3 = DownBlock(ch[2], ch[3])
+
+        # Bottleneck (optional 4th level)
+        self.has_bot = depth == 4
+        if self.has_bot:
+            self.bot = DownBlock(ch[3], ch[4])
+
         # Decoder
-        d3 = self.up3(e4)
-        d3 = torch.cat([d3, e3], dim=1)
-        d3 = self.dec3(d3)
-        
-        d2 = self.up2(d3)
-        d2 = torch.cat([d2, e2], dim=1)
-        d2 = self.dec2(d2)
-        
-        d1 = self.up1(d2)
-        d1 = torch.cat([d1, e1], dim=1)
-        d1 = self.dec1(d1)
-        
-        return self.out(d1)
+        if self.has_bot:
+            self.up3 = UpBlock(ch[4], ch[3], ch[3])
+        else:
+            self.up3 = UpBlock(ch[3], ch[2], ch[2])
+
+        self.up2 = UpBlock(ch[3] if self.has_bot else ch[2], ch[2] if self.has_bot else ch[1], ch[2] if self.has_bot else ch[1])
+        self.up1 = UpBlock(ch[2] if self.has_bot else ch[1], ch[1] if self.has_bot else ch[0], ch[1] if self.has_bot else ch[0])
+        self.up0 = UpBlock(ch[1] if self.has_bot else ch[0], ch[0], ch[0])
+
+        # Head
+        self.head = nn.Sequential(
+            nn.Conv2d(ch[0], ch[0] // 2, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch[0] // 2, 1, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Encoder
+        s0 = self.enc0(x)
+        s1 = self.enc1(s0)
+        s2 = self.enc2(s1)
+        s3 = self.enc3(s2)
+
+        if self.has_bot:
+            b = self.bot(s3)
+            d3 = self.up3(b, s3)
+        else:
+            d3 = s3
+
+        if self.has_bot:
+            d2 = self.up2(d3, s2)
+            d1 = self.up1(d2, s1)
+            d0 = self.up0(d1, s0)
+        else:
+            d2 = self.up2(d3, s2)
+            d1 = self.up1(d2, s1)
+            d0 = self.up0(d1, s0)
+
+        return torch.sigmoid(self.head(d0))
 
 
-# ============================================================================
-# LOSS: clDice (Topology-Aware Loss)
-# ============================================================================
+# ─────────────────────────────────────────────────────────────
+# SOFT SKELETONISATION  (differentiable proxy for clDice)
+# ─────────────────────────────────────────────────────────────
 
-def soft_erode(img):
-    """Soft erosion using min pooling"""
-    return -F.max_pool2d(-img, kernel_size=3, stride=1, padding=1)
+def _soft_erode(img: torch.Tensor) -> torch.Tensor:
+    """Morphological min-pool (2-connectivity)."""
+    if img.ndim == 4:                      # (B, 1, H, W)
+        return -F.max_pool2d(-img, kernel_size=3, stride=1, padding=1)
+    raise ValueError("Expected 4-D tensor.")
 
 
-def soft_dilate(img):
-    """Soft dilation using max pooling"""
+def _soft_dilate(img: torch.Tensor) -> torch.Tensor:
     return F.max_pool2d(img, kernel_size=3, stride=1, padding=1)
 
 
-def soft_skeletonize(img, iterations=10):
-    """Soft skeletonization via iterative thinning"""
-    skeleton = img.clone()
-    for _ in range(iterations):
-        eroded = soft_erode(skeleton)
-        temp = soft_dilate(soft_erode(skeleton))
-        skeleton = skeleton - (skeleton - eroded) * temp
-        skeleton = torch.clamp(skeleton, 0, 1)
-    return skeleton
+def _soft_open(img: torch.Tensor) -> torch.Tensor:
+    return _soft_dilate(_soft_erode(img))
 
 
-class clDiceLoss(nn.Module):
-    """Centerline Dice loss for topology preservation"""
-    
-    def __init__(self, alpha=0.5, smooth=1e-5):
+def soft_skeleton(img: torch.Tensor, num_iter: int = 10) -> torch.Tensor:
+    """
+    Differentiable skeleton approximation via iterative soft-erosion.
+    Reference: Shit et al., "clDice – a Novel Topology-Preserving Loss Function
+               for Tubular Structure Segmentation", CVPR 2021.
+    """
+    skel = F.relu(img - _soft_open(img))
+    for _ in range(num_iter):
+        img = _soft_erode(img)
+        delta = F.relu(img - _soft_open(img))
+        skel = skel + F.relu(delta - skel * delta)
+    return skel
+
+
+# ─────────────────────────────────────────────────────────────
+# TOPOLOGY-AWARE LOSS
+# ─────────────────────────────────────────────────────────────
+
+class CenterlineLoss(nn.Module):
+    """
+    Combined loss:
+        L = w_bce * BCE + w_cl * (1 - soft_clDice)
+
+    soft_clDice uses a differentiable skeleton proxy so gradients
+    flow back into the network through both terms.
+
+    Args:
+        bce_weight   : weight for BCE term
+        cl_weight    : weight for clDice term
+        skeleton_iter: soft-skeleton iterations (more → sharper, slower)
+        pos_weight   : optional positive-class weight for BCE (handles imbalance)
+    """
+
+    def __init__(
+        self,
+        bce_weight: float = 0.4,
+        cl_weight: float = 0.6,
+        skeleton_iter: int = 10,
+        pos_weight: Optional[float] = None,
+    ):
         super().__init__()
-        self.alpha = alpha
-        self.smooth = smooth
-    
-    def dice_score(self, pred, target):
-        intersection = (pred * target).sum(dim=(2, 3))
-        union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
-        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        return dice.mean()
-    
-    def forward(self, pred_logits, target):
-        pred = torch.sigmoid(pred_logits)
-        
-        # Standard Dice
-        dice = self.dice_score(pred, target)
-        
-        # Skeleton Dice (topology)
-        pred_skel = soft_skeletonize(pred, iterations=10)
-        target_skel = soft_skeletonize(target, iterations=10)
-        skel_dice = self.dice_score(pred_skel, target_skel)
-        
-        # Combined loss
-        loss = (1 - self.alpha) * (1 - dice) + self.alpha * (1 - skel_dice)
-        
-        return loss, dice.item(), skel_dice.item()
+        self.bce_weight = bce_weight
+        self.cl_weight = cl_weight
+        self.skeleton_iter = skeleton_iter
+        self.pos_weight = (
+            torch.tensor([pos_weight]) if pos_weight is not None else None
+        )
+
+    def _soft_cl_dice(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        soft clDice ∈ [0, 1], higher is better.
+        pred, target: (B, 1, H, W) float, [0,1]
+        """
+        skel_pred   = soft_skeleton(pred,   self.skeleton_iter)
+        skel_target = soft_skeleton(target, self.skeleton_iter)
+
+        # Topology-Precision: how much of pred-skeleton lies on target
+        tprec = (skel_pred * target).sum(dim=[1, 2, 3]) / (skel_pred.sum(dim=[1, 2, 3]) + 1e-8)
+        # Topology-Sensitivity: how much of gt-skeleton is covered by pred
+        tsens = (skel_target * pred).sum(dim=[1, 2, 3]) / (skel_target.sum(dim=[1, 2, 3]) + 1e-8)
+
+        cl_dice = 2 * tprec * tsens / (tprec + tsens + 1e-8)
+        return cl_dice.mean()
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Args:
+            pred   : (B, 1, H, W) sigmoid output
+            target : (B, 1, H, W) binary GT centerline, float
+            mask   : (B, 1, H, W) optional FOV mask – loss only inside ROI
+
+        Returns:
+            total_loss, {'bce': ..., 'cl_dice': ..., 'total': ...}
+        """
+        if mask is not None:
+            # flatten & select only ROI pixels for BCE
+            p = pred[mask > 0]
+            t = target[mask > 0]
+        else:
+            p = pred.reshape(-1)
+            t = target.reshape(-1)
+
+        pw = self.pos_weight.to(pred.device) if self.pos_weight is not None else None
+        bce = F.binary_cross_entropy(p, t, weight=None, reduction='mean')
+        if pw is not None:
+            # manual weighted BCE
+            bce = -(pw * t * torch.log(p + 1e-8) + (1 - t) * torch.log(1 - p + 1e-8)).mean()
+
+        cl_d = self._soft_cl_dice(pred, target)
+        total = self.bce_weight * bce + self.cl_weight * (1.0 - cl_d)
+
+        return total, {
+            'bce': bce.item(),
+            'cl_dice': cl_d.item(),
+            'total': total.item(),
+        }
 
 
-# ============================================================================
-# DATASET
-# ============================================================================
-
-class VesselDataset(Dataset):
-    """Dataset for vesselness -> centerline pairs"""
-    
-    def __init__(self, vesselness_files, centerline_files, augment=False):
-        self.vesselness_files = vesselness_files
-        self.centerline_files = centerline_files
-        self.augment = augment
-    
-    def __len__(self):
-        return len(self.vesselness_files)
-    
-    def __getitem__(self, idx):
-        # Load data
-        vesselness = np.load(self.vesselness_files[idx]).astype(np.float32)
-        centerline = np.load(self.centerline_files[idx]).astype(np.float32)
-        
-        # Ensure 2D
-        if vesselness.ndim == 3:
-            vesselness = vesselness[0]
-        if centerline.ndim == 3:
-            centerline = centerline[0]
-        
-        # Augmentation
-        if self.augment and np.random.rand() > 0.5:
-            # Random flip
-            if np.random.rand() > 0.5:
-                vesselness = np.flip(vesselness, 0).copy()
-                centerline = np.flip(centerline, 0).copy()
-            if np.random.rand() > 0.5:
-                vesselness = np.flip(vesselness, 1).copy()
-                centerline = np.flip(centerline, 1).copy()
-            # Random rotation
-            k = np.random.randint(0, 4)
-            vesselness = np.rot90(vesselness, k).copy()
-            centerline = np.rot90(centerline, k).copy()
-        
-        # Add channel dimension and convert to tensor
-        vesselness = torch.from_numpy(vesselness[None, ...])
-        centerline = torch.from_numpy(centerline[None, ...])
-        
-        return vesselness, centerline
-
-
-# ============================================================================
-# GREEDY TRACING
-# ============================================================================
+# ─────────────────────────────────────────────────────────────
+# GREEDY TRACER
+# ─────────────────────────────────────────────────────────────
 
 class GreedyTracer:
-    """Greedy centerline tracing on probability maps"""
-    
-    def __init__(self, min_prob=0.3, max_steps=1000):
-        self.min_prob = min_prob
-        self.max_steps = max_steps
-        self.directions = np.array([
-            [-1, 0], [-1, 1], [0, 1], [1, 1],
-            [1, 0], [1, -1], [0, -1], [-1, -1]
-        ])
-    
-    def trace_from_seed(self, prob_map, seed, visited):
-        """Trace from a single seed point"""
-        h, w = prob_map.shape
-        trajectory = [seed]
-        current = np.array(seed)
-        
-        for _ in range(self.max_steps):
-            y, x = current
-            visited[y, x] = True
-            
-            best_score = -1
-            best_next = None
-            
-            for direction in self.directions:
-                next_pos = current + direction
-                ny, nx = next_pos
-                
-                if ny < 0 or ny >= h or nx < 0 or nx >= w:
+    """
+    Converts a soft centerline probability map into a binary skeleton
+    via greedy traversal from seed points.
+
+    Algorithm:
+      1. Threshold map at `seed_thresh` to find candidate seeds.
+      2. Non-max suppress (keep local maxima in 3x3 neighbourhood).
+      3. For each unvisited seed (highest prob first):
+         a. Follow the steepest-ascent neighbour if prob > `step_thresh`.
+         b. Trace until the path revisits a visited pixel or falls below threshold.
+      4. Optionally post-process with morphological thinning.
+
+    Args:
+        seed_thresh  : minimum probability to start a trace
+        step_thresh  : minimum probability to continue stepping
+        min_length   : discard traces shorter than this (pixels)
+        thin_output  : apply skimage skeletonize to the binary output
+    """
+
+    def __init__(
+        self,
+        seed_thresh: float = 0.5,
+        step_thresh: float = 0.3,
+        min_length: int = 5,
+        thin_output: bool = True,
+    ):
+        self.seed_thresh = seed_thresh
+        self.step_thresh = step_thresh
+        self.min_length = min_length
+        self.thin_output = thin_output
+
+        # 8-connected neighbour offsets
+        self._offsets = [
+            (-1, -1), (-1, 0), (-1, 1),
+            (0,  -1),           (0,  1),
+            (1,  -1),  (1, 0),  (1,  1),
+        ]
+
+    def _local_maxima(self, prob: np.ndarray) -> np.ndarray:
+        """Return boolean mask of strict 8-neighbour local maxima."""
+        padded = np.pad(prob, 1, mode='constant', constant_values=0)
+        lm = np.ones_like(prob, dtype=bool)
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                if dy == 0 and dx == 0:
                     continue
-                if visited[ny, nx]:
-                    continue
-                
-                score = prob_map[ny, nx]
-                if score > best_score:
-                    best_score = score
-                    best_next = next_pos
-            
-            if best_next is None or prob_map[best_next[0], best_next[1]] < self.min_prob:
+                shifted = padded[1 + dy:1 + dy + prob.shape[0],
+                                 1 + dx:1 + dx + prob.shape[1]]
+                lm &= prob >= shifted
+        return lm
+
+    def _trace_from(
+        self,
+        prob: np.ndarray,
+        visited: np.ndarray,
+        start_r: int,
+        start_c: int,
+    ) -> List[Tuple[int, int]]:
+        """Greedy steepest-ascent trace. Returns list of (r, c) pixel coords."""
+        H, W = prob.shape
+        path = [(start_r, start_c)]
+        visited[start_r, start_c] = True
+
+        r, c = start_r, start_c
+        while True:
+            best_val = self.step_thresh
+            best_rc = None
+            for dr, dc in self._offsets:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < H and 0 <= nc < W and not visited[nr, nc]:
+                    if prob[nr, nc] > best_val:
+                        best_val = prob[nr, nc]
+                        best_rc = (nr, nc)
+            if best_rc is None:
                 break
-            
-            current = best_next
-            trajectory.append(tuple(current))
-        
-        return trajectory
-    
-    def detect_seeds(self, prob_map, threshold=0.5):
-        """Detect seed points using local maxima"""
-        from scipy.ndimage import maximum_filter
-        local_max = (prob_map == maximum_filter(prob_map, size=10))
-        seeds = np.argwhere(local_max & (prob_map >= threshold))
-        seeds = sorted(seeds, key=lambda s: prob_map[s[0], s[1]], reverse=True)
-        return [(int(y), int(x)) for y, x in seeds]
-    
-    def trace(self, prob_map):
-        """Trace complete centerline network"""
-        h, w = prob_map.shape
-        skeleton = np.zeros((h, w), dtype=np.float32)
-        visited = np.zeros((h, w), dtype=bool)
-        
-        seeds = self.detect_seeds(prob_map)
-        
-        for seed in seeds:
-            if visited[seed[0], seed[1]]:
+            r, c = best_rc
+            visited[r, c] = True
+            path.append((r, c))
+
+        return path
+
+    def trace(
+        self,
+        prob_map: np.ndarray,
+        fov_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Args:
+            prob_map : (H, W) float32 probability map
+            fov_mask : (H, W) uint8/bool – trace only inside mask
+
+        Returns:
+            skeleton : (H, W) uint8 binary centerline image
+        """
+        prob = prob_map.copy().astype(np.float32)
+        if fov_mask is not None:
+            prob[fov_mask == 0] = 0.0
+
+        H, W = prob.shape
+        skeleton = np.zeros((H, W), dtype=np.uint8)
+        visited = np.zeros((H, W), dtype=bool)
+
+        # Candidate seeds: above threshold AND local maxima
+        candidates = (prob >= self.seed_thresh) & self._local_maxima(prob)
+        seed_coords = np.argwhere(candidates)
+
+        # Sort seeds by descending probability (greedy: start from strongest)
+        seed_probs = prob[seed_coords[:, 0], seed_coords[:, 1]]
+        order = np.argsort(-seed_probs)
+        seed_coords = seed_coords[order]
+
+        for sr, sc in seed_coords:
+            if visited[sr, sc]:
                 continue
-            trajectory = self.trace_from_seed(prob_map, seed, visited)
-            for y, x in trajectory:
-                skeleton[y, x] = 1.0
-        
+            path = self._trace_from(prob, visited, sr, sc)
+            if len(path) >= self.min_length:
+                for r, c in path:
+                    skeleton[r, c] = 255
+
+        if self.thin_output and skeleton.any():
+            skeleton = (skeletonize(skeleton > 0) * 255).astype(np.uint8)
+
         return skeleton
 
+    def trace_batch(
+        self,
+        prob_maps: np.ndarray,
+        fov_masks: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Args:
+            prob_maps : (B, H, W) or (B, 1, H, W)
+            fov_masks : (B, H, W) or (B, 1, H, W), optional
 
-# ============================================================================
-# TRAINING
-# ============================================================================
+        Returns:
+            skeletons : (B, H, W) uint8
+        """
+        if prob_maps.ndim == 4:
+            prob_maps = prob_maps[:, 0]
+        if fov_masks is not None and fov_masks.ndim == 4:
+            fov_masks = fov_masks[:, 0]
 
-def train(model, train_loader, val_loader, epochs=50, device='cuda'):
-    """Train the U-Net model"""
-    
-    criterion = clDiceLoss(alpha=0.5)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    
-    best_val_loss = float('inf')
-    history = {'train_loss': [], 'val_loss': [], 'val_dice': [], 'val_cldice': []}
-    
-    Path('checkpoints').mkdir(exist_ok=True)
-    
-    for epoch in range(1, epochs + 1):
-        # Training
-        model.train()
-        train_loss = 0
-        for vesselness, centerline in tqdm(train_loader, desc=f'Epoch {epoch}/{epochs}'):
-            vesselness = vesselness.to(device)
-            centerline = centerline.to(device)
-            
-            optimizer.zero_grad()
-            pred = model(vesselness)
-            loss, _, _ = criterion(pred, centerline)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-        
-        train_loss /= len(train_loader)
-        
-        # Validation
-        model.eval()
-        val_loss = 0
-        val_dice = 0
-        val_cldice = 0
-        
-        with torch.no_grad():
-            for vesselness, centerline in val_loader:
-                vesselness = vesselness.to(device)
-                centerline = centerline.to(device)
-                
-                pred = model(vesselness)
-                loss, dice, cldice = criterion(pred, centerline)
-                
-                val_loss += loss.item()
-                val_dice += dice
-                val_cldice += cldice
-        
-        val_loss /= len(val_loader)
-        val_dice /= len(val_loader)
-        val_cldice /= len(val_loader)
-        
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['val_dice'].append(val_dice)
-        history['val_cldice'].append(val_cldice)
-        
-        print(f'Epoch {epoch}: Train Loss={train_loss:.4f}, '
-              f'Val Loss={val_loss:.4f}, Dice={val_dice:.3f}, clDice={val_cldice:.3f}')
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-            }, 'checkpoints/best_model.pth')
-            print(f'  → Saved best model (val_loss: {val_loss:.4f})')
-    
-    plot_history(history)
-    return history
+        B = prob_maps.shape[0]
+        results = []
+        for i in range(B):
+            m = fov_masks[i] if fov_masks is not None else None
+            results.append(self.trace(prob_maps[i], m))
+        return np.stack(results, axis=0)
 
 
-def plot_history(history):
-    """Plot training curves"""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
-    epochs = range(1, len(history['train_loss']) + 1)
-    
-    ax1.plot(epochs, history['train_loss'], label='Train Loss')
-    ax1.plot(epochs, history['val_loss'], label='Val Loss')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Loss')
-    ax1.set_title('Training Loss')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    ax2.plot(epochs, history['val_dice'], label='Dice Score')
-    ax2.plot(epochs, history['val_cldice'], label='clDice Score')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Score')
-    ax2.set_title('Validation Scores')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('checkpoints/training_history.png', dpi=150)
-    plt.show()
+# ─────────────────────────────────────────────────────────────
+# CONVENIENCE: FULL INFERENCE PIPELINE
+# ─────────────────────────────────────────────────────────────
 
+class CenterlinePredictor:
+    """
+    Wraps model + tracer for end-to-end inference.
 
-# ============================================================================
-# INFERENCE
-# ============================================================================
+    Usage:
+        predictor = CenterlinePredictor.from_checkpoint('weights.pt')
+        skeleton  = predictor.predict(image_np, fov_mask_np)
+    """
 
-@torch.no_grad()
-def inference(model, vesselness, device='cuda'):
-    """Run inference on vesselness map"""
-    model.eval()
-    
-    if isinstance(vesselness, np.ndarray):
-        vesselness = torch.from_numpy(vesselness).float()
-    
-    if vesselness.ndim == 2:
-        vesselness = vesselness[None, None, ...]
-    elif vesselness.ndim == 3:
-        vesselness = vesselness[None, ...]
-    
-    vesselness = vesselness.to(device)
-    
-    logits = model(vesselness)
-    prob = torch.sigmoid(logits)
-    prob = prob.cpu().numpy()[0, 0]
-    
-    return prob
+    def __init__(
+        self,
+        model: CenterlineUNet,
+        tracer: Optional[GreedyTracer] = None,
+        device: str = 'cpu',
+        patch_size: Optional[int] = None,   # None → full image
+        patch_stride: Optional[int] = None,
+    ):
+        self.model = model.to(device).eval()
+        self.tracer = tracer or GreedyTracer()
+        self.device = device
+        self.patch_size = patch_size
+        self.patch_stride = patch_stride or (patch_size // 2 if patch_size else None)
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        path: str,
+        device: str = 'cpu',
+        **kwargs,
+    ) -> 'CenterlinePredictor':
+        ckpt = torch.load(path, map_location=device)
+        cfg  = ckpt.get('model_cfg', {})
+        model = CenterlineUNet(**cfg)
+        model.load_state_dict(ckpt['model_state'])
+        return cls(model, device=device, **kwargs)
 
-def visualize_results(vesselness, prob_map, skeleton):
-    """Visualize extraction results"""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-    
-    axes[0, 0].imshow(vesselness, cmap='gray')
-    axes[0, 0].set_title('Input: Vesselness')
-    axes[0, 0].axis('off')
-    
-    axes[0, 1].imshow(prob_map, cmap='hot')
-    axes[0, 1].set_title('U-Net: Probability')
-    axes[0, 1].axis('off')
-    
-    axes[1, 0].imshow(skeleton, cmap='gray')
-    axes[1, 0].set_title('Greedy: Centerline')
-    axes[1, 0].axis('off')
-    
-    axes[1, 1].imshow(vesselness, cmap='gray', alpha=0.6)
-    axes[1, 1].imshow(skeleton, cmap='Reds', alpha=0.6)
-    axes[1, 1].set_title('Overlay')
-    axes[1, 1].axis('off')
-    
-    plt.tight_layout()
-    plt.savefig('results_visualization.png', dpi=150)
-    plt.show()
+    @torch.no_grad()
+    def _infer_full(self, img_t: torch.Tensor) -> torch.Tensor:
+        return self.model(img_t.unsqueeze(0).to(self.device))[0, 0].cpu()
 
+    @torch.no_grad()
+    def _infer_patched(self, img_t: torch.Tensor) -> torch.Tensor:
+        """Sliding-window inference with Gaussian blend weights."""
+        C, H, W = img_t.shape
+        ps = self.patch_size
+        st = self.patch_stride
 
-# ============================================================================
-# SYNTHETIC DATA GENERATION
-# ============================================================================
+        prob  = torch.zeros(H, W)
+        count = torch.zeros(H, W)
 
-def create_synthetic_data(num_samples=100, size=256, save_dir='data'):
-    """Create synthetic vessel dataset"""
-    from scipy.ndimage import gaussian_filter, distance_transform_edt
-    
-    save_dir = Path(save_dir)
-    vessel_dir = save_dir / 'vesselness'
-    center_dir = save_dir / 'centerline'
-    vessel_dir.mkdir(parents=True, exist_ok=True)
-    center_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f'Creating {num_samples} synthetic samples...')
-    
-    for i in tqdm(range(num_samples)):
-        centerline = np.zeros((size, size), dtype=np.float32)
-        
-        num_vessels = np.random.randint(2, 4)
-        for _ in range(num_vessels):
-            t = np.linspace(0, 1, 150)
-            x = (np.random.randint(20, size-20) + t * 120 * np.cos(np.random.rand() * 2 * np.pi) +
-                 30 * np.sin(np.random.rand() * 3 * t * 2 * np.pi)).astype(int)
-            y = (np.random.randint(20, size-20) + t * 120 * np.sin(np.random.rand() * 2 * np.pi) +
-                 30 * np.cos(np.random.rand() * 3 * t * 2 * np.pi)).astype(int)
-            
-            for j in range(len(x)):
-                if 0 <= x[j] < size and 0 <= y[j] < size:
-                    centerline[y[j], x[j]] = 1.0
-        
-        dist = distance_transform_edt(1 - centerline)
-        vesselness = np.exp(-dist ** 2 / 20.0)
-        vesselness = gaussian_filter(vesselness, sigma=1.0)
-        vesselness += np.random.randn(size, size) * 0.05
-        vesselness = np.clip(vesselness, 0, 1).astype(np.float32)
-        
-        np.save(vessel_dir / f'sample_{i:04d}.npy', vesselness)
-        np.save(center_dir / f'sample_{i:04d}.npy', centerline)
-    
-    print(f'Saved to {save_dir}')
-    return vessel_dir, center_dir
+        # Gaussian weight window
+        lin   = torch.linspace(-1, 1, ps)
+        gauss = torch.exp(-2 * (lin ** 2))
+        win   = (gauss[:, None] * gauss[None, :])
 
+        ys = list(range(0, H - ps + 1, st)) + [max(0, H - ps)]
+        xs = list(range(0, W - ps + 1, st)) + [max(0, W - ps)]
 
-# ============================================================================
-# MAIN
-# ============================================================================
+        for y in set(ys):
+            for x in set(xs):
+                patch = img_t[:, y:y + ps, x:x + ps].unsqueeze(0).to(self.device)
+                out = self.model(patch)[0, 0].cpu()
+                prob[y:y + ps, x:x + ps]  += out * win
+                count[y:y + ps, x:x + ps] += win
 
-def main():
-    parser = argparse.ArgumentParser(description='Centerline Extraction Baseline')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference'])
-    parser.add_argument('--data_dir', type=str, default='data')
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--input', type=str, help='Input RGB fundus image file for inference')
-    parser.add_argument('--model', type=str, default='checkpoints/best_model.pth')
-    args = parser.parse_args()
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
-    
-    if args.mode == 'train':
-        data_dir = Path(args.data_dir)
-        if not (data_dir / 'vesselness').exists():
-            print('Creating synthetic dataset...')
-            create_synthetic_data(num_samples=100, save_dir=args.data_dir)
-        
-        vessel_files = sorted((data_dir / 'vesselness').glob('*.npy'))
-        center_files = sorted((data_dir / 'centerline').glob('*.npy'))
-        
-        split = int(0.8 * len(vessel_files))
-        train_dataset = VesselDataset(vessel_files[:split], center_files[:split], augment=True)
-        val_dataset = VesselDataset(vessel_files[split:], center_files[split:], augment=False)
-        
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-        
-        print(f'Train: {len(train_dataset)} samples, Val: {len(val_dataset)} samples')
-        
-        model = UNet(in_channels=1, out_channels=1, base_channels=32).to(device)
-        print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
-        
-        train(model, train_loader, val_loader, epochs=args.epochs, device=device)
-        
-    elif args.mode == 'inference':
-        # Load model
-        model = UNet(in_channels=1, out_channels=1, base_channels=32).to(device)
-        checkpoint = torch.load(args.model, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f'Loaded model from {args.model}')
-        
-        # Load + preprocess input
-        preprocessor = FundusPreprocessor()
+        return prob / (count + 1e-8)
 
-        if args.input:
-            image = np.load(args.input)  # expects RGB fundus image
-            _, _, clahe, mask = preprocessor.preprocess(image, return_intermediate=True)
-            vesselness = clahe.astype(np.float32) / 255.0
-            vesselness *= (mask > 0)
+    def predict(
+        self,
+        image: np.ndarray,           # (H, W) float32 pre-processed
+        fov_mask: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Returns:
+            prob_map : (H, W) float32  raw probability
+            skeleton : (H, W) uint8    binarised centerline
+        """
+        img_t = torch.from_numpy(image).float().unsqueeze(0)  # (1, H, W)
+
+        if self.patch_size is not None:
+            prob = self._infer_patched(img_t)
         else:
-            # Demo data (synthetic, no preprocessing needed)
-            print('No input provided, creating demo data...')
-            from scipy.ndimage import gaussian_filter, distance_transform_edt
-            size = 256
-            centerline = np.zeros((size, size))
-            t = np.linspace(0, 4 * np.pi, 200)
-            x = np.linspace(20, size - 20, 200).astype(int)
-            y = (size // 2 + 40 * np.sin(t)).astype(int)
-            for i in range(len(x)):
-                centerline[y[i], x[i]] = 1.0
-            dist = distance_transform_edt(1 - centerline)
-            vesselness = np.exp(-dist ** 2 / 20.0)
-            vesselness = gaussian_filter(vesselness, sigma=1.0)
-            vesselness = np.clip(vesselness + np.random.randn(size, size) * 0.05, 0, 1)
-        
-        # Predict probability
-        print('Predicting centerline probability...')
-        prob_map = inference(model, vesselness, device=device)
-        
-        # Trace centerlines
-        print('Tracing centerlines...')
-        tracer = GreedyTracer(min_prob=0.3)
-        skeleton = tracer.trace(prob_map)
-        
-        # Visualize
-        visualize_results(vesselness, prob_map, skeleton)
-        
-        print(f'Results saved to results_visualization.png')
-        print(f'Centerline pixels: {skeleton.sum():.0f}')
+            prob = self._infer_full(img_t)
 
+        prob_np = prob.numpy()
+        skeleton = self.tracer.trace(prob_np, fov_mask)
+        return prob_np, skeleton
+
+
+# ─────────────────────────────────────────────────────────────
+# QUICK SANITY CHECK
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    main()
+    print("=== CenterlineUNet Sanity Check ===")
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # ── Model ──
+    model = CenterlineUNet(in_channels=1, base_ch=16, depth=4).to(device)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Parameters : {total:,}  (~{total/1e6:.2f}M)")
+
+    # ── Forward pass ──
+    x      = torch.rand(2, 1, 512, 512, device=device)
+    target = torch.zeros(2, 1, 512, 512, device=device)
+    target[:, :, 100:400, 254:258] = 1.0   # thin vertical line
+
+    pred = model(x)
+    print(f"Input      : {tuple(x.shape)}  →  Output: {tuple(pred.shape)}")
+    print(f"Pred range : [{pred.min():.3f}, {pred.max():.3f}]")
+
+    # ── Loss ──
+    criterion = CenterlineLoss(bce_weight=0.4, cl_weight=0.6, pos_weight=10.0)
+    loss, breakdown = criterion(pred, target)
+    print(f"Loss       : {loss.item():.4f}  |  {breakdown}")
+
+    # ── Greedy Tracer ──
+    tracer   = GreedyTracer(seed_thresh=0.5, step_thresh=0.3, min_length=5)
+    prob_np  = pred[0, 0].detach().cpu().numpy()
+    skeleton = tracer.trace(prob_np)
+    print(f"Skeleton   : {skeleton.shape}, nonzero pixels: {skeleton.sum() // 255}")
+
+    print("=== All OK ===")

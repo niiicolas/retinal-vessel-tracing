@@ -1,31 +1,34 @@
 """
 Classical Frangi vesselness baseline for comparison.
+Integrated with skan for graph-based pruning and optimized for centerline extraction.
 """
 import numpy as np
 from scipy import ndimage
 from skimage import filters, morphology
 from skimage.morphology import skeletonize, remove_small_objects
 from typing import Optional
+from skan import Skeleton, summarize
+
 from data.fundus_preprocessor import FundusPreprocessor
 
 class FrangiBaseline:
     """
-    Classical vessel segmentation using Frangi filter, with preprocessing.
+    Classical vessel segmentation using Frangi filter, with graph-based pruning.
     
     Pipeline:
-    1. FundusPreprocessor
+    1. Preprocessing (CLAHE, Green channel, Masking)
     2. Frangi vesselness filter
-    3. Thresholding
-    4. Morphological operations
-    5. Skeletonization
-    6. Graph pruning
+    3. Binary Thresholding
+    4. Small object removal
+    5. Skeletonization (Source of Truth)
+    6. SKAN Pruning (Graph-based removal of spurious tips)
     """
     
     def __init__(self,
-                 sigma_min: float = 1.0,
+                 sigma_min: float = 0.5,
                  sigma_max: float = 3.0,
                  num_scales: int = 5,
-                 threshold: float = 0.02,
+                 threshold: float = 0.08,
                  min_size: int = 50,
                  prune_length: int = 10):
         
@@ -38,17 +41,11 @@ class FrangiBaseline:
         
         self.preprocessor = FundusPreprocessor()
 
-    # ------------------------------------------------------------------
-    # Centerline extraction
-    # ------------------------------------------------------------------
-
     def extract_centerline(self, image: np.ndarray,
                            return_vesselness: bool = False,
                            external_fov_mask: Optional[np.ndarray] = None):
         """
-        Extract vessel centerline from image using preprocessor.
-        If external_fov_mask is provided (e.g. DRIVE dataset mask), it is used.
-        Otherwise the preprocessor generates a FOV mask automatically.
+        Extracts a 1-pixel wide skeleton.
         """
         preprocessed, _, _, _, mask = self.preprocessor.preprocess(
             image,
@@ -56,58 +53,59 @@ class FrangiBaseline:
             return_intermediate=True
         )
 
-        # Frangi vesselness
+        # 1. Frangi vesselness
         sigmas = np.linspace(self.sigma_min, self.sigma_max, self.num_scales)
         vesselness = filters.frangi(preprocessed.astype(np.float64), sigmas=sigmas, black_ridges=True)
 
-        # Normalize
+        # Normalize to [0, 1]
         vesselness = (vesselness - vesselness.min()) / (vesselness.max() - vesselness.min() + 1e-8)
-
-        # Apply FOV mask
         vesselness *= (mask > 0)
 
-        # Threshold + morphological ops
+        # 2. Binary segmentation
         binary = vesselness > self.threshold
+        # Morphological clean up of the mask
         binary = morphology.binary_closing(binary, morphology.disk(1))
-        binary = ndimage.binary_fill_holes(binary)
         binary = remove_small_objects(binary.astype(bool), min_size=self.min_size)
 
-        # Skeletonize + prune
+        # 3. Skeletonization (Model-internal)
         skeleton = skeletonize(binary)
-        skeleton = self._prune_skeleton(skeleton)
+
+        # 4. Graph-based Pruning (skan)
+        if np.any(skeleton):
+            skeleton = self._prune_with_skan(skeleton)
 
         if return_vesselness:
             return skeleton.astype(np.float32), vesselness
         return skeleton.astype(np.float32), None
 
-    # ------------------------------------------------------------------
-    # Skeleton pruning
-    # ------------------------------------------------------------------
+    def _prune_with_skan(self, skeleton_img: np.ndarray) -> np.ndarray:
+        """
+        Uses graph theory to remove short branches that end in a leaf node (tip).
+        """
+        try:
+            # Create graph from skeleton
+            skel = Skeleton(skeleton_img)
+            stats = summarize(skel)
 
-    def _prune_skeleton(self, skeleton: np.ndarray) -> np.ndarray:
-        """Remove short spurious branches from skeleton iteratively."""
-        for _ in range(3):
-            skeleton = self._prune_once(skeleton, self.prune_length)
-        return skeleton
-
-    def _prune_once(self, skeleton: np.ndarray, min_length: int) -> np.ndarray:
-        """Single pruning pass: remove branches shorter than min_length pixels."""
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        neighbour_count = ndimage.convolve(
-            skeleton.astype(np.uint8), kernel, mode='constant', cval=0
-        )
-        endpoints = (skeleton > 0) & (neighbour_count == 2)
-
-        labeled, num_features = ndimage.label(skeleton)
-        pruned = skeleton.copy()
-        endpoint_coords = np.argwhere(endpoints)
-
-        for coord in endpoint_coords:
-            label_id = labeled[coord[0], coord[1]]
-            if label_id == 0:
-                continue
-            branch_pixels = np.argwhere(labeled == label_id)
-            if len(branch_pixels) < min_length:
-                pruned[labeled == label_id] = 0
-
-        return pruned
+            # Identification of branch types:
+            # Type 1: Tip-to-Junction (The spurs we want to remove)
+            # Type 2: Junction-to-Junction (Main vessel segments)
+            
+            # Find indices of short tip branches
+            short_tips = stats[(stats['branch-type'] == 1) & 
+                               (stats['branch-distance'] < self.prune_length)]
+            
+            pruned_skeleton = skeleton_img.copy()
+            
+            # Remove pixels belonging to short branches
+            for edge_idx in short_tips.index:
+                coords = skel.path_coordinates(edge_idx)
+                for r, c in coords.astype(int):
+                    pruned_skeleton[r, c] = 0
+            
+            # Re-run skeletonize once to ensure 1-pixel thickness at former junctions
+            return skeletonize(pruned_skeleton)
+            
+        except Exception:
+            # Fallback if the graph is too small to be analyzed
+            return skeleton_img
