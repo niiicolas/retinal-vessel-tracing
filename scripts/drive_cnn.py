@@ -8,10 +8,12 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from PIL import Image
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 from tqdm import tqdm
 from skimage.morphology import skeletonize
 import pandas as pd
 import albumentations as A
+import warnings
 
 # Import local modules
 from baselines.centerline_unet_baseline import CenterlineUNet, CenterlineLoss, CenterlinePredictor
@@ -132,38 +134,106 @@ def evaluate_and_visualize(checkpoint_path):
     dataset = ManualDriveDataset(DRIVE_ROOT, val_indices, augment=False)
     loader = DataLoader(dataset, batch_size=1)
     
-    # FIX: weights_only=True removes the FutureWarning
+    warnings.filterwarnings("ignore", category=FutureWarning)
     predictor = CenterlinePredictor.from_checkpoint(checkpoint_path, device=DEVICE)
     metrics_fn = CenterlineMetrics(tolerance_levels=[1, 2, 3])
     
     all_metrics = []
+    val_transform = get_val_transforms()
+    
     for i, batch in enumerate(loader):
-        img_np, mask_np = batch['image'][0,0].numpy(), (batch['mask'][0,0].numpy() * 255).astype(np.uint8)
-        gt_skel, vessel_mask = (batch['centerline'][0,0].numpy() * 255).astype(np.uint8), (batch['vessel_mask'][0].numpy() * 255).astype(np.uint8)
-        image_id = os.path.basename(batch['path'][0]).split('_')[0]
+        img_np = batch['image'][0,0].numpy()
+        mask_np = (batch['mask'][0,0].numpy() * 255).astype(np.uint8)
+        gt_skel = (batch['centerline'][0,0].numpy() * 255).astype(np.uint8)
+        vessel_mask = (batch['vessel_mask'][0].numpy() * 255).astype(np.uint8)
+        img_path = batch['path'][0]
+        image_id = os.path.basename(img_path).split('_')[0]
 
+        # Load and pad original color image for visualization
+        orig_color = np.array(Image.open(img_path).convert('RGB'))
+        color_padded = val_transform(image=orig_color)['image']
+
+        # Prediction
         prob_map, pred_skel = predictor.predict(img_np, fov_mask=mask_np)
+        
+        # Metrics
         res = metrics_fn.compute_all_metrics(pred_skel, gt_skel, vessel_mask)
         res['image_id'] = image_id
         all_metrics.append(res)
         
-        fig, axes = plt.subplots(1, 4, figsize=(24, 7))
-        axes[0].imshow(img_np, cmap='gray'); axes[0].set_title("Input")
-        axes[1].imshow(prob_map, cmap='hot'); axes[1].set_title("CNN Probability")
+        # ==================== PLOTTING FIXES ====================
+        # 1. Safely binarize skeletons to strictly 0 or 255 to prevent overflow
+        gt_skel_vis = (gt_skel > 0).astype(np.uint8) * 255
+        pred_skel_vis = (pred_skel > 0).astype(np.uint8) * 255
+        
+        # 2. Black-out the background of the Probability Map using the FOV mask
+        fov_bin = (mask_np > 0).astype(np.float32)
+        prob_map_vis = prob_map * fov_bin 
+        
+        fig, axes = plt.subplots(1, 4, figsize=(24, 7), facecolor='white')
+        
+        # Panel 1: Original Color Image
+        axes[0].imshow(color_padded)
+        axes[0].set_title("Original Image", fontweight='bold')
+        
+        # Panel 2: CNN Probability (Now with a clean black background)
+        axes[1].imshow(prob_map_vis, cmap='gray')
+        axes[1].set_title("CNN Probability", fontweight='bold')
+        
+        # Panel 3: Skeletons Side-by-Side (Using the safe _vis arrays)
+        side_by_side = np.concatenate([gt_skel_vis, pred_skel_vis], axis=1)
+        axes[2].imshow(side_by_side, cmap='gray')
+        axes[2].set_title("Skeletons\n(Left: GT | Right: Pred)", fontweight='bold')
+        
+        # Panel 4: RGB Overlay (Using the safe _vis arrays)
         overlay = np.zeros((img_np.shape[0], img_np.shape[1], 3), dtype=np.uint8)
-        overlay[..., 1], overlay[..., 0] = gt_skel, (pred_skel * 255).astype(np.uint8) 
-        axes[2].imshow(overlay); axes[2].set_title("Overlay (Red:Pred, Green:GT)")
-        axes[3].set_title(f"F1@2px: {res['f1@2px']:.3f}\nclDice: {res.get('clDice',0):.3f}"); axes[3].axis('off')
-        plt.tight_layout(); plt.savefig(os.path.join(panels_dir, f"{image_id}_cnn_panel.png")); plt.close()
+        overlay[..., 1] = gt_skel_vis      # Green: GT
+        overlay[..., 0] = pred_skel_vis    # Red: Pred
+        
+        axes[3].imshow(overlay)
+        axes[3].set_title(f"Overlay Analysis\nF1: {res['f1@2px']:.3f} | clDice: {res.get('clDice',0):.3f}", 
+                          fontweight='bold', color='darkblue')
+        
+        # Legend for Panel 4
+        legend_elements = [
+            Patch(facecolor='green', edgecolor='black', label='GT Missing (FN)'),
+            Patch(facecolor='red', edgecolor='black', label='Pred (False Pos)'),
+            Patch(facecolor='yellow', edgecolor='black', label='Match (True Pos)')
+        ]
+        axes[3].legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.15), 
+                       ncol=3, frameon=False, fontsize=12)
 
+        # Cleanup axes
+        for ax in axes:
+            ax.axis('off')
+            
+        plt.tight_layout()
+        plt.savefig(os.path.join(panels_dir, f"{image_id}_cnn_panel.png"), bbox_inches='tight', dpi=150)
+        plt.close()
+
+    # ==================== CSV EXPORT ====================
     df = pd.DataFrame(all_metrics)
-    print("\n" + "="*45 + "\n      CNN RESULTS — DRIVE VALIDATION SET\n" + "="*45)
-    # Added precision and recall to the summary table
-    cols_to_print = ["f1@2px", "precision@2px", "recall@2px", "clDice"]
-    for col in cols_to_print:
-        if col in df.columns: 
-            print(f"{col:<15}: {df[col].mean():.4f} ± {df[col].std():.4f}")
+    
+    summary_data = {
+        'Metric': ['clDice', 'F1', 'Precision', 'Recall'],
+        'Mean ± Std': [
+            f"{df['clDice'].mean():.4f} ± {df['clDice'].std():.4f}",
+            f"{df['f1@2px'].mean():.4f} ± {df['f1@2px'].std():.4f}",
+            f"{df['precision@2px'].mean():.4f} ± {df['precision@2px'].std():.4f}",
+            f"{df['recall@2px'].mean():.4f} ± {df['recall@2px'].std():.4f}"
+        ]
+    }
+    
+    summary_df = pd.DataFrame(summary_data)
+    csv_path = os.path.join(OUTPUT_DIR, "metrics_summary.csv")
+    summary_df.to_csv(csv_path, index=False)
+    
+    print("\n" + "="*45)
+    print("      CNN RESULTS — DRIVE VALIDATION SET")
     print("="*45)
+    print(summary_df.to_string(index=False))
+    print("="*45)
+    print(f"Metrics successfully saved to: {csv_path}")
 
 # ==========================================
 # MAIN EXECUTION
@@ -172,8 +242,8 @@ if __name__ == "__main__":
     indices = list(range(20))
     train_indices, val_indices = indices[:-VAL_SIZE], indices[-VAL_SIZE:]
     
-    # Check if we should skip training (if weights already exist and we just want metrics)
-    RUN_TRAINING = True 
+    # Set to False so it instantly generates the fixed visuals without retraining
+    RUN_TRAINING = False 
     
     if RUN_TRAINING:
         train_ds = ManualDriveDataset(DRIVE_ROOT, train_indices, augment=True)
