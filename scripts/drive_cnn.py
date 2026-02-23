@@ -176,7 +176,7 @@ def evaluate_and_visualize(checkpoint_path):
         axes[0].imshow(color_padded)
         axes[0].set_title("Original Image", fontweight='bold')
         
-        # Panel 2: CNN Probability (Now with a clean black background)
+        # Panel 2: CNN Probability Map (with FOV masking)
         axes[1].imshow(prob_map_vis, cmap='gray')
         axes[1].set_title("CNN Probability", fontweight='bold')
         
