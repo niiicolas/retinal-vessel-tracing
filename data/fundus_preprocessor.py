@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List, Union
 
 
 class FundusPreprocessor:
@@ -24,11 +24,7 @@ class FundusPreprocessor:
         self.clahe_tile_size = clahe_tile_size
         self.gamma = gamma
         self.median_kernel = median_kernel
-
-        self.clahe = cv2.createCLAHE(
-            clipLimit=clahe_clip_limit,
-            tileGridSize=(clahe_tile_size, clahe_tile_size)
-        )
+        # self.clahe is no longer initialized here
 
     # --------------------------------------------------
     # CHANNEL EXTRACTION
@@ -42,6 +38,13 @@ class FundusPreprocessor:
     # GAMMA CORRECTION
     # --------------------------------------------------
     def apply_gamma_correction(self, image: np.ndarray) -> np.ndarray:
+        # Safety cast: If the image is float (0-1), scale it back to 0-255 uint8
+        if image.dtype != np.uint8:
+            if image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = image.astype(np.uint8)
+
         invGamma = 1.0 / self.gamma
         table = np.array([
             ((i / 255.0) ** invGamma) * 255
@@ -139,7 +142,7 @@ class FundusPreprocessor:
     def preprocess(self,
                    image: np.ndarray,
                    external_mask: Optional[np.ndarray] = None,
-                   return_intermediate: bool = False) -> Tuple:
+                   return_intermediate: bool = False) -> Union[np.ndarray, Tuple]:
 
         # 1. Green channel
         green = self.extract_green_channel(image)
@@ -159,8 +162,12 @@ class FundusPreprocessor:
         # 5. Apply mask BEFORE CLAHE 
         gamma_masked = self.apply_mask(denoised, mask)
 
-        # 6. CLAHE 
-        clahe_enhanced = self.clahe.apply(gamma_masked)
+        # 6. CLAHE (Created on the fly as requested)
+        clahe = cv2.createCLAHE(
+            clipLimit=self.clahe_clip_limit,
+            tileGridSize=(self.clahe_tile_size, self.clahe_tile_size)
+        )
+        clahe_enhanced = clahe.apply(gamma_masked)
 
         # 7. ROI-Aware Normalize to 0–1
         roi_pixels = clahe_enhanced[mask > 0]
@@ -187,8 +194,8 @@ class FundusPreprocessor:
     # BATCH
     # --------------------------------------------------
     def preprocess_batch(self,
-                         images: list,
-                         masks: Optional[list] = None) -> list:
+                         images: List[np.ndarray],
+                         masks: Optional[List[np.ndarray]] = None) -> List[np.ndarray]:
 
         results = []
         if masks is not None:

@@ -28,7 +28,8 @@ os.makedirs(panels_dir, exist_ok=True)
 # INITIALIZE MODEL & METRICS
 # ==========================================
 model = FrangiBaseline()
-metrics_calculator = CenterlineMetrics(tolerance_levels=[2])
+# We initialize with 1, 2, and 3px tolerances to see the full performance spectrum
+metrics_calculator = CenterlineMetrics(tolerance_levels=[1, 2, 3])
 
 all_metrics = []
 mosaic_data = []
@@ -78,40 +79,30 @@ for fname in image_files:
         external_fov_mask=external_mask
     )
 
-    # --- Skeletonize GT ---
+    # --- Skeletonize GT (Create the 1px Ground Truth) ---
     gt_skeleton = skeletonize(gt_binary)
 
-    # --- Compute metrics ---
-    raw = metrics_calculator.compute_all_metrics(
+    # --- Compute metrics for all tolerances ---
+    raw_metrics = metrics_calculator.compute_all_metrics(
         pred_skeleton,
         gt_skeleton,
         gt_vessel_mask=gt_binary
     )
 
-    # Add top-level keys for compatibility
-    raw['Precision'] = raw.get('precision@2px', 0.0)
-    raw['Recall']    = raw.get('recall@2px', 0.0)
-    raw['F1']        = raw.get('f1@2px', 0.0)
-    raw['clDice']    = raw.get('clDice', 0.0)
+    # --- Print 2px results to console as a standard reference ---
+    f1_2px   = raw_metrics.get('f1@2px', 0.0)
+    prec_2px = raw_metrics.get('precision@2px', 0.0)
+    rec_2px  = raw_metrics.get('recall@2px', 0.0)
+    cldice   = raw_metrics.get('clDice', 0.0)
 
-    f1_val     = raw['F1']
-    cldice_val = raw['clDice']
-    prec_val   = raw['Precision']
-    rec_val    = raw['Recall']
+    print(f"  Precision@2px: {prec_2px:.4f}")
+    print(f"  Recall@2px:    {rec_2px:.4f}")
+    print(f"  F1 Score@2px:  {f1_2px:.4f}")
+    print(f"  clDice:        {cldice:.4f}\n")
 
-    print(f"  Precision: {prec_val:.4f}")
-    print(f"  Recall:    {rec_val:.4f}")
-    print(f"  F1 Score:  {f1_val:.4f}")
-    print(f"  clDice:    {cldice_val:.4f}\n")
-
-    # --- Store metrics ---
-    metrics_entry = {
-        "image_id":  image_id,
-        "clDice":    cldice_val,
-        "F1":        f1_val,
-        "Precision": prec_val,
-        "Recall":    rec_val,
-    }
+    # --- Store all computed metrics ---
+    metrics_entry = {"image_id": image_id}
+    metrics_entry.update(raw_metrics)
     all_metrics.append(metrics_entry)
 
     mosaic_data.append({
@@ -137,34 +128,29 @@ for fname in image_files:
         pred_skeleton.astype(np.uint8) * 255
     ))
     axes[2].imshow(combined_skel, cmap='gray')
-    axes[2].set_title("Skeletons\n(Left: GT | Right: Pred)", fontsize=14, fontweight='bold')
+    axes[2].set_title("1px Skeletons\n(Left: GT | Right: Pred)", fontsize=14, fontweight='bold')
     axes[2].axis('off')
 
     h, w = pred_skeleton.shape
     overlay = np.zeros((h, w, 3), dtype=np.uint8)
-    overlay[:, :, 1] = gt_skeleton.astype(np.uint8) * 255
-    overlay[:, :, 0] = pred_skeleton.astype(np.uint8) * 255
+    overlay[:, :, 1] = gt_skeleton.astype(np.uint8) * 255 # GT in Green
+    overlay[:, :, 0] = pred_skeleton.astype(np.uint8) * 255 # Pred in Red
 
     axes[3].imshow(overlay)
-    axes[3].set_title(f"Overlay Analysis\nF1: {f1_val:.3f} | clDice: {cldice_val:.3f}",
+    axes[3].set_title(f"Overlay Analysis\nF1@2px: {f1_2px:.3f} | clDice: {cldice:.3f}",
                       fontsize=14, fontweight='bold')
     axes[3].axis('off')
 
     legend_elements = [
-        Line2D([0], [0], color='green', lw=4, label='GT'),
-        Line2D([0], [0], color='red', lw=4, label='Prediction'),
+        Line2D([0], [0], color='green', lw=4, label='GT (1px)'),
+        Line2D([0], [0], color='red', lw=4, label='Pred (1px)'),
     ]
-    axes[3].legend(handles=legend_elements,
-                   loc='lower center',
-                   bbox_to_anchor=(0.5, -0.2),
-                   ncol=2,
-                   frameon=False)
+    axes[3].legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.2), ncol=2, frameon=False)
 
     plt.tight_layout()
     panel_path = os.path.join(panels_dir, f"{image_id}_training_comparison.png")
     plt.savefig(panel_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"  Saved panel → {panel_path}")
 
 # ==========================================
 # MOSAIC OVERVIEW
@@ -184,10 +170,8 @@ if mosaic_data:
 
         axes[i].imshow(overlay)
         axes[i].set_title(
-            f"[{data['image_id']}]  clDice: {data['metrics']['clDice']:.3f}\n"
-            f"F1: {data['metrics']['F1']:.3f} | "
-            f"Prec: {data['metrics']['Precision']:.3f} | "
-            f"Rec: {data['metrics']['Recall']:.3f}",
+            f"[{data['image_id']}] clDice: {data['metrics']['clDice']:.3f}\n"
+            f"F1@2px: {data['metrics']['f1@2px']:.3f}",
             fontsize=9, fontweight='bold'
         )
         axes[i].axis('off')
@@ -202,25 +186,34 @@ if mosaic_data:
     print(f"\nSaved mosaic → {mosaic_path}")
 
 # ==========================================
-# SUMMARY TABLE
+# SUMMARY TABLE (Showing 1px, 2px, 3px)
 # ==========================================
 df = pd.DataFrame(all_metrics)
-metric_cols = ["clDice", "F1", "Precision", "Recall"]
+
+# Organize columns so they print in a logical order
+metric_cols = [
+    "clDice",
+    "f1@1px", "precision@1px", "recall@1px",
+    "f1@2px", "precision@2px", "recall@2px",
+    "f1@3px", "precision@3px", "recall@3px"
+]
 
 summary_rows = []
 for col in metric_cols:
-    summary_rows.append({
-        "Metric": col,
-        "Mean ± Std": f"{df[col].mean():.4f} ± {df[col].std():.4f}"
-    })
+    if col in df.columns:
+        summary_rows.append({
+            "Metric": col,
+            "Mean ± Std": f"{df[col].mean():.4f} ± {df[col].std():.4f}"
+        })
 
 summary_df = pd.DataFrame(summary_rows)
-print("\n" + "="*42)
-print("  FRANGI BASELINE — DRIVE TRAINING SET")
-print("="*42)
+print("\n" + "="*45)
+print("   FRANGI BASELINE — DRIVE TRAINING SET")
+print("="*45)
 print(summary_df.to_string(index=False))
-print("="*42)
+print("="*45)
 
+# Save to disk
 df.to_csv(os.path.join(output_dir, "metrics_per_image.csv"), index=False)
 summary_df.to_csv(os.path.join(output_dir, "metrics_summary.csv"), index=False)
 print(f"\nSaved all results → {output_dir}")

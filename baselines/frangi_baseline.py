@@ -9,6 +9,7 @@ from skimage.morphology import skeletonize, remove_small_objects
 from typing import Optional
 from skan import Skeleton, summarize
 
+# Local imports
 from data.fundus_preprocessor import FundusPreprocessor
 
 class FrangiBaseline:
