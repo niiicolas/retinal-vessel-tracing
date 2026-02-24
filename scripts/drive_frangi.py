@@ -1,6 +1,9 @@
-# ==========================================
-# EVALUATION SCRIPT — FRANGI BASELINE
-# ==========================================
+"""
+drive_frangi.py
+=========================
+Frangi Vesselness Baseline
+Processes all 20 images in the DRIVE training set with 1px, 2px, and 3px metrics.
+"""
 import os
 import cv2
 import numpy as np

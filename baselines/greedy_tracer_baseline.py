@@ -6,7 +6,7 @@ Greedy Tracer — orientation-following on Frangi vesselness maps.
 
 import numpy as np
 from skimage import filters
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, binary_erosion
 from skimage.morphology import skeletonize, remove_small_objects
 from typing import Optional, Tuple, List
 
@@ -223,8 +223,11 @@ class GreedyTracerBaseline:
         if self.gauss_sigma > 0:
             vesselness = gaussian_filter(vesselness, sigma=self.gauss_sigma)
 
-        # Zero outside FOV
-        vesselness *= (mask > 0).astype(np.float32)
+        # Erode the mask to kill the Frangi edge halo artifacts
+        safe_mask = binary_erosion(mask > 0, iterations=3)
+
+        # Zero outside the NEW, slightly smaller FOV
+        vesselness *= safe_mask.astype(np.float32)
 
         return vesselness.astype(np.float32)
 
@@ -254,10 +257,13 @@ class GreedyTracerBaseline:
             return_intermediate = True,
         )
 
-        # 2. Frangi vesselness + Gaussian smoothing
+        # 2. Frangi vesselness + Gaussian smoothing + Eroded FOV masking
         vesselness = self._compute_vesselness(preprocessed, mask)
 
         # 3. Greedy tracing — returns skeleton + full trajectory data
+        # Note: We pass the UNERODED mask here so the trace can still reach 
+        # the real edges of the vessels, but the vesselness map itself 
+        # already has the halo zeroed out.
         skeleton, traces = self.tracer.trace(vesselness, fov_mask=mask)
 
         # 4. Remove isolated small blobs (post-trace noise cleanup)

@@ -1,8 +1,8 @@
 """
 drive_greedytracer.py
-=====================
-Evaluation script for Baseline 3: Greedy Tracer on Frangi vesselness maps.
-Updated to include 1px, 2px, and 3px tolerance summaries and dynamic titles.
+=========================
+Greedy Tracer
+Processes all 20 images in the DRIVE training set with 1px, 2px, and 3px metrics.
 """
 
 import os
@@ -25,8 +25,6 @@ from evaluation.metrics import CenterlineMetrics
 # ==========================================
 DRIVE_ROOT = r"C:\ZHAW\BA\data\DRIVE\training"
 OUTPUT_DIR = r"C:\ZHAW\BA\retinal-vessel-tracing\results\greedy_tracer"
-
-VAL_SIZE   = 4
 
 MODEL_CFG = dict(
     sigma_min    = 0.5,
@@ -52,10 +50,11 @@ DPI              = 200
 # ==========================================
 # HELPERS
 # ==========================================
-def load_val_data(drive_root: str, val_size: int):
-    img_paths  = sorted(glob.glob(os.path.join(drive_root, "images",     "*.tif")))[-val_size:]
-    gt_paths   = sorted(glob.glob(os.path.join(drive_root, "1st_manual", "*.gif")))[-val_size:]
-    mask_paths = sorted(glob.glob(os.path.join(drive_root, "mask",       "*.gif")))[-val_size:]
+def load_full_dataset(drive_root: str):
+    """Loads ALL image, manual, and mask paths from the directory."""
+    img_paths  = sorted(glob.glob(os.path.join(drive_root, "images",     "*.tif")))
+    gt_paths   = sorted(glob.glob(os.path.join(drive_root, "1st_manual", "*.gif")))
+    mask_paths = sorted(glob.glob(os.path.join(drive_root, "mask",       "*.gif")))
     return img_paths, gt_paths, mask_paths
 
 
@@ -160,7 +159,6 @@ def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir):
     axes[2].set_title("Length Distribution (log x)", color='white', fontsize=FONT_SIZE_TITLE)
     axes[2].tick_params(colors='white')
 
-    # --- ADDED IMAGE ID TO SUPERTITLE ---
     plt.suptitle(f"Greedy Tracer Trajectory Analysis — Image {image_id}", 
                  color='white', fontsize=FONT_SIZE_TITLE + 4, fontweight='bold', y=1.02)
 
@@ -173,35 +171,42 @@ def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir):
 # MAIN
 # ==========================================
 def main():
-    print("\nEvaluation — Greedy Tracer Baseline")
+    print("\nFull Dataset Evaluation — Greedy Tracer Baseline")
 
     panels_dir = os.path.join(OUTPUT_DIR, "panels")
     traj_dir   = os.path.join(OUTPUT_DIR, "trajectories")
     os.makedirs(panels_dir, exist_ok=True)
     os.makedirs(traj_dir,   exist_ok=True)
 
-    img_paths, gt_paths, mask_paths = load_val_data(DRIVE_ROOT, VAL_SIZE)
+    # Modified: Load all images instead of slicing by VAL_SIZE
+    img_paths, gt_paths, mask_paths = load_full_dataset(DRIVE_ROOT)
+    num_total = len(img_paths)
+    print(f"Found {num_total} images for processing.")
 
     model      = GreedyTracerBaseline(**MODEL_CFG)
     metrics_fn = CenterlineMetrics(tolerance_levels=[1, 2, 3])
 
     all_metrics = []
 
-    for img_path, gt_path, mask_path in tqdm(zip(img_paths, gt_paths, mask_paths), total=VAL_SIZE):
+    # Process every image in the dataset
+    for img_path, gt_path, mask_path in tqdm(zip(img_paths, gt_paths, mask_paths), total=num_total):
         image_id = os.path.basename(img_path).split('_')[0]
 
+        # Load data
         img_rgb = np.array(Image.open(img_path).convert('RGB'))
         gt      = np.array(Image.open(gt_path).convert('L'))
         mask    = np.array(Image.open(mask_path).convert('L'))
 
+        # Precompute GT
         gt_skel     = (skeletonize(gt > 128) * 255).astype(np.uint8)
         vessel_mask = (gt > 128).astype(np.uint8) * 255
 
+        # Execute Baseline
         pred_skel, vesselness, traces = model.extract_centerline(
             img_rgb, external_fov_mask=mask, return_vesselness=True
         )
 
-        # Compute full metrics
+        # Compute all required metrics (1, 2, 3px)
         res = metrics_fn.compute_all_metrics(pred_skel, gt_skel, vessel_mask)
         res.update({
             'image_id': image_id,
@@ -210,10 +215,11 @@ def main():
         })
         all_metrics.append(res)
 
+        # Generate per-image visuals
         save_standard_panel(img_rgb, vesselness, gt_skel, pred_skel, mask, res, image_id, panels_dir)
         save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir)
 
-    # ── SUMMARY LOGIC ──────────────────────────────────────────────────────
+    # ── GLOBAL SUMMARY ──────────────────────────────────────────────────────
     df = pd.DataFrame(all_metrics)
     target_cols = [
         "clDice",
@@ -225,17 +231,23 @@ def main():
     summary_rows = []
     for col in target_cols:
         if col in df.columns:
-            summary_rows.append({"Metric": col, "Mean ± Std": f"{df[col].mean():.4f} ± {df[col].std():.4f}"})
+            summary_rows.append({
+                "Metric": col, 
+                "Mean ± Std": f"{df[col].mean():.4f} ± {df[col].std():.4f}"
+            })
 
     summary_df = pd.DataFrame(summary_rows)
-    print("\n" + "=" * 50)
-    print("   GREEDY TRACER RESULTS — DRIVE VALIDATION SET")
-    print("=" * 50)
-    print(summary_df.to_string(index=False))
-    print("=" * 50)
     
-    summary_df.to_csv(os.path.join(OUTPUT_DIR, "metrics_summary.csv"), index=False)
-    df.to_csv(os.path.join(OUTPUT_DIR, "metrics_per_image.csv"), index=False)
+    print("\n" + "=" * 55)
+    print(f"   GREEDY TRACER — FULL DRIVE DATASET (N={num_total})")
+    print("=" * 55)
+    print(summary_df.to_string(index=False))
+    print("=" * 55)
+    
+    # Save results
+    summary_df.to_csv(os.path.join(OUTPUT_DIR, "full_summary_metrics.csv"), index=False)
+    df.to_csv(os.path.join(OUTPUT_DIR, "per_image_detailed_metrics.csv"), index=False)
+    print(f"Full results saved to: {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()

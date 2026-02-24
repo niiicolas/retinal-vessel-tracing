@@ -1,3 +1,10 @@
+"""
+drive_cnn.py
+=========================
+Centerline UNet CNN Baseline
+Processes all 20 images in the DRIVE training set with 1px, 2px, and 3px metrics.
+"""
+
 import os
 import glob
 import numpy as np
