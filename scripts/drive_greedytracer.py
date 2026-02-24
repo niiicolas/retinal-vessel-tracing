@@ -150,6 +150,12 @@ def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir):
 
     axes[1].set_title(f"Top-{n_show} Visit Order", color='white', fontsize=FONT_SIZE_TITLE)
 
+    sm = plt.cm.ScalarMappable(cmap=cmap_order, norm=order_norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=axes[1], fraction=0.046, pad=0.04)
+    cbar.set_label('Visit Order (0 = First/Strongest)', color='white', fontsize=FONT_SIZE_LABEL)
+    cbar.ax.yaxis.set_tick_params(colors='white')
+
     # Panel C: Histogram
     axes[2].axis('on')
     axes[2].set_facecolor('#1a1a1a')
@@ -158,6 +164,9 @@ def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir):
     axes[2].set_xscale('log')
     axes[2].set_title("Length Distribution (log x)", color='white', fontsize=FONT_SIZE_TITLE)
     axes[2].tick_params(colors='white')
+    
+    axes[2].set_xlabel('Trace Length (pixels)', color='white', fontsize=FONT_SIZE_LABEL)
+    axes[2].set_ylabel('Count (Number of Traces)', color='white', fontsize=FONT_SIZE_LABEL)
 
     plt.suptitle(f"Greedy Tracer Trajectory Analysis — Image {image_id}", 
                  color='white', fontsize=FONT_SIZE_TITLE + 4, fontweight='bold', y=1.02)
