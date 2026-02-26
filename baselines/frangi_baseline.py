@@ -1,7 +1,16 @@
+# frangi_baseline.py
 """
-Classical Frangi vesselness baseline for comparison.
-Integrated with skan for graph-based pruning and optimized for centerline extraction.
+==================
+Frangi Vesselness Baseline with Topological Pruning.
+
+Workflow:
+  1. Multi-scale Frangi filter (Hessian-based enhancement).
+  2. Morphological cleanup (Binary closing + size filtering).
+  3. Skeletonization (1-pixel centerline extraction).
+  4. Skan Pruning: Removes 'Type 1' spurs (Tip-to-Junction) below prune_length.
+==================
 """
+
 import numpy as np
 from scipy import ndimage
 from skimage import filters, morphology

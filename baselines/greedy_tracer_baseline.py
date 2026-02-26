@@ -1,7 +1,15 @@
+# greedy_tracer_baseline.py
 """
-greedy_tracer_baseline.py
-=========================
-Greedy Tracer — orientation-following on Frangi vesselness maps.
+==================
+Greedy Tracer Baseline for Vessel Extraction.
+
+Workflow:
+  1. Preprocessing & Multi-scale Frangi filtering.
+  2. Gaussian smoothing to stabilize steepest-ascent.
+  3. FOV erosion (3 iterations) to eliminate boundary halo artifacts.
+  4. Greedy steepest-ascent tracing from local maxima seeds.
+  5. Post-trace object removal for noise cleanup.
+==================
 """
 
 import numpy as np

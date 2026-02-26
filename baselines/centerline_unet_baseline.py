@@ -1,21 +1,23 @@
+# centerline_unet_baseline.py
 """
-centerline_unet.py
 ==================
 Lightweight Centerline UNet for retinal vessel centerline probability estimation.
 
 Architecture:
-  - Depthwise-separable convolutions for efficiency
+  - Depthwise-Separable (3x3 DW -> 1x1 PW) convolutions for parameter efficiency (~0.5M params)
+  - ReLU activation and Batch Normalization throughout
   - 4-level encoder/decoder with skip connections
   - Single-channel sigmoid output → centerline probability map
 
 Loss:
-  - clDice  (topology-aware, skeleton overlap)
-  - Binary Cross-Entropy (pixel-level)
-  - Combined: total = BCE_weight * BCE + clDice_weight * (1 - clDice)
+  - clDice: Topology-aware loss using a differentiable soft-skeleton proxy
+  - Binary Cross-Entropy: Pixel-level supervision (with optional pos_weight for imbalance)
+  - Combined: Total = w_bce * BCE + w_cl * (1 - clDice)
 
 Extras:
-  - GreedyTracer: converts probability map → binary skeleton via
-    seeded greedy traversal following local maxima
+  - GreedyTracer: Seeded steepest-ascent traversal to extract 1-pixel binary skeletons
+  - Patched Inference: Sliding-window prediction with Gaussian window blending to eliminate edge artifacts
+==================
 """
 
 import math
@@ -266,7 +268,7 @@ class CenterlineLoss(nn.Module):
         Args:
             pred   : (B, 1, H, W) sigmoid output
             target : (B, 1, H, W) binary GT centerline, float
-            mask   : (B, 1, H, W) optional FOV mask – loss only inside ROI
+            mask   : (B, 1, H, W) optional FOV mask - loss only inside ROI
 
         Returns:
             total_loss, {'bce': ..., 'cl_dice': ..., 'total': ...}
@@ -388,7 +390,7 @@ class GreedyTracer:
         """
         Args:
             prob_map : (H, W) float32 probability map
-            fov_mask : (H, W) uint8/bool – trace only inside mask
+            fov_mask : (H, W) uint8/bool - trace only inside mask
 
         Returns:
             skeleton : (H, W) uint8 binary centerline image
