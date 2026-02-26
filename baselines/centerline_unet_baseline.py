@@ -28,9 +28,9 @@ import numpy as np
 from typing import Optional, Tuple, List
 
 
-# ─────────────────────────────────────────────────────────────
-# BUILDING BLOCKS
-# ─────────────────────────────────────────────────────────────
+# ==========================================
+# Building blocks
+# ==========================================
 
 class DSConvBlock(nn.Module):
     """Depthwise-Separable Conv → BN → ReLU (x2)."""
@@ -81,10 +81,9 @@ class UpBlock(nn.Module):
             x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
         return self.conv(torch.cat([x, skip], dim=1))
 
-
-# ─────────────────────────────────────────────────────────────
+# ==========================================
 # CENTERLINE UNET
-# ─────────────────────────────────────────────────────────────
+# ==========================================
 
 class CenterlineUNet(nn.Module):
     """
@@ -172,10 +171,10 @@ class CenterlineUNet(nn.Module):
 
         return torch.sigmoid(self.head(d0))
 
+# ==========================================
+# SOFT SKELETONISATION & clDice LOSS
+# ==========================================
 
-# ─────────────────────────────────────────────────────────────
-# SOFT SKELETONISATION  (differentiable proxy for clDice)
-# ─────────────────────────────────────────────────────────────
 
 def _soft_erode(img: torch.Tensor) -> torch.Tensor:
     """Morphological min-pool (2-connectivity)."""
@@ -195,7 +194,7 @@ def _soft_open(img: torch.Tensor) -> torch.Tensor:
 def soft_skeleton(img: torch.Tensor, num_iter: int = 10) -> torch.Tensor:
     """
     Differentiable skeleton approximation via iterative soft-erosion.
-    Reference: Shit et al., "clDice – a Novel Topology-Preserving Loss Function
+    Reference: Shit et al., "clDice - a Novel Topology-Preserving Loss Function
                for Tubular Structure Segmentation", CVPR 2021.
     """
     skel = F.relu(img - _soft_open(img))
@@ -205,10 +204,9 @@ def soft_skeleton(img: torch.Tensor, num_iter: int = 10) -> torch.Tensor:
         skel = skel + F.relu(delta - skel * delta)
     return skel
 
-
-# ─────────────────────────────────────────────────────────────
-# TOPOLOGY-AWARE LOSS
-# ─────────────────────────────────────────────────────────────
+# ==========================================
+# Topology - aware Loss
+# ==========================================
 
 class CenterlineLoss(nn.Module):
     """
@@ -296,10 +294,9 @@ class CenterlineLoss(nn.Module):
             'total': total.item(),
         }
 
-
-# ─────────────────────────────────────────────────────────────
-# GREEDY TRACER
-# ─────────────────────────────────────────────────────────────
+# ==========================================
+# Greedy Tracer: Probability Map → Binary Skeleton
+# ==========================================
 
 class GreedyTracer:
     """
@@ -451,11 +448,9 @@ class GreedyTracer:
             results.append(self.trace(prob_maps[i], m))
         return np.stack(results, axis=0)
 
-
-# ─────────────────────────────────────────────────────────────
-# CONVENIENCE: FULL INFERENCE PIPELINE
-# ─────────────────────────────────────────────────────────────
-
+# ==========================================
+# FULL INFERENCE PIPELINE
+# ==========================================
 class CenterlinePredictor:
     """
     Wraps model + tracer for end-to-end inference.
@@ -545,9 +540,9 @@ class CenterlinePredictor:
         return prob_np, skeleton
 
 
-# ─────────────────────────────────────────────────────────────
-# QUICK SANITY CHECK
-# ─────────────────────────────────────────────────────────────
+# ==========================================
+# Sanity check 
+# ==========================================
 
 if __name__ == '__main__':
     print("=== CenterlineUNet Sanity Check ===")

@@ -12,10 +12,9 @@ from typing import Optional, Tuple, List
 
 from data.fundus_preprocessor import FundusPreprocessor
 
-
-# ─────────────────────────────────────────────────────────────
+# ==========================================
 # TRAJECTORY-RECORDING GREEDY TRACER
-# ─────────────────────────────────────────────────────────────
+# ==========================================
 
 class GreedyTracer:
     """
@@ -147,10 +146,9 @@ class GreedyTracer:
 
         return skeleton, traces
 
-
-# ─────────────────────────────────────────────────────────────
+# ==========================================
 # GREEDY TRACER BASELINE
-# ─────────────────────────────────────────────────────────────
+# ==========================================
 
 class GreedyTracerBaseline:
     """
