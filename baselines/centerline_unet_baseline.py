@@ -9,7 +9,7 @@ Architecture:
   - 4-level encoder/decoder with skip connections
   - Single-channel sigmoid output → centerline probability map
 
-Loss:
+Loss:c
   - clDice: Topology-aware loss using a differentiable soft-skeleton proxy
   - Binary Cross-Entropy: Pixel-level supervision (with optional pos_weight for imbalance)
   - Combined: Total = w_bce * BCE + w_cl * (1 - clDice)
@@ -20,7 +20,6 @@ Extras:
 ==================
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,6 +27,8 @@ from scipy.ndimage import distance_transform_edt, binary_dilation
 from skimage.morphology import skeletonize
 import numpy as np
 from typing import Optional, Tuple, List
+
+from skan import Skeleton as SkanSkeleton, summarize
 
 
 # ==========================================
@@ -421,7 +422,28 @@ class GreedyTracer:
                     skeleton[r, c] = 255
 
         if self.thin_output and skeleton.any():
-            skeleton = (skeletonize(skeleton > 0) * 255).astype(np.uint8)
+            skeleton_bool = skeletonize(skeleton > 0)
+
+            try:
+                skel = SkanSkeleton(skeleton_bool)
+                stats = summarize(skel, separator='_')
+                
+                # Find short Type 1 (tip-to-junction) branches
+                short_tips = stats[(stats['branch-type'] == 1) & 
+                                   (stats['branch-distance'] < self.min_length)]
+                
+                pruned = skeleton_bool.copy()
+                for edge_idx in short_tips.index:
+                    coords = skel.path_coordinates(edge_idx)
+                    for r, c in coords.astype(int):
+                        pruned[r, c] = False
+                
+                # Re-skeletonize to ensure perfect 1-pixel junctions
+                skeleton_bool = skeletonize(pruned)
+            except Exception:
+                pass # Fallback if graph is too small
+                
+            skeleton = (skeleton_bool * 255).astype(np.uint8)
 
         return skeleton
 

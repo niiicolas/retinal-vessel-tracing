@@ -1,7 +1,7 @@
 # greedy_tracer_baseline.py
 """
 ==================
-Greedy Tracer Baseline for Vessel Extraction.
+Greedy Tracer Baseline for Vessel Extraction
 
 Workflow:
   1. Preprocessing & Multi-scale Frangi filtering.
@@ -9,6 +9,7 @@ Workflow:
   3. FOV erosion (3 iterations) to eliminate boundary halo artifacts.
   4. Greedy steepest-ascent tracing from local maxima seeds.
   5. Post-trace object removal for noise cleanup.
+  6. SKAN Pruning (New): Graph-based removal of spurious tips.
 ==================
 """
 
@@ -17,6 +18,7 @@ from skimage import filters
 from scipy.ndimage import gaussian_filter, binary_erosion
 from skimage.morphology import skeletonize, remove_small_objects
 from typing import Optional, Tuple, List
+from skan import Skeleton as SkanSkeleton, summarize
 
 from data.fundus_preprocessor import FundusPreprocessor
 
@@ -150,7 +152,29 @@ class GreedyTracer:
                 traces.append(path)
 
         if self.thin_output and skeleton.any():
-            skeleton = (skeletonize(skeleton > 0) * 255).astype(np.uint8)
+            skeleton_bool = skeletonize(skeleton > 0)
+            
+            # --- SKAN Pruning Step ---
+            try:
+                skel = SkanSkeleton(skeleton_bool)
+                stats = summarize(skel, separator='_')
+                
+                # Find short Type 1 (tip-to-junction) branches
+                short_tips = stats[(stats['branch-type'] == 1) & 
+                                   (stats['branch-distance'] < self.min_length)]
+                
+                pruned = skeleton_bool.copy()
+                for edge_idx in short_tips.index:
+                    coords = skel.path_coordinates(edge_idx)
+                    for r, c in coords.astype(int):
+                        pruned[r, c] = False
+                
+                # Re-skeletonize to ensure perfect 1-pixel junctions
+                skeleton_bool = skeletonize(pruned)
+            except Exception:
+                pass # Fallback if graph is too small
+                
+            skeleton = (skeleton_bool * 255).astype(np.uint8)
 
         return skeleton, traces
 

@@ -1,5 +1,5 @@
+# drive_frangi.py
 """
-drive_frangi.py
 =========================
 Frangi Vesselness Baseline
 Processes all 20 images in the DRIVE training set with 1px, 2px, and 3px metrics.
@@ -11,7 +11,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from PIL import Image
 from skimage.morphology import skeletonize
-from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from tqdm import tqdm
 
 from baselines.frangi_baseline import FrangiBaseline
 from evaluation.metrics import CenterlineMetrics
@@ -31,7 +32,6 @@ os.makedirs(panels_dir, exist_ok=True)
 # INITIALIZE MODEL & METRICS
 # ==========================================
 model = FrangiBaseline()
-# We initialize with 1, 2, and 3px tolerances to see the full performance spectrum
 metrics_calculator = CenterlineMetrics(tolerance_levels=[1, 2, 3])
 
 all_metrics = []
@@ -47,9 +47,8 @@ print(f"Found {len(image_files)} training images.\n")
 # ==========================================
 # MAIN LOOP
 # ==========================================
-for fname in image_files:
+for fname in tqdm(image_files, desc="Evaluating Frangi Baseline"):
     image_id = fname.split('_')[0]
-    print(f"Processing {fname} ...")
 
     # --- Load image ---
     img_bgr = cv2.imread(os.path.join(image_dir, fname))
@@ -69,7 +68,6 @@ for fname in image_files:
     # --- Load manual GT ---
     manual_candidates = sorted([f for f in os.listdir(manual_dir) if f.startswith(image_id)])
     if not manual_candidates:
-        print(f"  WARNING: No manual annotation for {image_id}, skipping.\n")
         continue
 
     gt_pil = Image.open(os.path.join(manual_dir, manual_candidates[0])).convert('L')
@@ -92,16 +90,8 @@ for fname in image_files:
         gt_vessel_mask=gt_binary
     )
 
-    # --- Print 2px results to console as a standard reference ---
     f1_2px   = raw_metrics.get('f1@2px', 0.0)
-    prec_2px = raw_metrics.get('precision@2px', 0.0)
-    rec_2px  = raw_metrics.get('recall@2px', 0.0)
     cldice   = raw_metrics.get('clDice', 0.0)
-
-    print(f"  Precision@2px: {prec_2px:.4f}")
-    print(f"  Recall@2px:    {rec_2px:.4f}")
-    print(f"  F1 Score@2px:  {f1_2px:.4f}")
-    print(f"  clDice:        {cldice:.4f}\n")
 
     # --- Store all computed metrics ---
     metrics_entry = {"image_id": image_id}
@@ -116,10 +106,10 @@ for fname in image_files:
     })
 
     # --- Panel visualization ---
-    fig, axes = plt.subplots(1, 4, figsize=(24, 7))
+    fig, axes = plt.subplots(1, 4, figsize=(24, 7), facecolor='white')
 
     axes[0].imshow(image)
-    axes[0].set_title("Original Image", fontsize=14, fontweight='bold')
+    axes[0].set_title(f"Original Image (ID: {image_id})", fontsize=14, fontweight='bold')
     axes[0].axis('off')
 
     axes[1].imshow(vesselness, cmap='gray')
@@ -141,14 +131,15 @@ for fname in image_files:
 
     axes[3].imshow(overlay)
     axes[3].set_title(f"Overlay Analysis\nF1@2px: {f1_2px:.3f} | clDice: {cldice:.3f}",
-                      fontsize=14, fontweight='bold')
+                      fontsize=14, fontweight='bold', color='darkblue')
     axes[3].axis('off')
 
     legend_elements = [
-        Line2D([0], [0], color='green', lw=4, label='GT (1px)'),
-        Line2D([0], [0], color='red', lw=4, label='Pred (1px)'),
+        Patch(facecolor='green',  edgecolor='black', label='GT'),
+        Patch(facecolor='red',    edgecolor='black', label='Pred'),
+        Patch(facecolor='yellow', edgecolor='black', label='Match'),
     ]
-    axes[3].legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.2), ncol=2, frameon=False)
+    axes[3].legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.2), ncol=3, frameon=False, fontsize=12)
 
     plt.tight_layout()
     panel_path = os.path.join(panels_dir, f"{image_id}_training_comparison.png")
@@ -186,16 +177,16 @@ if mosaic_data:
     mosaic_path = os.path.join(output_dir, "mosaic_overview.png")
     plt.savefig(mosaic_path, dpi=200, bbox_inches='tight')
     plt.close()
-    print(f"\nSaved mosaic → {mosaic_path}")
 
 # ==========================================
-# SUMMARY TABLE (Showing 1px, 2px, 3px)
+# SUMMARY TABLE
 # ==========================================
 df = pd.DataFrame(all_metrics)
 
-# Organize columns so they print in a logical order
+# Metrics 
 metric_cols = [
     "clDice",
+    "betti_0_error", "hd95",
     "f1@1px", "precision@1px", "recall@1px",
     "f1@2px", "precision@2px", "recall@2px",
     "f1@3px", "precision@3px", "recall@3px"
@@ -216,7 +207,5 @@ print("="*45)
 print(summary_df.to_string(index=False))
 print("="*45)
 
-# Save to disk
 df.to_csv(os.path.join(output_dir, "metrics_per_image.csv"), index=False)
 summary_df.to_csv(os.path.join(output_dir, "metrics_summary.csv"), index=False)
-print(f"\nSaved all results → {output_dir}")

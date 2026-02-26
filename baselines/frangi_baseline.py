@@ -16,7 +16,7 @@ from scipy import ndimage
 from skimage import filters, morphology
 from skimage.morphology import skeletonize, remove_small_objects
 from typing import Optional
-from skan import Skeleton, summarize
+from skan import Skeleton as SkanSkeleton, summarize
 
 # Local imports
 from data.fundus_preprocessor import FundusPreprocessor
@@ -94,8 +94,8 @@ class FrangiBaseline:
         """
         try:
             # Create graph from skeleton
-            skel = Skeleton(skeleton_img)
-            stats = summarize(skel)
+            skel = SkanSkeleton(skeleton_img)
+            stats = summarize(skel, separator='_')
 
             # Identification of branch types:
             # Type 1: Tip-to-Junction (The spurs we want to remove)
