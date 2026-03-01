@@ -505,7 +505,7 @@ class CenterlinePredictor:
         device: str = 'cpu',
         **kwargs,
     ) -> 'CenterlinePredictor':
-        ckpt = torch.load(path, map_location=device)
+        ckpt = torch.load(path, map_location=device, weights_only=False)
         cfg  = ckpt.get('model_cfg', {})
         model = CenterlineUNet(**cfg)
         model.load_state_dict(ckpt['model_state'])
