@@ -1,5 +1,5 @@
+# drive_greedytracer.py
 """
-drive_greedytracer.py
 =========================
 Greedy Tracer
 Processes all 20 images in the DRIVE training set with 1px, 2px, and 3px metrics.
@@ -171,18 +171,23 @@ def main():
         gt      = np.array(Image.open(gt_path).convert('L'))
         mask    = np.array(Image.open(mask_path).convert('L'))
 
-        gt_skel     = (skeletonize(gt > 128) * 255).astype(np.uint8)
-        vessel_mask = (gt > 128).astype(np.uint8) * 255
+        gt_skel        = (skeletonize(gt > 128) * 255).astype(np.uint8)
+        gt_vessel_mask = (gt > 128).astype(np.uint8)
 
         pred_skel, vesselness, traces = model.extract_centerline(
             img_rgb, external_fov_mask=mask, return_vesselness=True
         )
 
-        res = metrics_fn.compute_all_metrics(pred_skel, gt_skel, vessel_mask)
+        res = metrics_fn.compute_all_metrics(
+            pred_skel,
+            gt_skel,
+            pred_vessel_mask = (pred_skel > 0).astype(np.uint8),
+            gt_vessel_mask   = gt_vessel_mask,
+        )
         res.update({
-            'image_id': image_id,
+            'image_id':   image_id,
             'num_traces': len(traces),
-            'median_len': float(np.median([len(t) for t in traces])) if traces else 0.0
+            'median_len': float(np.median([len(t) for t in traces])) if traces else 0.0,
         })
         all_metrics.append(res)
 
@@ -192,13 +197,12 @@ def main():
     # ── GLOBAL SUMMARY ──────────────────────────────────────────────────────
     df = pd.DataFrame(all_metrics)
 
-    # Metrics
     metric_cols = [
         "clDice",
         "betti_0_error", "hd95",
         "f1@1px", "precision@1px", "recall@1px",
         "f1@2px", "precision@2px", "recall@2px",
-        "f1@3px", "precision@3px", "recall@3px"
+        "f1@3px", "precision@3px", "recall@3px",
     ]
 
     summary_rows = []
@@ -207,13 +211,13 @@ def main():
             summary_rows.append({"Metric": col, "Mean ± Std": f"{df[col].mean():.4f} ± {df[col].std():.4f}"})
 
     summary_df = pd.DataFrame(summary_rows)
-    
+
     print("\n" + "=" * 55)
     print(f"   GREEDY TRACER — FULL DRIVE DATASET (N={num_total})")
     print("=" * 55)
     print(summary_df.to_string(index=False))
     print("=" * 55)
-    
+
     summary_df.to_csv(os.path.join(OUTPUT_DIR, "metrics_summary.csv"), index=False)
     df.to_csv(os.path.join(OUTPUT_DIR, "metrics_per_image.csv"), index=False)
 

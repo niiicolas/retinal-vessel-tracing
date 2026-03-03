@@ -23,7 +23,7 @@ from evaluation.metrics import CenterlineMetrics
 image_dir  = r"C:\ZHAW\BA\data\DRIVE\training\images"
 manual_dir = r"C:\ZHAW\BA\data\DRIVE\training\1st_manual"
 mask_dir   = r"C:\ZHAW\BA\data\DRIVE\training\mask"
-output_dir = r"C:\ZHAW\BA\retinal-vessel-tracing\results\frangi_training"
+output_dir = r"C:\ZHAW\BA\retinal-vessel-tracing\results\frangi"
 
 panels_dir = os.path.join(output_dir, "panels")
 os.makedirs(panels_dir, exist_ok=True)
@@ -74,7 +74,7 @@ for fname in tqdm(image_files, desc="Evaluating Frangi Baseline"):
     gt_binary = (np.array(gt_pil) > 128) & fov_mask_bool
 
     # --- Run Frangi baseline ---
-    pred_skeleton, vesselness = model.extract_centerline(
+    pred_skeleton, vesselness, pred_binary = model.extract_centerline(
         image,
         return_vesselness=True,
         external_fov_mask=external_mask
@@ -87,6 +87,7 @@ for fname in tqdm(image_files, desc="Evaluating Frangi Baseline"):
     raw_metrics = metrics_calculator.compute_all_metrics(
         pred_skeleton,
         gt_skeleton,
+        pred_vessel_mask=pred_binary, 
         gt_vessel_mask=gt_binary
     )
 
@@ -142,7 +143,7 @@ for fname in tqdm(image_files, desc="Evaluating Frangi Baseline"):
     axes[3].legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.2), ncol=3, frameon=False, fontsize=12)
 
     plt.tight_layout()
-    panel_path = os.path.join(panels_dir, f"{image_id}_training_comparison.png")
+    panel_path = os.path.join(panels_dir, f"{image_id}_frangi_panel.png")
     plt.savefig(panel_path, dpi=300, bbox_inches='tight')
     plt.close()
 
