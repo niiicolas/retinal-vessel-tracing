@@ -5,15 +5,17 @@ Frangi Vesselness Baseline with Topological Pruning.
 
 Workflow:
   1. Multi-scale Frangi filter (Hessian-based enhancement)
-  2. Morphological cleanup (Binary closing + size filtering)
-  3. Skeletonization (1-pixel centerline extraction)
-  4. Skan Pruning: Removes 'Type 1' spurs (Tip-to-Junction) below prune_length
+  2. Gaussian smoothing to suppress background noise before thresholding
+  3. Morphological cleanup (Binary closing + size filtering)
+  4. Skeletonization (1-pixel centerline extraction)
+  5. Skan Pruning: Removes 'Type 1' spurs (Tip-to-Junction) below prune_length
 ==================
 """
 
 import numpy as np
 from skimage import filters, morphology
 from skimage.morphology import skeletonize, remove_small_objects
+from scipy.ndimage import gaussian_filter
 from typing import Optional, Tuple
 from skan import Skeleton as SkanSkeleton, summarize
 
@@ -27,26 +29,29 @@ class FrangiBaseline:
     Pipeline:
     1. Preprocessing (CLAHE, Green channel, Masking)
     2. Frangi vesselness filter
-    3. Binary Thresholding
-    4. Small object removal
-    5. Skeletonization (Source of Truth)
-    6. SKAN Pruning (Graph-based removal of spurious tips)
+    3. Gaussian smoothing (suppresses background noise before thresholding)
+    4. Binary Thresholding
+    5. Small object removal
+    6. Skeletonization (Source of Truth)
+    7. SKAN Pruning (Graph-based removal of spurious tips)
     """
 
     def __init__(self,
-                 sigma_min: float = 0.5,
+                 sigma_min: float = 1.0,
                  sigma_max: float = 3.0,
                  num_scales: int = 5,
-                 threshold: float = 0.08,
+                 threshold: float = 0.05,
                  min_size: int = 50,
-                 prune_length: int = 10):
+                 prune_length: int = 10,
+                 gauss_sigma: float = 1.0):
 
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.num_scales = num_scales
-        self.threshold = threshold
-        self.min_size = min_size
+        self.sigma_min    = sigma_min
+        self.sigma_max    = sigma_max
+        self.num_scales   = num_scales
+        self.threshold    = threshold
+        self.min_size     = min_size
         self.prune_length = prune_length
+        self.gauss_sigma  = gauss_sigma
 
         self.preprocessor = FundusPreprocessor()
 
@@ -73,21 +78,27 @@ class FrangiBaseline:
         sigmas = np.linspace(self.sigma_min, self.sigma_max, self.num_scales)
         vesselness = filters.frangi(preprocessed.astype(np.float64), sigmas=sigmas, black_ridges=True)
         vesselness = (vesselness - vesselness.min()) / (vesselness.max() - vesselness.min() + 1e-8)
+
+        # 2. Gaussian smoothing — suppresses background noise before thresholding
+        #    Keep gauss_sigma in range 1.0–1.5; higher values blur vessel edges
+        if self.gauss_sigma > 0:
+            vesselness = gaussian_filter(vesselness, sigma=self.gauss_sigma)
+
         vesselness *= (mask > 0)
 
-        # 2. Binary segmentation + morphological cleanup
+        # 3. Binary segmentation + morphological cleanup
         binary = vesselness > self.threshold
         binary = morphology.binary_closing(binary, morphology.disk(1))
         binary = remove_small_objects(binary.astype(bool), min_size=self.min_size)
 
-        # 3. Skeletonization
+        # 4. Skeletonization
         skeleton = skeletonize(binary)
 
-        # 4. Graph-based pruning with SKAN
+        # 5. Graph-based pruning with SKAN
         if np.any(skeleton):
             skeleton = self._prune_with_skan(skeleton)
 
-        # 5. Return tuple (skeleton, vesselness, binary)
+        # 6. Return tuple (skeleton, vesselness, binary)
         if not return_vesselness:
             vesselness = None
 
