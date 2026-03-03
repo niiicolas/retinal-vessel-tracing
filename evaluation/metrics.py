@@ -4,7 +4,7 @@ Evaluation metrics for retinal vessel centerline extraction.
 
 Includes:
 - Centerline F1 at multiple tolerances (distance-based)
-- clDice (mask-based, original formulation)
+- clDice (mask-based)
 - Betti-0 error (connected component difference)
 - HD95 (95th percentile Hausdorff distance)
 """
@@ -132,7 +132,7 @@ class CenterlineMetrics:
         gt_mask: np.ndarray
     ) -> float:
         """
-        Compute original clDice metric.
+        Compute clDice metric.
 
         Tprec = |S(P) ∩ G| / |S(P)|
         Tsens = |S(G) ∩ P| / |S(G)|
