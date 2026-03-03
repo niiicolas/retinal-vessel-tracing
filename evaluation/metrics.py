@@ -1,131 +1,230 @@
 # evaluation/metrics.py
 """
 Evaluation metrics for retinal vessel centerline extraction.
-Includes F1 at multiple tolerances, clDice, Betti-0 error, and HD95.
+
+Includes:
+- Centerline F1 at multiple tolerances (distance-based)
+- clDice (mask-based, original formulation)
+- Betti-0 error (connected component difference)
+- HD95 (95th percentile Hausdorff distance)
 """
 
 import numpy as np
 from scipy import ndimage
 from skimage import measure
+from skimage.morphology import skeletonize
 from typing import Dict, List, Optional, Tuple
 
 
 class CenterlineMetrics:
     """
-    Compute evaluation metrics for predicted vs ground-truth skeletons.
+    Compute evaluation metrics for predicted vs ground-truth skeletons
+    and vessel masks.
     """
 
     def __init__(self, tolerance_levels: List[int] = [1, 2, 3]):
         self.tolerance_levels = tolerance_levels
-        self.struct = ndimage.generate_binary_structure(2, 2)
 
-    def compute_all_metrics(self,
-                            pred_skeleton: np.ndarray,
-                            gt_skeleton: np.ndarray,
-                            gt_vessel_mask: Optional[np.ndarray] = None
-                            ) -> Dict[str, float]:
+    # ============================================================
+    # MAIN ENTRY
+    # ============================================================
+
+    def compute_all_metrics(
+        self,
+        pred_skeleton: np.ndarray,
+        gt_skeleton: np.ndarray,
+        pred_vessel_mask: Optional[np.ndarray] = None,
+        gt_vessel_mask: Optional[np.ndarray] = None
+    ) -> Dict[str, float]:
         """
         Compute all metrics for a single prediction.
-
-        Returns:
-            Dict[str, float]: precision@Nx, recall@Nx, f1@Nx, clDice, betti_0_error, hd95
         """
+
         metrics = {}
-        
-        # 1. F1 Scores at different tolerances
+
+        # --------------------------------------------------------
+        # 1. Centerline F1 Scores (skeleton-based)
+        # --------------------------------------------------------
         for tau in self.tolerance_levels:
-            precision, recall, f1 = self.centerline_f1(pred_skeleton, gt_skeleton, tau)
+            precision, recall, f1 = self.centerline_f1(
+                pred_skeleton,
+                gt_skeleton,
+                tau
+            )
             metrics[f'precision@{tau}px'] = precision
             metrics[f'recall@{tau}px'] = recall
             metrics[f'f1@{tau}px'] = f1
 
-        # 2. clDice (only if vessel mask is provided)
-        if gt_vessel_mask is not None:
-            metrics['clDice'] = self.cl_dice(pred_skeleton, gt_skeleton, gt_vessel_mask)
+        # --------------------------------------------------------
+        # 2. clDice (mask-based, if masks provided)
+        # --------------------------------------------------------
+        if pred_vessel_mask is not None and gt_vessel_mask is not None:
+            metrics['clDice'] = self.cl_dice(
+                pred_vessel_mask,
+                gt_vessel_mask
+            )
 
-        # 3. Topology Metrics 
-        metrics['betti_0_error'] = self.betti_0_error(pred_skeleton, gt_skeleton)
-        metrics['hd95'] = self.hd95(pred_skeleton, gt_skeleton)
+        # --------------------------------------------------------
+        # 3. Topology Metrics
+        # --------------------------------------------------------
+        metrics['betti_0_error'] = self.betti_0_error(
+            pred_skeleton,
+            gt_skeleton
+        )
+
+        metrics['hd95'] = self.hd95(
+            pred_skeleton,
+            gt_skeleton
+        )
 
         return metrics
 
-    def centerline_f1(self,
-                      pred: np.ndarray,
-                      gt: np.ndarray,
-                      tolerance: int = 2) -> Tuple[float, float, float]:
+    # ============================================================
+    # CENTERLINE F1 (Distance-Tolerant, Vectorized)
+    # ============================================================
+
+    def centerline_f1(
+        self,
+        pred: np.ndarray,
+        gt: np.ndarray,
+        tolerance: int = 2
+    ) -> Tuple[float, float, float]:
         """
-        Compute centerline F1 with distance tolerance.
+        Compute centerline F1 with Euclidean distance tolerance.
         """
+
         pred_bin = pred > 0
         gt_bin = gt > 0
 
+        # Edge cases
         if pred_bin.sum() == 0 and gt_bin.sum() == 0:
             return 1.0, 1.0, 1.0
         if pred_bin.sum() == 0 or gt_bin.sum() == 0:
             return 0.0, 0.0, 0.0
 
         # Distance transforms
-        gt_dist = ndimage.distance_transform_edt(1 - gt_bin)
-        pred_dist = ndimage.distance_transform_edt(1 - pred_bin)
+        gt_dist = ndimage.distance_transform_edt(~gt_bin)
+        pred_dist = ndimage.distance_transform_edt(~pred_bin)
 
-        # Precision
-        pred_points = np.argwhere(pred_bin)
-        tp_precision = sum(gt_dist[y, x] <= tolerance for y, x in pred_points)
-        precision = tp_precision / len(pred_points)
+        # Vectorized precision
+        tp_precision = int((gt_dist[pred_bin] <= tolerance).sum())
+        precision = tp_precision / pred_bin.sum()
 
-        # Recall
-        gt_points = np.argwhere(gt_bin)
-        tp_recall = sum(pred_dist[y, x] <= tolerance for y, x in gt_points)
-        recall = tp_recall / len(gt_points)
+        # Vectorized recall
+        tp_recall = int((pred_dist[gt_bin] <= tolerance).sum())
+        recall = tp_recall / gt_bin.sum()
 
-        # F1 Score
-        f1 = 2 * precision * recall / (precision + recall + 1e-8) if (precision + recall) > 0 else 0.0
+        # F1
+        if precision + recall == 0:
+            f1 = 0.0
+        else:
+            f1 = 2 * precision * recall / (precision + recall)
 
         return precision, recall, f1
 
-    def cl_dice(self, pred_skeleton: np.ndarray, gt_skeleton: np.ndarray, gt_vessel_mask: np.ndarray) -> float:
-        """
-        Compute clDice coefficient (Topology-Aware).
-        Reference: Shit et al. "clDice - a Novel Topology-Preserving Loss Function for Tubular Structure Segmentation"
-        """
-        pred_bin = pred_skeleton > 0
-        gt_bin = gt_skeleton > 0
-        mask_bin = gt_vessel_mask > 0
+    # ============================================================
+    # PROPER clDice (Mask-Based)
+    # ============================================================
 
-        # Topology-Precision: Predicted skeleton inside GT vessel mask
-        tprec = np.logical_and(pred_bin, mask_bin).sum() / (pred_bin.sum() + 1e-8) if pred_bin.sum() > 0 else 0.0
-
-        # Topology-Sensitivity: GT skeleton covered by dilated predicted skeleton
-        pred_dilated = ndimage.binary_dilation(pred_bin, iterations=2)
-        tsens = np.logical_and(gt_bin, pred_dilated).sum() / (gt_bin.sum() + 1e-8) if gt_bin.sum() > 0 else 1.0
-
-        return 2 * tprec * tsens / (tprec + tsens + 1e-8) if (tprec + tsens) > 0 else 0.0
-
-    def betti_0_error(self, pred: np.ndarray, gt: np.ndarray) -> int:
+    def cl_dice(
+        self,
+        pred_mask: np.ndarray,
+        gt_mask: np.ndarray
+    ) -> float:
         """
-        Calculates absolute error in 0th Betti Number (Connected Components).
+        Compute original clDice metric.
+
+        Tprec = |S(P) ∩ G| / |S(P)|
+        Tsens = |S(G) ∩ P| / |S(G)|
+        clDice = 2 Tprec Tsens / (Tprec + Tsens)
+
+        P = predicted vessel mask
+        G = ground-truth vessel mask
+        S(.) = skeletonization
         """
-        _, pred_b0 = measure.label(pred > 0, return_num=True, connectivity=2)
-        _, gt_b0 = measure.label(gt > 0, return_num=True, connectivity=2)
+
+        pred_bin = pred_mask > 0
+        gt_bin = gt_mask > 0
+
+        # Edge cases
+        if pred_bin.sum() == 0 and gt_bin.sum() == 0:
+            return 1.0
+        if pred_bin.sum() == 0 or gt_bin.sum() == 0:
+            return 0.0
+
+        # Skeletonization
+        skel_pred = skeletonize(pred_bin)
+        skel_gt = skeletonize(gt_bin)
+
+        if skel_pred.sum() == 0 or skel_gt.sum() == 0:
+            return 0.0
+
+        # Topology precision
+        tprec = np.logical_and(skel_pred, gt_bin).sum() / skel_pred.sum()
+
+        # Topology sensitivity
+        tsens = np.logical_and(skel_gt, pred_bin).sum() / skel_gt.sum()
+
+        if tprec + tsens == 0:
+            return 0.0
+
+        return 2 * tprec * tsens / (tprec + tsens)
+
+    # ============================================================
+    # BETTI-0 ERROR
+    # ============================================================
+
+    def betti_0_error(
+        self,
+        pred: np.ndarray,
+        gt: np.ndarray
+    ) -> int:
+        """
+        Absolute difference in number of connected components.
+        """
+
+        _, pred_b0 = measure.label(
+            pred > 0,
+            return_num=True,
+            connectivity=2
+        )
+
+        _, gt_b0 = measure.label(
+            gt > 0,
+            return_num=True,
+            connectivity=2
+        )
+
         return abs(int(pred_b0) - int(gt_b0))
 
-    def hd95(self, pred: np.ndarray, gt: np.ndarray) -> float:
+    # ============================================================
+    # HD95 (Symmetric)
+    # ============================================================
+
+    def hd95(
+        self,
+        pred: np.ndarray,
+        gt: np.ndarray
+    ) -> float:
         """
-        95th percentile Hausdorff Distance. 
-        Measures the spatial distance between the sets of pixels.
+        95th percentile symmetric Hausdorff distance.
         """
-        p_bin, g_bin = pred > 0, gt > 0
-        
-        # Handle cases with no prediction or no GT
+
+        p_bin = pred > 0
+        g_bin = gt > 0
+
         if p_bin.sum() == 0 and g_bin.sum() == 0:
             return 0.0
+
         if p_bin.sum() == 0 or g_bin.sum() == 0:
-            return float(np.sqrt(pred.shape[0]**2 + pred.shape[1]**2)) # Image diagonal penalty
+            # Image diagonal penalty
+            return float(
+                np.sqrt(pred.shape[0] ** 2 + pred.shape[1] ** 2)
+            )
 
-        p_dist_map = ndimage.distance_transform_edt(1 - p_bin)
-        g_dist_map = ndimage.distance_transform_edt(1 - g_bin)
+        p_dist_map = ndimage.distance_transform_edt(~p_bin)
+        g_dist_map = ndimage.distance_transform_edt(~g_bin)
 
-        # Distances from pred pixels to nearest GT pixel and vice-versa
         d_pred_to_gt = g_dist_map[p_bin]
         d_gt_to_pred = p_dist_map[g_bin]
 

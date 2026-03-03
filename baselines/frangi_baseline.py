@@ -12,7 +12,6 @@ Workflow:
 """
 
 import numpy as np
-from scipy import ndimage
 from skimage import filters, morphology
 from skimage.morphology import skeletonize, remove_small_objects
 from typing import Optional
@@ -85,8 +84,8 @@ class FrangiBaseline:
             skeleton = self._prune_with_skan(skeleton)
 
         if return_vesselness:
-            return skeleton.astype(np.float32), vesselness
-        return skeleton.astype(np.float32), None
+            return skeleton.astype(np.float32), vesselness, binary.astype(np.uint8)
+        return skeleton.astype(np.float32), None, binary.astype(np.uint8)
 
     def _prune_with_skan(self, skeleton_img: np.ndarray) -> np.ndarray:
         """
