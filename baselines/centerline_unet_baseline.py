@@ -27,7 +27,6 @@ from scipy.ndimage import distance_transform_edt, binary_dilation
 from skimage.morphology import skeletonize
 import numpy as np
 from typing import Optional, Tuple, List
-
 from skan import Skeleton as SkanSkeleton, summarize
 
 
