@@ -2,12 +2,14 @@
 """
 =========================
 Centerline UNet CNN Baseline
+Optimized for Speed (AMP, cuDNN, Non-Blocking Transfers).
 """
 
 import os
 import glob
 import numpy as np
 import torch
+import torch.amp  # Added for Mixed Precision
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -104,7 +106,6 @@ class ManualDriveDataset(Dataset):
         gt_t    = torch.from_numpy(augmented['mask']).float().unsqueeze(0)
         mask_t  = torch.from_numpy(augmented['fov']).float().unsqueeze(0) / 255.0
 
-        # FIX: convert vessel_mask to tensor so DataLoader can collate it
         vessel_mask_t = torch.from_numpy(
             augmented['thick_gt'].astype(np.float32)
         ).unsqueeze(0)
@@ -119,10 +120,10 @@ class ManualDriveDataset(Dataset):
 
 
 # ==========================================
-# TRAINING HELPERS
+# TRAINING HELPERS (OPTIMIZED FOR SPEED)
 # ==========================================
 
-def run_epoch(model, loader, criterion, optimizer=None, device="cpu", desc="Processing"):
+def run_epoch(model, loader, criterion, optimizer=None, device="cpu", desc="Processing", scaler=None):
     if optimizer:
         model.train()
     else:
@@ -131,19 +132,28 @@ def run_epoch(model, loader, criterion, optimizer=None, device="cpu", desc="Proc
     total_loss = 0
     with torch.set_grad_enabled(optimizer is not None):
         for batch in tqdm(loader, desc=desc, leave=False):
-            img    = batch['image'].to(device)
-            target = batch['centerline'].to(device)
-            mask   = batch['mask'].to(device)
+            # SPEEDUP 1: non_blocking=True allows overlap between CPU data loading and GPU compute
+            img    = batch['image'].to(device, non_blocking=True)
+            target = batch['centerline'].to(device, non_blocking=True)
+            mask   = batch['mask'].to(device, non_blocking=True)
 
             if optimizer:
-                optimizer.zero_grad()
+                # SPEEDUP 2: set_to_none=True is faster than zeroing memory
+                optimizer.zero_grad(set_to_none=True)
 
-            pred = model(img)
-            loss, _ = criterion(pred, target, mask=mask)
+            # SPEEDUP 3: Automatic Mixed Precision (AMP)
+            with torch.autocast(device_type='cuda' if 'cuda' in device else 'cpu', enabled='cuda' in device):
+                pred = model(img)
+                loss, _ = criterion(pred, target, mask=mask)
 
             if optimizer:
-                loss.backward()
-                optimizer.step()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
             total_loss += loss.item()
 
@@ -177,7 +187,6 @@ def evaluate_and_visualize(checkpoint_path, test_indices):
     os.makedirs(panels_dir, exist_ok=True)
 
     dataset = ManualDriveDataset(DRIVE_ROOT, test_indices, augment=False)
-    # FIX: num_workers + pin_memory for GPU throughput
     loader  = DataLoader(dataset, batch_size=1, num_workers=NUM_WORKERS, pin_memory=True)
 
     with warnings.catch_warnings():
@@ -193,8 +202,6 @@ def evaluate_and_visualize(checkpoint_path, test_indices):
         img_np   = batch['image'][0, 0].numpy()
         mask_np  = (batch['mask'][0, 0].numpy() * 255).astype(np.uint8)
         gt_skel  = (batch['centerline'][0, 0].numpy() * 255).astype(np.uint8)
-
-        # FIX: vessel_mask is now a tensor → unpack with [0, 0]
         gt_vessel_mask = (batch['vessel_mask'][0, 0].numpy() > 0).astype(np.uint8)
 
         img_path = batch['path'][0]
@@ -206,7 +213,7 @@ def evaluate_and_visualize(checkpoint_path, test_indices):
             pred_skel,
             gt_skel,
             gt_vessel_mask = gt_vessel_mask,
-            pred_prob      = prob_map,   # raw sigmoid → hard clDice via thresholding
+            pred_prob      = prob_map,
             fov_mask       = mask_np,
         )
         res['image_id'] = image_id
@@ -215,37 +222,29 @@ def evaluate_and_visualize(checkpoint_path, test_indices):
         gt_vis   = (gt_skel   > 0).astype(np.uint8) * 255
         pred_vis = (pred_skel > 0).astype(np.uint8) * 255
         mosaic_data.append({
-            "image_id":     image_id,
-            "gt_skeleton":  gt_vis,
+            "image_id":      image_id,
+            "gt_skeleton":   gt_vis,
             "pred_skeleton": pred_vis,
-            "metrics":      res,
+            "metrics":       res,
         })
 
         # ── 4-Panel Visualization ──
         fig, axes = plt.subplots(1, 4, figsize=(24, 7), facecolor='white')
 
-        # Panel 0: original RGB (re-opened and transformed for display)
-        axes[0].imshow(
-            val_transform(image=np.array(Image.open(img_path).convert('RGB')))['image']
-        )
+        axes[0].imshow(val_transform(image=np.array(Image.open(img_path).convert('RGB')))['image'])
         axes[0].set_title("Input Image")
 
-        # Panel 1: probability map masked to FOV
         axes[1].imshow(prob_map * (mask_np > 0), cmap='inferno', vmin=0, vmax=1)
         axes[1].set_title("Probability Map")
 
-        # Panel 2: GT vs Pred skeletons side by side
         axes[2].imshow(np.concatenate([gt_vis, pred_vis], axis=1), cmap='gray')
         axes[2].set_title("GT (left) | Pred (right)")
 
-        # Panel 3: colour overlay — green=GT, red=Pred, yellow=overlap
         overlay = np.zeros((img_np.shape[0], img_np.shape[1], 3), dtype=np.uint8)
-        overlay[..., 1] = gt_vis    # green channel = GT
-        overlay[..., 0] = pred_vis  # red channel   = Pred
+        overlay[..., 1] = gt_vis
+        overlay[..., 0] = pred_vis
         axes[3].imshow(overlay)
-        axes[3].set_title(
-            f"F1@2px: {res['f1@2px']:.3f} | clDice: {res.get('clDice', 0):.3f}"
-        )
+        axes[3].set_title(f"F1@2px: {res['f1@2px']:.3f} | clDice: {res.get('clDice', 0):.3f}")
 
         for ax in axes:
             ax.axis('off')
@@ -263,8 +262,8 @@ def evaluate_and_visualize(checkpoint_path, test_indices):
         for i, data in enumerate(mosaic_data):
             h, w = data['gt_skeleton'].shape
             over = np.zeros((h, w, 3), dtype=np.uint8)
-            over[..., 1] = data['gt_skeleton']   # green = GT
-            over[..., 0] = data['pred_skeleton']  # red   = Pred
+            over[..., 1] = data['gt_skeleton']
+            over[..., 0] = data['pred_skeleton']
             axes[i].imshow(over)
             axes[i].set_title(
                 f"ID: {data['image_id']}\nF1@2px: {data['metrics']['f1@2px']:.3f}",
@@ -302,6 +301,10 @@ def evaluate_and_visualize(checkpoint_path, test_indices):
 # ==========================================
 
 if __name__ == "__main__":
+    # SPEEDUP 4: Enable cuDNN hardware autotuning for faster convolutions
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+
     idx       = list(range(20))
     train_idx = idx[:16]
     val_idx   = idx[16:]
@@ -311,7 +314,6 @@ if __name__ == "__main__":
     if RUN_TRAINING:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        # FIX: num_workers + pin_memory on both loaders
         train_loader = DataLoader(
             ManualDriveDataset(DRIVE_ROOT, train_idx, augment=True),
             batch_size=BATCH_SIZE, shuffle=True,
@@ -327,14 +329,18 @@ if __name__ == "__main__":
         criterion = CenterlineLoss(0.4, 0.6, pos_weight=10.0)
         optimizer = optim.AdamW(model.parameters(), lr=LR)
         scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
+        
+        # Initialize AMP Scaler
+        scaler = torch.amp.GradScaler('cuda' if 'cuda' in DEVICE else 'cpu', enabled='cuda' in DEVICE)
 
         train_hist, val_hist = [], []
         best_val_loss = float('inf')
 
         print(f"--- Starting Training ({EPOCHS} Epochs) on {DEVICE} ---")
         for epoch in range(1, EPOCHS + 1):
-            t_loss = run_epoch(model, train_loader, criterion, optimizer, DEVICE, "Train")
-            v_loss = run_epoch(model, val_loader,   criterion, None,      DEVICE, "Val")
+            t_loss = run_epoch(model, train_loader, criterion, optimizer, DEVICE, "Train", scaler=scaler)
+            v_loss = run_epoch(model, val_loader,   criterion, None,      DEVICE, "Val",   scaler=None)
+            
             train_hist.append(t_loss)
             val_hist.append(v_loss)
             scheduler.step()
@@ -346,9 +352,7 @@ if __name__ == "__main__":
                     SAVE_PATH,
                 )
 
-            if epoch % 10 == 0 or epoch == 1:
-                print(f"Epoch {epoch:>3}/{EPOCHS} | "
-                      f"Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f}")
+            print(f"Epoch {epoch:>3}/{EPOCHS} | Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f}")
 
         plot_loss_curves(
             train_hist, val_hist,

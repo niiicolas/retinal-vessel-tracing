@@ -24,7 +24,6 @@ class FundusPreprocessor:
         self.clahe_tile_size = clahe_tile_size
         self.gamma = gamma
         self.median_kernel = median_kernel
-        # self.clahe is no longer initialized here
 
     # --------------------------------------------------
     # CHANNEL EXTRACTION

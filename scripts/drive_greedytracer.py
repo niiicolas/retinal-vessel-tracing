@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.patches import Patch
 from tqdm import tqdm
-from skimage.morphology import skeletonize
+from skimage.morphology import skeletonize, binary_dilation, disk
 import pandas as pd
 
 from baselines.greedy_tracer_baseline import GreedyTracerBaseline
@@ -41,7 +41,7 @@ FONT_SIZE_TITLE  = 14
 FONT_SIZE_LABEL  = 12
 FONT_SIZE_TICK   = 10
 FONT_SIZE_LEGEND = 10
-TOP_N_ORDER      = 50   
+TOP_N_ORDER      = 50
 DPI              = 200
 
 # ==========================================
@@ -52,6 +52,7 @@ def load_full_dataset(drive_root: str):
     gt_paths   = sorted(glob.glob(os.path.join(drive_root, "1st_manual", "*.gif")))
     mask_paths = sorted(glob.glob(os.path.join(drive_root, "mask",       "*.gif")))
     return img_paths, gt_paths, mask_paths
+
 
 def save_standard_panel(img_rgb, vesselness, gt_skel_vis, pred_skel_vis, mask, res, image_id, panels_dir):
     fov_bin    = (mask > 0).astype(np.float32)
@@ -70,8 +71,8 @@ def save_standard_panel(img_rgb, vesselness, gt_skel_vis, pred_skel_vis, mask, r
     axes[2].set_title("1px Skeletons\n(Left: GT | Right: Pred)", fontweight='bold', fontsize=FONT_SIZE_TITLE)
 
     overlay = np.zeros((*img_rgb.shape[:2], 3), dtype=np.uint8)
-    overlay[..., 1] = gt_skel_vis
-    overlay[..., 0] = pred_skel_vis
+    overlay[..., 1] = gt_skel_vis    # green = GT
+    overlay[..., 0] = pred_skel_vis  # red   = Pred
     axes[3].imshow(overlay)
     axes[3].set_title(
         f"Overlay Analysis\nF1@2px: {res['f1@2px']:.3f} | clDice: {res.get('clDice', 0):.3f}",
@@ -91,8 +92,10 @@ def save_standard_panel(img_rgb, vesselness, gt_skel_vis, pred_skel_vis, mask, r
         ax.axis('off')
 
     plt.tight_layout()
-    plt.savefig(os.path.join(panels_dir, f"{image_id}_greedy_panel.png"), bbox_inches='tight', dpi=DPI)
+    plt.savefig(os.path.join(panels_dir, f"{image_id}_greedy_panel.png"),
+                bbox_inches='tight', dpi=DPI)
     plt.close()
+
 
 def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir):
     if len(traces) == 0:
@@ -122,7 +125,6 @@ def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir):
         coords = np.array(traces[i])
         color  = cmap_order(order_norm(i))
         axes[1].plot(coords[:, 1], coords[:, 0], color=color, linewidth=1.2)
-
     axes[1].set_title(f"Top-{n_show} Visit Order", color='white', fontsize=FONT_SIZE_TITLE)
 
     sm = plt.cm.ScalarMappable(cmap=cmap_order, norm=order_norm)
@@ -133,7 +135,10 @@ def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir):
 
     axes[2].axis('on')
     axes[2].set_facecolor('#1a1a1a')
-    log_bins = np.logspace(np.log10(max(trace_lengths.min(), 1)), np.log10(trace_lengths.max()), 40)
+    log_bins = np.logspace(
+        np.log10(max(trace_lengths.min(), 1)),
+        np.log10(trace_lengths.max()), 40,
+    )
     axes[2].hist(trace_lengths, bins=log_bins, color='#f07f2a', alpha=0.85)
     axes[2].set_xscale('log')
     axes[2].set_title("Length Distribution (log x)", color='white', fontsize=FONT_SIZE_TITLE)
@@ -141,12 +146,16 @@ def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir):
     axes[2].set_xlabel('Trace Length (pixels)', color='white', fontsize=FONT_SIZE_LABEL)
     axes[2].set_ylabel('Count (Number of Traces)', color='white', fontsize=FONT_SIZE_LABEL)
 
-    plt.suptitle(f"Greedy Tracer Trajectory Analysis — Image {image_id}", 
-                 color='white', fontsize=FONT_SIZE_TITLE + 4, fontweight='bold', y=1.02)
+    plt.suptitle(
+        f"Greedy Tracer Trajectory Analysis — Image {image_id}",
+        color='white', fontsize=FONT_SIZE_TITLE + 4, fontweight='bold', y=1.02,
+    )
 
     plt.tight_layout()
-    plt.savefig(os.path.join(traj_dir, f"{image_id}_trajectory.png"), facecolor=BG, dpi=DPI, bbox_inches='tight')
+    plt.savefig(os.path.join(traj_dir, f"{image_id}_trajectory.png"),
+                facecolor=BG, dpi=DPI, bbox_inches='tight')
     plt.close()
+
 
 # ==========================================
 # MAIN
@@ -164,7 +173,11 @@ def main():
     metrics_fn = CenterlineMetrics(tolerance_levels=[1, 2, 3])
     all_metrics = []
 
-    for img_path, gt_path, mask_path in tqdm(zip(img_paths, gt_paths, mask_paths), total=num_total, desc="Evaluating Greedy Tracer"):
+    for img_path, gt_path, mask_path in tqdm(
+        zip(img_paths, gt_paths, mask_paths),
+        total=num_total,
+        desc="Evaluating Greedy Tracer",
+    ):
         image_id = os.path.basename(img_path).split('_')[0]
 
         img_rgb = np.array(Image.open(img_path).convert('RGB'))
@@ -175,15 +188,20 @@ def main():
         gt_vessel_mask = (gt > 128).astype(np.uint8)
 
         pred_skel, vesselness, traces = model.extract_centerline(
-            img_rgb, external_fov_mask=mask, return_vesselness=True
+            img_rgb, external_fov_mask=mask, return_vesselness=True,
         )
+
+        # Dilate the 1px skeleton to get a thick vessel mask for clDice.
+        # The greedy tracer only produces a centerline, not a vessel region,
+        # so we approximate the vessel mask with a small morphological dilation.
+        pred_vessel_mask = binary_dilation(pred_skel > 0, disk(2)).astype(np.uint8)
 
         res = metrics_fn.compute_all_metrics(
             pred_skel,
             gt_skel,
-            gt_vessel_mask = gt_vessel_mask,
-            pred_prob      = vesselness,   
-            fov_mask       = mask,
+            pred_vessel_mask = pred_vessel_mask,
+            gt_vessel_mask   = gt_vessel_mask,
+            fov_mask         = mask,
         )
 
         res.update({
@@ -193,10 +211,15 @@ def main():
         })
         all_metrics.append(res)
 
-        save_standard_panel(img_rgb, vesselness, gt_skel, pred_skel, mask, res, image_id, panels_dir)
+        # Normalise to {0, 255} before passing to visualization
+        gt_skel_vis   = (gt_skel   > 0).astype(np.uint8) * 255
+        pred_skel_vis = (pred_skel > 0).astype(np.uint8) * 255
+
+        save_standard_panel(img_rgb, vesselness, gt_skel_vis, pred_skel_vis,
+                            mask, res, image_id, panels_dir)
         save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir)
 
-    # ── GLOBAL SUMMARY ──────────────────────────────────────────────────────
+    # ── GLOBAL SUMMARY ──
     df = pd.DataFrame(all_metrics)
 
     metric_cols = [
@@ -207,11 +230,10 @@ def main():
         "f1@3px", "precision@3px", "recall@3px",
     ]
 
-    summary_rows = []
-    for col in metric_cols:
-        if col in df.columns:
-            summary_rows.append({"Metric": col, "Mean ± Std": f"{df[col].mean():.4f} ± {df[col].std():.4f}"})
-
+    summary_rows = [
+        {"Metric": col, "Mean ± Std": f"{df[col].mean():.4f} ± {df[col].std():.4f}"}
+        for col in metric_cols if col in df.columns
+    ]
     summary_df = pd.DataFrame(summary_rows)
 
     print("\n" + "=" * 55)
@@ -220,8 +242,9 @@ def main():
     print(summary_df.to_string(index=False))
     print("=" * 55)
 
-    summary_df.to_csv(os.path.join(OUTPUT_DIR, "metrics_summary.csv"), index=False)
-    df.to_csv(os.path.join(OUTPUT_DIR, "metrics_per_image.csv"), index=False)
+    summary_df.to_csv(os.path.join(OUTPUT_DIR, "metrics_summary.csv"),   index=False)
+    df.to_csv(        os.path.join(OUTPUT_DIR, "metrics_per_image.csv"), index=False)
+
 
 if __name__ == "__main__":
     main()

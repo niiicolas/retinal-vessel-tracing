@@ -123,7 +123,7 @@ class CenterlineUNet(nn.Module):
         # Bottleneck
         self.bot  = DownBlock(ch[3], ch[4])            # (B, 256, H/16, W/16)
 
-        # FIX 1: Decoder channels are now explicit and index-driven
+        # Decoder channels are now explicit and index-driven
         #   UpBlock(in_from_below, skip_from_encoder, out)
         self.up3 = UpBlock(ch[4], ch[3], ch[3])       # 256 + 128 → 128
         self.up2 = UpBlock(ch[3], ch[2], ch[2])       # 128 +  64 →  64
@@ -246,11 +246,11 @@ class CenterlineLoss(nn.Module):
         skel_target = soft_skeleton(target, self.skeleton_iter)
 
         # Topology-Precision: how much of pred-skeleton lies on target
-        tprec = (skel_pred * target).sum(dim=[1, 2, 3]) / (skel_pred.sum(dim=[1, 2, 3]) + 1e-8)
+        tprec = (skel_pred * target).sum(dim=[1, 2, 3]) / (skel_pred.sum(dim=[1, 2, 3]) + 1e-5)
         # Topology-Sensitivity: how much of gt-skeleton is covered by pred
-        tsens = (skel_target * pred).sum(dim=[1, 2, 3]) / (skel_target.sum(dim=[1, 2, 3]) + 1e-8)
+        tsens = (skel_target * pred).sum(dim=[1, 2, 3]) / (skel_target.sum(dim=[1, 2, 3]) + 1e-5)
 
-        cl_dice = 2 * tprec * tsens / (tprec + tsens + 1e-8)
+        cl_dice = 2 * tprec * tsens / (tprec + tsens + 1e-5)
         return cl_dice.mean()
 
     def forward(
@@ -275,12 +275,12 @@ class CenterlineLoss(nn.Module):
             p = pred.reshape(-1)
             t = target.reshape(-1)
 
-        # FIX 2: Single clean BCE path — no silent overwrite
+        # Single clean BCE path — no silent overwrite
         pw = self.pos_weight.to(pred.device) if self.pos_weight is not None else None
         if pw is not None:
             # Weighted BCE: penalises false negatives on rare centerline pixels
-            bce = -(pw * t * torch.log(p + 1e-8)
-                    + (1 - t) * torch.log(1 - p + 1e-8)).mean()
+            bce = -(pw * t * torch.log(p + 1e-5)
+                    + (1 - t) * torch.log(1 - p + 1e-5)).mean()
         else:
             bce = F.binary_cross_entropy(p, t, reduction='mean')
 
