@@ -2,10 +2,6 @@
 """
 =========================
 Centerline UNet CNN Baseline
-- Fixed: NameError for 'predictor'
-- Fixed: FutureWarning for torch.load
-- Fixed: clDice always 0 (wrong positional arg in compute_all_metrics)
-- Features: Best-Model checkpointing, Loss Curves, and Mosaic Overview
 """
 
 import os
@@ -17,7 +13,6 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from PIL import Image
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 from tqdm import tqdm
 from skimage.morphology import skeletonize
 import pandas as pd
@@ -40,8 +35,9 @@ EPOCHS       = 100
 BATCH_SIZE   = 2
 LR           = 1e-3
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
+NUM_WORKERS  = 2   # set to 0 if multiprocessing causes issues on Windows
 
-MODEL_CFG    = dict(in_channels=1, base_ch=16, depth=4)
+MODEL_CFG    = dict(in_channels=1, base_ch=16)
 
 # ==========================================
 # TRANSFORMS & DATASET
@@ -63,6 +59,7 @@ def get_val_transforms():
         A.LongestMaxSize(max_size=584),
         A.PadIfNeeded(min_height=584, min_width=584, border_mode=0),
     ], additional_targets={'fov': 'mask', 'thick_gt': 'mask'})
+
 
 class ManualDriveDataset(Dataset):
     def __init__(self, root, indices, augment=False):
@@ -90,7 +87,8 @@ class ManualDriveDataset(Dataset):
             self.thick_gts.append((gt > 128).astype(np.float32))
             self.masks.append(mask)
 
-    def __len__(self): return len(self.img_paths)
+    def __len__(self):
+        return len(self.img_paths)
 
     def __getitem__(self, idx):
         preprocessed = self.preprocessed[idx]
@@ -106,32 +104,58 @@ class ManualDriveDataset(Dataset):
         gt_t    = torch.from_numpy(augmented['mask']).float().unsqueeze(0)
         mask_t  = torch.from_numpy(augmented['fov']).float().unsqueeze(0) / 255.0
 
-        return {'image': img_t, 'centerline': gt_t, 'mask': mask_t,
-                'vessel_mask': augmented['thick_gt'].astype(np.uint8), 'path': self.img_paths[idx]}
+        # FIX: convert vessel_mask to tensor so DataLoader can collate it
+        vessel_mask_t = torch.from_numpy(
+            augmented['thick_gt'].astype(np.float32)
+        ).unsqueeze(0)
+
+        return {
+            'image':       img_t,
+            'centerline':  gt_t,
+            'mask':        mask_t,
+            'vessel_mask': vessel_mask_t,
+            'path':        self.img_paths[idx],
+        }
+
 
 # ==========================================
 # TRAINING HELPERS
 # ==========================================
+
 def run_epoch(model, loader, criterion, optimizer=None, device="cpu", desc="Processing"):
-    if optimizer: model.train()
-    else: model.eval()
+    if optimizer:
+        model.train()
+    else:
+        model.eval()
+
     total_loss = 0
     with torch.set_grad_enabled(optimizer is not None):
         for batch in tqdm(loader, desc=desc, leave=False):
-            img, target, mask = batch['image'].to(device), batch['centerline'].to(device), batch['mask'].to(device)
-            if optimizer: optimizer.zero_grad()
+            img    = batch['image'].to(device)
+            target = batch['centerline'].to(device)
+            mask   = batch['mask'].to(device)
+
+            if optimizer:
+                optimizer.zero_grad()
+
             pred = model(img)
             loss, _ = criterion(pred, target, mask=mask)
+
             if optimizer:
                 loss.backward()
                 optimizer.step()
+
             total_loss += loss.item()
+
     return total_loss / len(loader)
+
 
 def plot_loss_curves(train_losses, val_losses, save_path):
     plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(train_losses)+1), train_losses, label='Train Loss', color='#1f77b4', lw=2)
-    plt.plot(range(1, len(val_losses)+1), val_losses, label='Val Loss', color='#ff7f0e', lw=2, linestyle='--')
+    plt.plot(range(1, len(train_losses) + 1), train_losses,
+             label='Train Loss', color='#1f77b4', lw=2)
+    plt.plot(range(1, len(val_losses) + 1), val_losses,
+             label='Val Loss', color='#ff7f0e', lw=2, linestyle='--')
     plt.title("CNN Training Progression", fontsize=14, fontweight='bold')
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
@@ -141,106 +165,163 @@ def plot_loss_curves(train_losses, val_losses, save_path):
     plt.savefig(save_path, dpi=150)
     plt.close()
 
+
 # ==========================================
 # EVALUATION & MOSAIC
 # ==========================================
+
 @torch.no_grad()
 def evaluate_and_visualize(checkpoint_path, test_indices):
-    print(f"\nEvaluating on Test Set")
+    print("\nEvaluating on Test Set")
     panels_dir = os.path.join(OUTPUT_DIR, "panels")
     os.makedirs(panels_dir, exist_ok=True)
 
-    dataset    = ManualDriveDataset(DRIVE_ROOT, test_indices, augment=False)
-    loader     = DataLoader(dataset, batch_size=1, num_workers=0)
+    dataset = ManualDriveDataset(DRIVE_ROOT, test_indices, augment=False)
+    # FIX: num_workers + pin_memory for GPU throughput
+    loader  = DataLoader(dataset, batch_size=1, num_workers=NUM_WORKERS, pin_memory=True)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         predictor = CenterlinePredictor.from_checkpoint(checkpoint_path, device=DEVICE)
 
-    metrics_fn = CenterlineMetrics(tolerance_levels=[1, 2, 3])
+    metrics_fn    = CenterlineMetrics(tolerance_levels=[1, 2, 3])
     val_transform = get_val_transforms()
-    all_metrics, mosaic_data = [], []
+    all_metrics   = []
+    mosaic_data   = []
 
     for batch in tqdm(loader, desc="Testing"):
-        img_np         = batch['image'][0, 0].numpy()
-        mask_np        = (batch['mask'][0, 0].numpy() * 255).astype(np.uint8)
-        gt_skel        = (batch['centerline'][0, 0].numpy() * 255).astype(np.uint8)
-        gt_vessel_mask = (batch['vessel_mask'][0].numpy() > 0).astype(np.uint8)  # fixed
-        img_path       = batch['path'][0]
-        image_id       = os.path.basename(img_path).split('_')[0]
+        img_np   = batch['image'][0, 0].numpy()
+        mask_np  = (batch['mask'][0, 0].numpy() * 255).astype(np.uint8)
+        gt_skel  = (batch['centerline'][0, 0].numpy() * 255).astype(np.uint8)
+
+        # FIX: vessel_mask is now a tensor → unpack with [0, 0]
+        gt_vessel_mask = (batch['vessel_mask'][0, 0].numpy() > 0).astype(np.uint8)
+
+        img_path = batch['path'][0]
+        image_id = os.path.basename(img_path).split('_')[0]
 
         prob_map, pred_skel = predictor.predict(img_np, fov_mask=mask_np)
 
         res = metrics_fn.compute_all_metrics(
             pred_skel,
             gt_skel,
-            pred_vessel_mask = (pred_skel > 0).astype(np.uint8),
-            gt_vessel_mask   = gt_vessel_mask,
+            gt_vessel_mask = gt_vessel_mask,
+            pred_prob      = prob_map,   # raw sigmoid → hard clDice via thresholding
+            fov_mask       = mask_np,
         )
         res['image_id'] = image_id
         all_metrics.append(res)
 
-        gt_vis, pred_vis = (gt_skel > 0).astype(np.uint8) * 255, (pred_skel > 0).astype(np.uint8) * 255
-        mosaic_data.append({"image_id": image_id, "gt_skeleton": gt_vis, "pred_skeleton": pred_vis, "metrics": res})
+        gt_vis   = (gt_skel   > 0).astype(np.uint8) * 255
+        pred_vis = (pred_skel > 0).astype(np.uint8) * 255
+        mosaic_data.append({
+            "image_id":     image_id,
+            "gt_skeleton":  gt_vis,
+            "pred_skeleton": pred_vis,
+            "metrics":      res,
+        })
 
-        # 4-Panel Visualization
+        # ── 4-Panel Visualization ──
         fig, axes = plt.subplots(1, 4, figsize=(24, 7), facecolor='white')
-        axes[0].imshow(val_transform(image=np.array(Image.open(img_path).convert('RGB')))['image'])
-        axes[1].imshow(prob_map * (mask_np > 0), cmap='gray')
+
+        # Panel 0: original RGB (re-opened and transformed for display)
+        axes[0].imshow(
+            val_transform(image=np.array(Image.open(img_path).convert('RGB')))['image']
+        )
+        axes[0].set_title("Input Image")
+
+        # Panel 1: probability map masked to FOV
+        axes[1].imshow(prob_map * (mask_np > 0), cmap='inferno', vmin=0, vmax=1)
+        axes[1].set_title("Probability Map")
+
+        # Panel 2: GT vs Pred skeletons side by side
         axes[2].imshow(np.concatenate([gt_vis, pred_vis], axis=1), cmap='gray')
+        axes[2].set_title("GT (left) | Pred (right)")
+
+        # Panel 3: colour overlay — green=GT, red=Pred, yellow=overlap
         overlay = np.zeros((img_np.shape[0], img_np.shape[1], 3), dtype=np.uint8)
-        overlay[..., 1], overlay[..., 0] = gt_vis, pred_vis
+        overlay[..., 1] = gt_vis    # green channel = GT
+        overlay[..., 0] = pred_vis  # red channel   = Pred
         axes[3].imshow(overlay)
-        axes[3].set_title(f"F1@2px: {res['f1@2px']:.3f} | clDice: {res.get('clDice', 0):.3f}")
-        for ax in axes: ax.axis('off')
+        axes[3].set_title(
+            f"F1@2px: {res['f1@2px']:.3f} | clDice: {res.get('clDice', 0):.3f}"
+        )
+
+        for ax in axes:
+            ax.axis('off')
+
         plt.tight_layout()
-        plt.savefig(os.path.join(panels_dir, f"{image_id}_panel.png"))
+        plt.savefig(os.path.join(panels_dir, f"{image_id}_panel.png"), dpi=150)
         plt.close()
 
-    # Mosaic Overview
+    # ── Mosaic Overview ──
     if mosaic_data:
-        n = len(mosaic_data)
-        fig, axes = plt.subplots(1, n, figsize=(n*5, 5))
-        if n == 1: axes = [axes]
+        n    = len(mosaic_data)
+        fig, axes = plt.subplots(1, n, figsize=(n * 5, 5))
+        if n == 1:
+            axes = [axes]
         for i, data in enumerate(mosaic_data):
             h, w = data['gt_skeleton'].shape
             over = np.zeros((h, w, 3), dtype=np.uint8)
-            over[..., 1], over[..., 0] = data['gt_skeleton'], data['pred_skeleton']
+            over[..., 1] = data['gt_skeleton']   # green = GT
+            over[..., 0] = data['pred_skeleton']  # red   = Pred
             axes[i].imshow(over)
-            axes[i].set_title(f"ID: {data['image_id']}\nF1@2px: {data['metrics']['f1@2px']:.3f}", fontweight='bold')
+            axes[i].set_title(
+                f"ID: {data['image_id']}\nF1@2px: {data['metrics']['f1@2px']:.3f}",
+                fontweight='bold',
+            )
             axes[i].axis('off')
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, "mosaic_overview.png"), dpi=200)
         plt.close()
 
+    # ── Results Table ──
     df = pd.DataFrame(all_metrics)
-    metric_cols = ["clDice", "betti_0_error", "hd95",
-                   "f1@1px", "precision@1px", "recall@1px",
-                   "f1@2px", "precision@2px", "recall@2px",
-                   "f1@3px", "precision@3px", "recall@3px"]
-    summary_rows = [{"Metric": c, "Mean ± Std": f"{df[c].mean():.4f} ± {df[c].std():.4f}"}
-                    for c in metric_cols if c in df.columns]
+    metric_cols = [
+        "clDice", "betti_0_error", "hd95",
+        "f1@1px",   "precision@1px",   "recall@1px",
+        "f1@2px",   "precision@2px",   "recall@2px",
+        "f1@3px",   "precision@3px",   "recall@3px",
+    ]
+    summary_rows = [
+        {"Metric": c, "Mean ± Std": f"{df[c].mean():.4f} ± {df[c].std():.4f}"}
+        for c in metric_cols if c in df.columns
+    ]
     summary_df = pd.DataFrame(summary_rows)
-    print("\n" + "="*45 + "\n   FINAL RESULTS\n" + "="*45)
-    print(summary_df.to_string(index=False))
-    print("="*45)
 
-    summary_df.to_csv(os.path.join(OUTPUT_DIR, "metrics_summary.csv"), index=False)
-    df.to_csv(os.path.join(OUTPUT_DIR, "metrics_per_image.csv"), index=False)
+    print("\n" + "=" * 45 + "\n   FINAL RESULTS\n" + "=" * 45)
+    print(summary_df.to_string(index=False))
+    print("=" * 45)
+
+    summary_df.to_csv(os.path.join(OUTPUT_DIR, "metrics_summary.csv"),   index=False)
+    df.to_csv(        os.path.join(OUTPUT_DIR, "metrics_per_image.csv"), index=False)
+
 
 # ==========================================
 # MAIN
 # ==========================================
+
 if __name__ == "__main__":
-    idx = list(range(20))
-    train_idx, val_idx = idx[:16], idx[16:]
+    idx       = list(range(20))
+    train_idx = idx[:16]
+    val_idx   = idx[16:]
 
     RUN_TRAINING = True
 
     if RUN_TRAINING:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        train_loader = DataLoader(ManualDriveDataset(DRIVE_ROOT, train_idx, augment=True), batch_size=BATCH_SIZE, shuffle=True)
-        val_loader   = DataLoader(ManualDriveDataset(DRIVE_ROOT, val_idx, augment=False), batch_size=1)
+
+        # FIX: num_workers + pin_memory on both loaders
+        train_loader = DataLoader(
+            ManualDriveDataset(DRIVE_ROOT, train_idx, augment=True),
+            batch_size=BATCH_SIZE, shuffle=True,
+            num_workers=NUM_WORKERS, pin_memory=True,
+        )
+        val_loader = DataLoader(
+            ManualDriveDataset(DRIVE_ROOT, val_idx, augment=False),
+            batch_size=1,
+            num_workers=NUM_WORKERS, pin_memory=True,
+        )
 
         model     = CenterlineUNet(**MODEL_CFG).to(DEVICE)
         criterion = CenterlineLoss(0.4, 0.6, pos_weight=10.0)
@@ -250,22 +331,29 @@ if __name__ == "__main__":
         train_hist, val_hist = [], []
         best_val_loss = float('inf')
 
-        print(f"--- Starting Training ({EPOCHS} Epochs) ---")
+        print(f"--- Starting Training ({EPOCHS} Epochs) on {DEVICE} ---")
         for epoch in range(1, EPOCHS + 1):
             t_loss = run_epoch(model, train_loader, criterion, optimizer, DEVICE, "Train")
-            v_loss = run_epoch(model, val_loader, criterion, None, DEVICE, "Val")
+            v_loss = run_epoch(model, val_loader,   criterion, None,      DEVICE, "Val")
             train_hist.append(t_loss)
             val_hist.append(v_loss)
             scheduler.step()
 
             if v_loss < best_val_loss:
                 best_val_loss = v_loss
-                torch.save({'model_state': model.state_dict(), 'model_cfg': MODEL_CFG}, SAVE_PATH)
+                torch.save(
+                    {'model_state': model.state_dict(), 'model_cfg': MODEL_CFG},
+                    SAVE_PATH,
+                )
 
             if epoch % 10 == 0 or epoch == 1:
-                print(f"Epoch {epoch:>3}/{EPOCHS} | Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f}")
+                print(f"Epoch {epoch:>3}/{EPOCHS} | "
+                      f"Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f}")
 
-        plot_loss_curves(train_hist, val_hist, os.path.join(OUTPUT_DIR, "training_val_curves.png"))
+        plot_loss_curves(
+            train_hist, val_hist,
+            os.path.join(OUTPUT_DIR, "training_val_curves.png"),
+        )
         print(f"Training finished. Best Val Loss: {best_val_loss:.4f}")
 
     if os.path.exists(SAVE_PATH):

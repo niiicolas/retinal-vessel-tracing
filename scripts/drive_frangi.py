@@ -81,14 +81,15 @@ for fname in tqdm(image_files, desc="Evaluating Frangi Baseline"):
     )
 
     # --- Skeletonize GT (Create the 1px Ground Truth) ---
-    gt_skeleton = skeletonize(gt_binary)
+    gt_skeleton = (skeletonize(gt_binary) * 255).astype(np.uint8)
 
     # --- Compute metrics for all tolerances ---
     raw_metrics = metrics_calculator.compute_all_metrics(
-        pred_skeleton,
-        gt_skeleton,
-        pred_vessel_mask=pred_binary, 
-        gt_vessel_mask=gt_binary
+    pred_skeleton,
+    gt_skeleton,
+    gt_vessel_mask = gt_binary.astype(np.uint8),
+    pred_prob      = vesselness, 
+    fov_mask       = external_mask,
     )
 
     f1_2px   = raw_metrics.get('f1@2px', 0.0)

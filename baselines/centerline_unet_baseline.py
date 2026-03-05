@@ -9,7 +9,7 @@ Architecture:
   - 4-level encoder/decoder with skip connections
   - Single-channel sigmoid output → centerline probability map
 
-Loss:c
+Loss:
   - clDice: Topology-aware loss using a differentiable soft-skeleton proxy
   - Binary Cross-Entropy: Pixel-level supervision (with optional pos_weight for imbalance)
   - Combined: Total = w_bce * BCE + w_cl * (1 - clDice)
@@ -23,10 +23,10 @@ Extras:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.ndimage import distance_transform_edt, binary_dilation
 from skimage.morphology import skeletonize
 import numpy as np
 from typing import Optional, Tuple, List
+
 from skan import Skeleton as SkanSkeleton, summarize
 
 
@@ -83,6 +83,7 @@ class UpBlock(nn.Module):
             x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
         return self.conv(torch.cat([x, skip], dim=1))
 
+
 # ==========================================
 # CENTERLINE UNET
 # ==========================================
@@ -93,42 +94,41 @@ class CenterlineUNet(nn.Module):
 
     Input:  (B, in_channels, H, W)  - float32, normalised 0-1
     Output: (B, 1, H, W)            - sigmoid probability map
-    
+
     Default channel widths keep the model ~0.5 M parameters.
+    Only depth=4 is supported.
+
+    Channel layout (base_ch=16):
+        enc0 →  16   enc1 →  32   enc2 →  64   enc3 → 128
+        bot  → 256
+        up3  → 128   up2  →  64   up1  →  32   up0  →  16
     """
 
     def __init__(
         self,
         in_channels: int = 1,
-        base_ch: int = 16,           # multiply for wider network
-        depth: int = 4,              # number of encoder levels (max 4)
+        base_ch: int = 16,
     ):
         super().__init__()
-        assert depth in (3, 4), "depth must be 3 or 4"
 
-        ch = [base_ch * (2 ** i) for i in range(depth + 1)]
-        # e.g. depth=4, base=16 → [16, 32, 64, 128, 256]
+        ch = [base_ch * (2 ** i) for i in range(5)]
+        # ch = [16, 32, 64, 128, 256] for base_ch=16
 
         # Encoder
-        self.enc0 = DSConvBlock(in_channels, ch[0])
-        self.enc1 = DownBlock(ch[0], ch[1])
-        self.enc2 = DownBlock(ch[1], ch[2])
-        self.enc3 = DownBlock(ch[2], ch[3])
+        self.enc0 = DSConvBlock(in_channels, ch[0])   # (B, 16,  H,    W)
+        self.enc1 = DownBlock(ch[0], ch[1])            # (B, 32,  H/2,  W/2)
+        self.enc2 = DownBlock(ch[1], ch[2])            # (B, 64,  H/4,  W/4)
+        self.enc3 = DownBlock(ch[2], ch[3])            # (B, 128, H/8,  W/8)
 
-        # Bottleneck (optional 4th level)
-        self.has_bot = depth == 4
-        if self.has_bot:
-            self.bot = DownBlock(ch[3], ch[4])
+        # Bottleneck
+        self.bot  = DownBlock(ch[3], ch[4])            # (B, 256, H/16, W/16)
 
-        # Decoder
-        if self.has_bot:
-            self.up3 = UpBlock(ch[4], ch[3], ch[3])
-        else:
-            self.up3 = UpBlock(ch[3], ch[2], ch[2])
-
-        self.up2 = UpBlock(ch[3] if self.has_bot else ch[2], ch[2] if self.has_bot else ch[1], ch[2] if self.has_bot else ch[1])
-        self.up1 = UpBlock(ch[2] if self.has_bot else ch[1], ch[1] if self.has_bot else ch[0], ch[1] if self.has_bot else ch[0])
-        self.up0 = UpBlock(ch[1] if self.has_bot else ch[0], ch[0], ch[0])
+        # FIX 1: Decoder channels are now explicit and index-driven
+        #   UpBlock(in_from_below, skip_from_encoder, out)
+        self.up3 = UpBlock(ch[4], ch[3], ch[3])       # 256 + 128 → 128
+        self.up2 = UpBlock(ch[3], ch[2], ch[2])       # 128 +  64 →  64
+        self.up1 = UpBlock(ch[2], ch[1], ch[1])       #  64 +  32 →  32
+        self.up0 = UpBlock(ch[1], ch[0], ch[0])       #  32 +  16 →  16
 
         # Head
         self.head = nn.Sequential(
@@ -156,27 +156,21 @@ class CenterlineUNet(nn.Module):
         s2 = self.enc2(s1)
         s3 = self.enc3(s2)
 
-        if self.has_bot:
-            b = self.bot(s3)
-            d3 = self.up3(b, s3)
-        else:
-            d3 = s3
+        # Bottleneck
+        b = self.bot(s3)
 
-        if self.has_bot:
-            d2 = self.up2(d3, s2)
-            d1 = self.up1(d2, s1)
-            d0 = self.up0(d1, s0)
-        else:
-            d2 = self.up2(d3, s2)
-            d1 = self.up1(d2, s1)
-            d0 = self.up0(d1, s0)
+        # Decoder
+        d3 = self.up3(b,  s3)
+        d2 = self.up2(d3, s2)
+        d1 = self.up1(d2, s1)
+        d0 = self.up0(d1, s0)
 
         return torch.sigmoid(self.head(d0))
+
 
 # ==========================================
 # SOFT SKELETONISATION & clDice LOSS
 # ==========================================
-
 
 def _soft_erode(img: torch.Tensor) -> torch.Tensor:
     """Morphological min-pool (2-connectivity)."""
@@ -206,8 +200,9 @@ def soft_skeleton(img: torch.Tensor, num_iter: int = 10) -> torch.Tensor:
         skel = skel + F.relu(delta - skel * delta)
     return skel
 
+
 # ==========================================
-# Topology - aware Loss
+# Topology-aware Loss
 # ==========================================
 
 class CenterlineLoss(nn.Module):
@@ -245,7 +240,7 @@ class CenterlineLoss(nn.Module):
     ) -> torch.Tensor:
         """
         soft clDice ∈ [0, 1], higher is better.
-        pred, target: (B, 1, H, W) float, [0,1]
+        pred, target: (B, 1, H, W) float, [0, 1]
         """
         skel_pred   = soft_skeleton(pred,   self.skeleton_iter)
         skel_target = soft_skeleton(target, self.skeleton_iter)
@@ -274,27 +269,30 @@ class CenterlineLoss(nn.Module):
             total_loss, {'bce': ..., 'cl_dice': ..., 'total': ...}
         """
         if mask is not None:
-            # flatten & select only ROI pixels for BCE
             p = pred[mask > 0]
             t = target[mask > 0]
         else:
             p = pred.reshape(-1)
             t = target.reshape(-1)
 
+        # FIX 2: Single clean BCE path — no silent overwrite
         pw = self.pos_weight.to(pred.device) if self.pos_weight is not None else None
-        bce = F.binary_cross_entropy(p, t, weight=None, reduction='mean')
         if pw is not None:
-            # manual weighted BCE
-            bce = -(pw * t * torch.log(p + 1e-8) + (1 - t) * torch.log(1 - p + 1e-8)).mean()
+            # Weighted BCE: penalises false negatives on rare centerline pixels
+            bce = -(pw * t * torch.log(p + 1e-8)
+                    + (1 - t) * torch.log(1 - p + 1e-8)).mean()
+        else:
+            bce = F.binary_cross_entropy(p, t, reduction='mean')
 
-        cl_d = self._soft_cl_dice(pred, target)
+        cl_d  = self._soft_cl_dice(pred, target)
         total = self.bce_weight * bce + self.cl_weight * (1.0 - cl_d)
 
         return total, {
-            'bce': bce.item(),
+            'bce':     bce.item(),
             'cl_dice': cl_d.item(),
-            'total': total.item(),
+            'total':   total.item(),
         }
+
 
 # ==========================================
 # Greedy Tracer: Probability Map → Binary Skeleton
@@ -401,15 +399,15 @@ class GreedyTracer:
 
         H, W = prob.shape
         skeleton = np.zeros((H, W), dtype=np.uint8)
-        visited = np.zeros((H, W), dtype=bool)
+        visited  = np.zeros((H, W), dtype=bool)
 
         # Candidate seeds: above threshold AND local maxima
-        candidates = (prob >= self.seed_thresh) & self._local_maxima(prob)
+        candidates  = (prob >= self.seed_thresh) & self._local_maxima(prob)
         seed_coords = np.argwhere(candidates)
 
         # Sort seeds by descending probability (greedy: start from strongest)
-        seed_probs = prob[seed_coords[:, 0], seed_coords[:, 1]]
-        order = np.argsort(-seed_probs)
+        seed_probs  = prob[seed_coords[:, 0], seed_coords[:, 1]]
+        order       = np.argsort(-seed_probs)
         seed_coords = seed_coords[order]
 
         for sr, sc in seed_coords:
@@ -424,24 +422,26 @@ class GreedyTracer:
             skeleton_bool = skeletonize(skeleton > 0)
 
             try:
-                skel = SkanSkeleton(skeleton_bool)
+                skel  = SkanSkeleton(skeleton_bool)
                 stats = summarize(skel, separator='_')
-                
-                # Find short Type 1 (tip-to-junction) branches
-                short_tips = stats[(stats['branch-type'] == 1) & 
-                                   (stats['branch-distance'] < self.min_length)]
-                
+
+                # Prune short tip-to-junction branches (type 1)
+                short_tips = stats[
+                    (stats['branch-type'] == 1) &
+                    (stats['branch-distance'] < self.min_length)
+                ]
+
                 pruned = skeleton_bool.copy()
                 for edge_idx in short_tips.index:
                     coords = skel.path_coordinates(edge_idx)
                     for r, c in coords.astype(int):
                         pruned[r, c] = False
-                
+
                 # Re-skeletonize to ensure perfect 1-pixel junctions
                 skeleton_bool = skeletonize(pruned)
             except Exception:
-                pass # Fallback if graph is too small
-                
+                pass  # Fallback if graph is too small
+
             skeleton = (skeleton_bool * 255).astype(np.uint8)
 
         return skeleton
@@ -471,9 +471,11 @@ class GreedyTracer:
             results.append(self.trace(prob_maps[i], m))
         return np.stack(results, axis=0)
 
+
 # ==========================================
-# FULL INFERENCE PIPELINE
+# FULL PIPELINE
 # ==========================================
+
 class CenterlinePredictor:
     """
     Wraps model + tracer for end-to-end inference.
@@ -488,13 +490,13 @@ class CenterlinePredictor:
         model: CenterlineUNet,
         tracer: Optional[GreedyTracer] = None,
         device: str = 'cpu',
-        patch_size: Optional[int] = None,   # None → full image
+        patch_size: Optional[int] = None,    
         patch_stride: Optional[int] = None,
     ):
-        self.model = model.to(device).eval()
-        self.tracer = tracer or GreedyTracer()
-        self.device = device
-        self.patch_size = patch_size
+        self.model        = model.to(device).eval()
+        self.tracer       = tracer or GreedyTracer()
+        self.device       = device
+        self.patch_size   = patch_size
         self.patch_stride = patch_stride or (patch_size // 2 if patch_size else None)
 
     @classmethod
@@ -504,8 +506,8 @@ class CenterlinePredictor:
         device: str = 'cpu',
         **kwargs,
     ) -> 'CenterlinePredictor':
-        ckpt = torch.load(path, map_location=device, weights_only=False)
-        cfg  = ckpt.get('model_cfg', {})
+        ckpt  = torch.load(path, map_location=device, weights_only=False)
+        cfg   = ckpt.get('model_cfg', {})
         model = CenterlineUNet(**cfg)
         model.load_state_dict(ckpt['model_state'])
         return cls(model, device=device, **kwargs)
@@ -527,7 +529,7 @@ class CenterlinePredictor:
         # Gaussian weight window
         lin   = torch.linspace(-1, 1, ps)
         gauss = torch.exp(-2 * (lin ** 2))
-        win   = (gauss[:, None] * gauss[None, :])
+        win   = gauss[:, None] * gauss[None, :]
 
         ys = list(range(0, H - ps + 1, st)) + [max(0, H - ps)]
         xs = list(range(0, W - ps + 1, st)) + [max(0, W - ps)]
@@ -535,7 +537,7 @@ class CenterlinePredictor:
         for y in set(ys):
             for x in set(xs):
                 patch = img_t[:, y:y + ps, x:x + ps].unsqueeze(0).to(self.device)
-                out = self.model(patch)[0, 0].cpu()
+                out   = self.model(patch)[0, 0].cpu()
                 prob[y:y + ps, x:x + ps]  += out * win
                 count[y:y + ps, x:x + ps] += win
 
@@ -543,7 +545,7 @@ class CenterlinePredictor:
 
     def predict(
         self,
-        image: np.ndarray,           # (H, W) float32 pre-processed
+        image: np.ndarray,            # (H, W) float32 pre-processed
         fov_mask: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -558,13 +560,13 @@ class CenterlinePredictor:
         else:
             prob = self._infer_full(img_t)
 
-        prob_np = prob.numpy()
+        prob_np  = prob.numpy()
         skeleton = self.tracer.trace(prob_np, fov_mask)
         return prob_np, skeleton
 
 
 # ==========================================
-# Sanity check 
+# Sanity check
 # ==========================================
 
 if __name__ == '__main__':
@@ -573,7 +575,7 @@ if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # ── Model ──
-    model = CenterlineUNet(in_channels=1, base_ch=16, depth=4).to(device)
+    model = CenterlineUNet(in_channels=1, base_ch=16).to(device)
     total = sum(p.numel() for p in model.parameters())
     print(f"Parameters : {total:,}  (~{total/1e6:.2f}M)")
 

@@ -181,9 +181,11 @@ def main():
         res = metrics_fn.compute_all_metrics(
             pred_skel,
             gt_skel,
-            pred_vessel_mask = (pred_skel > 0).astype(np.uint8),
-            gt_vessel_mask   = gt_vessel_mask,
+            gt_vessel_mask = gt_vessel_mask,
+            pred_prob      = vesselness,   
+            fov_mask       = mask,
         )
+
         res.update({
             'image_id':   image_id,
             'num_traces': len(traces),
