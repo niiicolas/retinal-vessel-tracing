@@ -22,32 +22,20 @@ class CenterlineExtractor:
         
     def extract_centerline(self, vessel_mask: np.ndarray) -> np.ndarray:
         """Extract centerline from binary vessel mask using skeletonization."""
-        # Ensure binary mask
         binary = vessel_mask > 0.5
-        
-        # Remove small disconnected components
         binary = remove_small_objects(binary, min_size=50)
-        
-        # Skeletonize
         skeleton = skeletonize(binary)
-        
-        # Prune spurious branches
         skeleton = self._prune_skeleton(skeleton)
-        
         return skeleton.astype(np.float32)
     
     def _prune_skeleton(self, skeleton: np.ndarray) -> np.ndarray:
         """Remove spurious short branches from skeleton."""
         for _ in range(self.prune_iterations):
-            # Find endpoints (pixels with only one neighbor)
             endpoints = self._find_endpoints(skeleton)
-            
-            # Trace from each endpoint and remove if branch is too short
             for y, x in endpoints:
                 branch_length = self._trace_branch_length(skeleton, y, x)
                 if branch_length < self.min_branch_length:
                     skeleton = self._remove_branch(skeleton, y, x)
-                    
         return skeleton
     
     def _find_endpoints(self, skeleton: np.ndarray) -> List[Tuple[int, int]]:
@@ -75,14 +63,12 @@ class CenterlineExtractor:
         for _ in range(max_steps):
             visited[y, x] = True
             length += 1
-            
-            # Find unvisited neighbors on skeleton
             neighbors = self._get_skeleton_neighbors(skeleton, y, x, visited)
             
             if len(neighbors) == 0:
-                break  # Dead end
+                break
             elif len(neighbors) > 1:
-                break  # Junction reached
+                break
             else:
                 y, x = neighbors[0]
                 
@@ -115,7 +101,6 @@ class CenterlineExtractor:
         for _ in range(self.min_branch_length + 5):
             visited[y, x] = True
             result[y, x] = 0
-            
             neighbors = self._get_skeleton_neighbors(skeleton, y, x, visited)
             
             if len(neighbors) != 1:
@@ -128,20 +113,15 @@ class CenterlineExtractor:
         """Convert skeleton image to graph representation."""
         G = nx.Graph()
         
-        # Find special points
         endpoints = self._find_endpoints(skeleton)
         junctions = self._find_junctions(skeleton)
         special_points = set(endpoints + junctions)
         
-        # Add nodes
         for idx, point in enumerate(special_points):
             G.add_node(idx, pos=point, 
                       type='endpoint' if point in endpoints else 'junction')
         
-        # Create mapping from coordinates to node indices
         point_to_node = {point: idx for idx, point in enumerate(special_points)}
-        
-        # Trace edges between special points
         visited_edges = set()
         
         for start_point in special_points:
@@ -197,7 +177,6 @@ class CenterlineExtractor:
                 path.append(current)
                 visited.add(current)
             else:
-                # Multiple paths - this shouldn't happen on a proper skeleton
                 current = neighbors[0]
                 path.append(current)
                 visited.add(current)
@@ -225,15 +204,12 @@ class CenterlineExtractor:
         traces = []
         visited_edges = set()
         
-        # Start from endpoints (degree 1 nodes)
         endpoints = [n for n in graph.nodes if graph.degree(n) == 1]
         
         if not endpoints:
-            # No endpoints, start from any node
             endpoints = [list(graph.nodes)[0]]
         
         for start_node in endpoints:
-            # DFS traversal from this endpoint
             stack = [(start_node, None)]
             
             while stack:
@@ -252,4 +228,25 @@ class CenterlineExtractor:
                         
                         stack.append((neighbor, edge_key))
         
-        return traces
+        return traces 
+
+
+def compute_centerline_f1(pred: np.ndarray,
+                           gt: np.ndarray,
+                           tolerance: float = 2.0) -> Dict[str, float]:
+    """
+    Standalone tolerance-aware centerline F1, precision, and recall.
+    Used by the training loop and evaluation suite.
+    """
+    extractor = CenterlineExtractor()
+    dist_to_gt   = extractor.compute_distance_transform(gt,   tolerance=1e9)
+    dist_to_pred = extractor.compute_distance_transform(pred, tolerance=1e9)
+
+    pred_px = pred > 0
+    gt_px   = gt   > 0
+
+    precision = float((dist_to_gt[pred_px]   <= tolerance).sum()) / max(pred_px.sum(), 1)
+    recall    = float((dist_to_pred[gt_px] <= tolerance).sum()) / max(gt_px.sum(), 1)
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {'f1': f1, 'precision': precision, 'recall': recall}
