@@ -167,40 +167,45 @@ class SeedDetector(nn.Module):
         return torch.sigmoid(self.head(d0))   # (B, 1, H, W) in [0, 1]
 
     # ------------------------------------------------------------------
-    # Inference helpers — identical to previous ResNet version
+    # Inference helpers
     # ------------------------------------------------------------------
 
     def detect_seeds(self,
                      image: torch.Tensor,
                      obs_half: int = 32,
                      return_heatmap: bool = False,
+                     fov_mask: Optional[torch.Tensor] = None 
                      ) -> Tuple[List[List[Tuple[int, int, float]]], Optional[torch.Tensor]]:
         """
-        Run inference and return ranked seed points per image.
-
-        Args:
-            image:          (B, 3, H, W) float32 tensor
-            obs_half:       half of observation patch size — seeds within
-                            this margin from the border are clipped inward
-                            so the environment never crashes on out-of-bounds
-            return_heatmap: also return the raw heatmap tensor
-
-        Returns:
-            batch_seeds:  list (len B) of [(y, x, confidence), ...] sorted
-                          by confidence descending, top_k max per image
-            heatmap:      (B,1,H,W) tensor if return_heatmap else None
+        Run inference and return ranked seed points per image, 
+        masking out the FOV border.
         """
         self.eval()
         with torch.no_grad():
             heatmap = self.forward(image)
 
         h, w   = image.shape[-2], image.shape[-1]
-        margin = obs_half + 5    # matches _pick_frontier_seed clip
+        margin = obs_half + 5
+
+        # 1. Silence the circular FOV boundary using the mask
+        if fov_mask is not None:
+            # Erode the mask to remove the bright edge rim
+            kernel_size = 35
+            pad = kernel_size // 2
+            # Max pooling on the negative mask acts as a quick morphological erosion in PyTorch
+            eroded_fov = -F.max_pool2d(-fov_mask, kernel_size=kernel_size, stride=1, padding=pad)
+            heatmap = heatmap * eroded_fov
+
+        # 2. Silence the outer rectangular margin completely so we don't pick up seeds there
+        heatmap[:, :, :margin, :] = 0
+        heatmap[:, :, -margin:, :] = 0
+        heatmap[:, :, :, :margin] = 0
+        heatmap[:, :, :, -margin:] = 0
 
         batch_seeds = []
         for b in range(heatmap.shape[0]):
             hmap  = heatmap[b, 0].cpu().numpy()
-            seeds = self._extract_seeds_nms(hmap, h, w, margin)
+            seeds = self._extract_seeds_nms(hmap, h, w)
             batch_seeds.append(seeds)
 
         return batch_seeds, (heatmap if return_heatmap else None)
@@ -208,18 +213,13 @@ class SeedDetector(nn.Module):
     def _extract_seeds_nms(self,
                            heatmap: np.ndarray,
                            h: int, w: int,
-                           margin: int,
                            ) -> List[Tuple[int, int, float]]:
         """
         Non-maximum suppression on heatmap → top-k seed list.
-
-        Seeds outside the border margin are clipped inward rather than
-        discarded, so we never lose coverage of near-border vessels.
         """
         from skimage.feature import peak_local_max
 
         if not (heatmap > self.confidence_threshold).any():
-            # Fallback: image centre if no confident peaks found
             return [(h // 2, w // 2, 0.5)]
 
         coords = peak_local_max(
@@ -231,9 +231,7 @@ class SeedDetector(nn.Module):
 
         seeds = []
         for y, x in coords:
-            y = int(np.clip(y, margin, h - margin - 1))
-            x = int(np.clip(x, margin, w - margin - 1))
-            seeds.append((y, x, float(heatmap[y, x])))
+            seeds.append((int(y), int(x), float(heatmap[y, x])))
 
         seeds.sort(key=lambda s: s[2], reverse=True)
         return seeds[:self.top_k]

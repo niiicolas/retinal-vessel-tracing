@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 
 
 # ==========================================
@@ -25,7 +25,7 @@ from typing import List, Dict, Tuple, Optional
 def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0) -> np.ndarray:
     """
     Build ground-truth seed heatmap for one image.
-    Places a Gaussian blob (σ=3px) at every endpoint and junction
+    Places a Gaussian blob (sigma=3px) at every endpoint and junction
     of the GT centerline skeleton.
 
     Args:
@@ -132,8 +132,7 @@ class SeedDetectorTrainer:
 
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', patience=5, factor=0.5, verbose=True
-        )
+            self.optimizer, mode='min', patience=5, factor=0.5)
 
     def train(self, train_samples: List[Dict], val_samples: List[Dict],
               save_path: str, config: dict) -> None:

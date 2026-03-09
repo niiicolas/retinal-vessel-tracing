@@ -36,7 +36,7 @@ _preprocessor = FundusPreprocessor()
 # CONFIG
 # ==========================================
 DRIVE_ROOT  = r"C:\ZHAW\BA\data\DRIVE\training"
-SAVE_PATH   = r"C:\ZHAW\BA\weights\seed_detector.pt"
+SAVE_PATH   = r"C:\ZHAW\BA\retinal-vessel-tracing\weights\seed_detector.pt"
 
 IMAGES_DIR  = os.path.join(DRIVE_ROOT, "images")
 VESSELS_DIR = os.path.join(DRIVE_ROOT, "1st_manual")
@@ -62,7 +62,6 @@ CONFIG = {
         'top_k_seeds':          50,    # max seeds returned per image
     }
 }
-
 
 # ==========================================
 # DATA LOADING  (DRIVE-specific)

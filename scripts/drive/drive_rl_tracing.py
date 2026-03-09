@@ -1,19 +1,11 @@
 # scripts/drive_rl_tracing.py
 """
 End-to-end inference: SeedDetector → FrontierTracer → F1 evaluation.
-
-Two modes (set MODE below):
-  'gt'    — uses GT centerline gaps to pick seeds (old behaviour, useful for
-             isolating PPO walker performance without seed detector errors)
-  'e2e'   — fully end-to-end: SeedDetector predicts seeds from the raw image,
-             no GT used at inference time
-
-Usage:
-    python -m scripts.drive_rl_tracing
 """
 
 import os
 import sys
+from tqdm import tqdm
 import cv2
 import numpy as np
 import torch
@@ -43,9 +35,9 @@ MODE = 'e2e'   # 'gt' | 'e2e'
 # PATHS
 # ==========================================
 DRIVE_ROOT      = r"C:\ZHAW\BA\data\DRIVE\training"
-PPO_WEIGHTS     = r"C:\ZHAW\BA\weights\ppo_policy.pt"
-SEED_WEIGHTS    = r"C:\ZHAW\BA\weights\seed_detector.pt"
-OUTPUT_DIR      = r"C:\ZHAW\BA\retinal-vessel-tracing\results\RL_tracing_DRIVE"
+PPO_WEIGHTS     = r"C:\ZHAW\BA\retinal-vessel-tracing\weights\ppo_policy.pt"
+SEED_WEIGHTS    = r"C:\ZHAW\BA\retinal-vessel-tracing\weights\seed_detector.pt"
+OUTPUT_DIR      = r"C:\ZHAW\BA\retinal-vessel-tracing\results\RL_tracing_seeddetector_DRIVE"
 
 IMAGES_DIR      = os.path.join(DRIVE_ROOT, "images")
 VESSELS_DIR     = os.path.join(DRIVE_ROOT, "1st_manual")
@@ -54,7 +46,7 @@ MASKS_DIR       = os.path.join(DRIVE_ROOT, "mask")
 TOLERANCE       = 2.0
 OBS_SIZE        = 65
 MAX_STEPS       = 2000
-MAX_TRACES      = 50
+MAX_TRACES      = 80
 MIN_COV_GAIN    = 0.001
 TEST_IDS        = ["38", "39", "40"]
 
@@ -72,9 +64,9 @@ PPO_CONFIG = {
         'observation_size':      OBS_SIZE,
         'tolerance':             TOLERANCE,
         'use_vesselness':        False,
-        'max_steps_per_episode': MAX_STEPS,
-        'max_off_track_streak':  3,
-        'step_size':             1,
+        'max_steps_per_episode': 600,
+        'max_off_track_streak':  5,
+        'step_size':             2,
     },
     'reward': {
         'alpha_near':            0.1,
@@ -91,10 +83,9 @@ PPO_CONFIG = {
 
 SEED_CONFIG = {
     'seed_detector': {
-        'backbone':             'resnet18',
-        'pretrained':           False,   # weights loaded from checkpoint
-        'nms_radius':           10,
-        'confidence_threshold': 0.3,
+        'base_ch':              16,    
+        'nms_radius':           15,
+        'confidence_threshold': 0.3,    
         'top_k_seeds':          MAX_TRACES,
     }
 }
@@ -111,6 +102,9 @@ def load_sample(img_id: str) -> dict:
 
     img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    
+    # Save a copy of the original RGB image for the first visualization panel
+    orig_img_rgb = img_rgb.copy()
 
     vessel     = np.array(Image.open(vessel_path).convert('L'))
     vessel_bin = (vessel > 128).astype(np.uint8)
@@ -130,6 +124,7 @@ def load_sample(img_id: str) -> dict:
 
     return {
         'id':             img_id,
+        'image_orig':     orig_img_rgb,  # <-- Added original image to dict
         'image':          img_rgb,
         'centerline':     centerline,
         'dist_transform': dist_tf,
@@ -142,7 +137,6 @@ def load_sample(img_id: str) -> dict:
 # ==========================================
 
 def _pick_frontier_seed_gt(gt_centerline, covered, half):
-    """Original GT-dependent seed picker — for ablation / baseline comparison."""
     uncovered = (gt_centerline > 0) & (covered == 0)
     if not uncovered.any():
         return None
@@ -170,10 +164,6 @@ def _pick_frontier_seed_gt(gt_centerline, covered, half):
 # ==========================================
 
 def trace_gt_mode(ppo_model, sample):
-    """
-    GT-based frontier tracing (old pipeline).
-    Kept for ablation: compare e2e vs gt to measure seed detector impact.
-    """
     env = VesselTracingEnv(PPO_CONFIG)
     env.set_data(
         image=sample['image'],
@@ -190,10 +180,10 @@ def trace_gt_mode(ppo_model, sample):
 
     ppo_model.eval()
     with torch.no_grad():
-        for trace_idx in range(MAX_TRACES):
+        for trace_idx in tqdm(range(MAX_TRACES), desc=f"Img {sample['id']} Tracing", unit="trace", leave=False):
             start = _pick_frontier_seed_gt(sample['centerline'], combined, half)
             if start is None:
-                print(f"    Full GT coverage after {trace_idx} traces.")
+                tqdm.write(f"    Full GT coverage after {trace_idx} traces.")
                 break
 
             obs, _         = env.reset(start_position=start)
@@ -213,12 +203,12 @@ def trace_gt_mode(ppo_model, sample):
 
             gain         = (combined.sum() - covered_before) / gt_total
             coverage_pct = combined.sum() / gt_total
-            print(f"    Trace {trace_idx+1:3d} from {start} -> "
-                  f"{len(path)} steps  gain={gain:.3f}  coverage={coverage_pct:.3f}")
+            
+            tqdm.write(f"    Trace {trace_idx+1:3d} gain={gain:.3f} coverage={coverage_pct:.3f}")
             paths.append(path)
 
             if trace_idx >= 3 and gain < MIN_COV_GAIN:
-                print(f"    Early stop: gain {gain:.4f} < {MIN_COV_GAIN}")
+                tqdm.write(f"    Early stop: gain {gain:.4f} < {MIN_COV_GAIN}")
                 break
 
     return combined, paths
@@ -229,35 +219,30 @@ def trace_gt_mode(ppo_model, sample):
 # ==========================================
 
 def trace_e2e_mode(ppo_model, seed_model, sample):
-    """
-    Fully end-to-end: seed detector predicts starting points,
-    FrontierTracer runs PPO from each seed.
-    No GT used at inference time.
-    """
-    # Predict seeds from raw image
     img_t = torch.from_numpy(
         sample['image'].transpose(2, 0, 1)
-    ).unsqueeze(0).float().to(DEVICE)                          # (1,3,H,W)
+    ).unsqueeze(0).float().to(DEVICE)
+
+    fov_t = torch.from_numpy(sample['fov_mask']).unsqueeze(0).unsqueeze(0).float().to(DEVICE)
 
     batch_seeds, heatmap = seed_model.detect_seeds(
-        img_t, obs_half=OBS_SIZE // 2, return_heatmap=True
+        img_t, 
+        obs_half=OBS_SIZE // 2, 
+        return_heatmap=True,
+        fov_mask=fov_t
     )
-    seeds = batch_seeds[0]   # [(y, x, conf), ...]
-    print(f"    Seed detector: {len(seeds)} seeds predicted")
+    seeds = batch_seeds[0] 
+    tqdm.write(f"    Seed detector: {len(seeds)} seeds predicted")
 
     if not seeds:
-        print("    WARNING: No seeds found, falling back to image centre")
+        tqdm.write("    WARNING: No seeds found, falling back to image centre")
         h, w = sample['image'].shape[:2]
         seeds = [(h // 2, w // 2, 0.5)]
 
-    # Build env
     env = VesselTracingEnv(PPO_CONFIG)
     tracer = FrontierTracer(env, ppo_model, DEVICE, obs_size=OBS_SIZE)
-
-    # Convert seed list to (y, x) tuples — drop confidence score
     initial_seeds = [(y, x) for y, x, _ in seeds]
 
-    # Run stack-based frontier loop — defined in FrontierTracer.trace_from_seeds()
     combined, paths = tracer.trace_from_seeds(sample, initial_seeds)
 
     return combined, paths, heatmap[0, 0].cpu().numpy()
@@ -267,67 +252,71 @@ def trace_e2e_mode(ppo_model, seed_model, sample):
 # VISUALISATION
 # ==========================================
 
-def make_overlay(image_rgb, gt_centerline, traced, paths):
-    overlay = (image_rgb * 255).astype(np.uint8).copy()
-    overlay[gt_centerline > 0]                        = [0,   200,  0]   # GT — green
-    overlay[traced > 0]                               = [220,  50, 50]   # traced — red
+def make_overlay(image_orig, gt_centerline, traced, paths):
+    """Creates a darkened grayscale background with colored traces over it."""
+    # Convert to grayscale and darken
+    gray = cv2.cvtColor((image_orig * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    dark_gray = (gray * 0.4).astype(np.uint8)
+    overlay = cv2.cvtColor(dark_gray, cv2.COLOR_GRAY2RGB)
+    
+    # Overlay colors
+    overlay[gt_centerline > 0]                        = [0,   200,  0]   # GT (missed) — green
+    overlay[traced > 0]                               = [220,  50, 50]   # Traced (FP) — red
     overlay[(gt_centerline > 0) & (traced > 0)]       = [255, 220,  0]   # TP — yellow
     for path in paths:
         if path:
             y, x = path[0]
-            cv2.circle(overlay, (x, y), 4, (0, 255, 255), -1)            # seeds — cyan
+            cv2.circle(overlay, (x, y), 4, (0, 255, 255), -1)            # Seeds — cyan
     return overlay
 
 
 def visualize_sample(ppo_model, seed_model, sample, output_dir):
     img_id = sample['id']
-    print(f"\n  Image {img_id}: MODE={MODE}")
+    tqdm.write(f"\nProcessing Image {img_id} [Mode: {MODE}]")
 
     if MODE == 'gt':
         traced, paths = trace_gt_mode(ppo_model, sample)
-        heatmap_img   = None
-        n_cols = 4
     else:
-        traced, paths, heatmap_img = trace_e2e_mode(ppo_model, seed_model, sample)
-        n_cols = 5
+        # We don't need to plot the heatmap anymore, so we can ignore it
+        traced, paths, _ = trace_e2e_mode(ppo_model, seed_model, sample)
 
     metrics       = compute_centerline_f1(traced, sample['centerline'], tolerance=TOLERANCE)
     n_traces_used = len(paths)
-    print(f"  F1={metrics['f1']:.3f}  P={metrics['precision']:.3f}  "
-          f"R={metrics['recall']:.3f}  traces={n_traces_used}")
+    tqdm.write(f"  Result: F1={metrics['f1']:.3f} | Prec={metrics['precision']:.3f} | Rec={metrics['recall']:.3f}")
 
-    overlay = make_overlay(sample['image'], sample['centerline'], traced, paths)
+    # Pass the original image to make the darkened background
+    overlay = make_overlay(sample['image_orig'], sample['centerline'], traced, paths)
 
-    fig, axes = plt.subplots(1, n_cols, figsize=(6 * n_cols, 6))
-    fig.suptitle(
-        f"Image {img_id} [{MODE}] — F1={metrics['f1']:.3f}  "
-        f"P={metrics['precision']:.3f}  R={metrics['recall']:.3f}  "
-        f"({n_traces_used} traces)",
-        fontsize=13, fontweight='bold',
-    )
+    # 5 Columns to match your target layout exactly
+    n_cols = 5
+    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5))
+    
+    # Target Title Format
+    fig.suptitle(f"Image {img_id} — F1={metrics['f1']:.3f}  P={metrics['precision']:.3f}  R={metrics['recall']:.3f}  ({n_traces_used} traces)", 
+                 fontsize=14, fontweight='bold')
 
-    axes[0].imshow(sample['image']);        axes[0].set_title("Fundus");     axes[0].axis('off')
-    axes[1].imshow(sample['centerline'], cmap='gray'); axes[1].set_title("GT centerline"); axes[1].axis('off')
-    axes[2].imshow(traced, cmap='gray');    axes[2].set_title(f"Traced ({n_traces_used} traces)"); axes[2].axis('off')
-    axes[3].imshow(overlay);               axes[3].set_title("Overlay");    axes[3].axis('off')
+    # Subplots with proper labels
+    axes[0].imshow(sample['image_orig']); axes[0].set_title("(a) Original RGB Fundus", fontsize=10); axes[0].axis('off')
+    axes[1].imshow(sample['image']);      axes[1].set_title("(b) Preprocessed (Agent Input)", fontsize=10); axes[1].axis('off')
+    axes[2].imshow(sample['centerline'], cmap='gray'); axes[2].set_title("(c) GT Centerline", fontsize=10); axes[2].axis('off')
+    axes[3].imshow(traced, cmap='gray');  axes[3].set_title(f"(d) Agent Traced ({n_traces_used} paths)", fontsize=10); axes[3].axis('off')
+    axes[4].imshow(overlay);              axes[4].set_title("(e) Darkened Overlay", fontsize=10); axes[4].axis('off')
 
-    if n_cols == 5 and heatmap_img is not None:
-        axes[4].imshow(heatmap_img, cmap='hot'); axes[4].set_title("Seed heatmap"); axes[4].axis('off')
-
+    # Reordered Legend matching your target image
     legend = [
         mpatches.Patch(color='#00C800', label='GT only (miss)'),
-        mpatches.Patch(color='#DC3232', label='Traced only (FP)'),
         mpatches.Patch(color='#FFDC00', label='True positive'),
-        mpatches.Patch(color='#00FFFF', label='Seed point'),
+        mpatches.Patch(color='#DC3232', label='Traced only (FP)'),
+        mpatches.Patch(color='#00FFFF', label='Seed Point'),
     ]
-    axes[3].legend(handles=legend, loc='lower right', fontsize=7,
+    axes[4].legend(handles=legend, loc='lower right', fontsize=8,
                    framealpha=0.8, ncol=2)
 
     plt.tight_layout()
     out_path = os.path.join(output_dir, f"trace_{img_id}_{MODE}.png")
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"  Saved → {out_path}")
+    tqdm.write(f"  Saved → {out_path}")
     return metrics
 
 
@@ -340,42 +329,28 @@ def main():
     print(f"Device: {DEVICE}  |  Mode: {MODE}")
 
     # Load PPO model
-    print(f"\nLoading PPO weights: {PPO_WEIGHTS}")
     ppo_ckpt  = torch.load(PPO_WEIGHTS, map_location=DEVICE, weights_only=True)
     ppo_model = ActorCriticNetwork(PPO_CONFIG).to(DEVICE)
     ppo_model.load_state_dict(ppo_ckpt['model_state_dict'])
     ppo_model.eval()
-    print(f"  iter={ppo_ckpt.get('iteration','?')}  "
-          f"best_F1={ppo_ckpt.get('best_f1','?')}")
 
-    # Load seed detector (only needed for e2e mode)
+    # Load seed detector
     seed_model = None
     if MODE == 'e2e':
-        if not os.path.exists(SEED_WEIGHTS):
-            print(f"\nERROR: Seed detector weights not found at {SEED_WEIGHTS}")
-            print("Run scripts/train_seed_detector.py first, or set MODE='gt'")
-            return
-        print(f"\nLoading seed detector: {SEED_WEIGHTS}")
         seed_ckpt  = torch.load(SEED_WEIGHTS, map_location=DEVICE, weights_only=True)
         seed_model = SeedDetector(SEED_CONFIG).to(DEVICE)
         seed_model.load_state_dict(seed_ckpt['model_state_dict'])
         seed_model.eval()
-        print(f"  epoch={seed_ckpt.get('epoch','?')}  "
-              f"val_loss={seed_ckpt.get('val_loss','?'):.5f}")
 
-    # Run on test images
-    all_f1 = []
-    for img_id in TEST_IDS:
+    # Master progress bar for all test images
+    for img_id in tqdm(TEST_IDS, desc="Total Benchmark", unit="img"):
         img_path = os.path.join(IMAGES_DIR, f"{img_id}_training.tif")
         if not os.path.exists(img_path):
-            print(f"  [{img_id}] not found, skipping")
             continue
         sample  = load_sample(img_id)
         metrics = visualize_sample(ppo_model, seed_model, sample, OUTPUT_DIR)
-        all_f1.append(metrics['f1'])
 
-    print(f"\nMean F1 ({MODE}): {np.mean(all_f1):.3f}")
-    print(f"Output: {OUTPUT_DIR}")
+    print(f"\nOutput directory: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
