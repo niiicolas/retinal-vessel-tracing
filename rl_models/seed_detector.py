@@ -1,317 +1,239 @@
 # models/seed_detector.py
 """
-Seed detection network for identifying starting points.
+Seed detector — predicts a sparse heatmap of vessel endpoints and junctions.
+
+Architecture: CenterlineUNet (same as baseline, see centerline_unet_baseline.py)
+  - Depthwise-separable convolutions (~0.5M params)
+  - 4-level encoder/decoder with skip connections  ← key upgrade vs ResNet+plain decoder
+  - in_channels=3 (RGB with enhanced green)
+  - Sigmoid output → heatmap in [0, 1]
+
+Difference from centerline baseline:
+  - Input: 3-channel RGB (not 1-channel greyscale)
+  - GT targets: sparse Gaussian blobs at endpoints+junctions only (not full vessel mask)
+  - Loss: focal loss (not BCE+clDice) — clDice is for connected segments, not sparse keypoints
+
+Provides:
+    SeedDetector  — UNet → (B,1,H,W) heatmap
+                    call .detect_seeds() to get ranked (y, x, confidence) lists
+
+Training logic lives in training/seed_detector_trainer.py.
+Used at inference time by scripts/drive_rl_tracing.py via FrontierTracer.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Any, List, Tuple, Optional
-import numpy as np
-import torchvision.models as models
 
+
+# ==========================================
+# UNET BUILDING BLOCKS
+# Copied from centerline_unet_baseline.py — identical implementation
+# ==========================================
+
+class DSConvBlock(nn.Module):
+    """Depthwise-Separable Conv → BN → ReLU (x2)."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch,  in_ch,  3, padding=1, groups=in_ch,  bias=False),
+            nn.Conv2d(in_ch,  out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, groups=out_ch, bias=False),
+            nn.Conv2d(out_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class DownBlock(nn.Module):
+    """MaxPool → DSConvBlock."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.pool = nn.MaxPool2d(2)
+        self.conv = DSConvBlock(in_ch, out_ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(self.pool(x))
+
+
+class UpBlock(nn.Module):
+    """Bilinear upsample → concat skip → DSConvBlock."""
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        self.up   = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv = DSConvBlock(in_ch + skip_ch, out_ch)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        if x.shape != skip.shape:
+            x = F.interpolate(x, size=skip.shape[2:],
+                              mode='bilinear', align_corners=False)
+        return self.conv(torch.cat([x, skip], dim=1))
+
+
+# ==========================================
+# SEED DETECTOR  (UNet backbone)
+# ==========================================
 
 class SeedDetector(nn.Module):
     """
-    CNN for detecting seed points (endpoints and junctions) on vessel centerlines.
-    
-    Outputs a heatmap of seed point probabilities.
+    UNet-based seed point heatmap predictor.
+
+    Input : (B, 3, H, W)  full RGB fundus image, float32 in [0, 1]
+    Output: (B, 1, H, W)  heatmap in [0, 1], peaks = endpoints / junctions
+
+    Architecture is identical to CenterlineUNet(in_channels=3, base_ch=16)
+    from centerline_unet_baseline.py. Skip connections give the decoder
+    access to full-resolution spatial features at every level — critical
+    for localising sparse keypoints precisely on thin vessels.
+
+    Channel layout (base_ch=16):
+        enc0 →  16   enc1 →  32   enc2 →  64   enc3 → 128
+        bot  → 256
+        up3  → 128   up2  →  64   up1  →  32   up0  →  16
     """
-    
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
-        
-        seed_config = config.get('seed_detector', {})
-        
-        self.backbone_name = seed_config.get('backbone', 'resnet18')
-        self.pretrained = seed_config.get('pretrained', True)
-        self.nms_radius = seed_config.get('nms_radius', 10)
-        self.confidence_threshold = seed_config.get('confidence_threshold', 0.5)
-        self.top_k = seed_config.get('top_k_seeds', 50)
-        
-        # Build backbone
-        self._build_backbone()
-        
-        # Decoder for upsampling
-        self.decoder = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            
-            nn.Conv2d(32, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            
-            nn.Conv2d(16, 1, kernel_size=1),
-            nn.Sigmoid()
+
+        seed_cfg = config.get('seed_detector', {})
+        self.nms_radius           = seed_cfg.get('nms_radius',           10)
+        self.confidence_threshold = seed_cfg.get('confidence_threshold', 0.3)
+        self.top_k                = seed_cfg.get('top_k_seeds',          50)
+        base_ch                   = seed_cfg.get('base_ch',              16)
+
+        ch = [base_ch * (2 ** i) for i in range(5)]
+        # ch = [16, 32, 64, 128, 256] for base_ch=16
+
+        # Encoder — same as CenterlineUNet, in_channels=3 for RGB
+        self.enc0 = DSConvBlock(3,     ch[0])
+        self.enc1 = DownBlock(ch[0],   ch[1])
+        self.enc2 = DownBlock(ch[1],   ch[2])
+        self.enc3 = DownBlock(ch[2],   ch[3])
+
+        # Bottleneck
+        self.bot  = DownBlock(ch[3],   ch[4])
+
+        # Decoder with skip connections — same as CenterlineUNet
+        self.up3  = UpBlock(ch[4], ch[3], ch[3])   # 256 + 128 → 128
+        self.up2  = UpBlock(ch[3], ch[2], ch[2])   # 128 +  64 →  64
+        self.up1  = UpBlock(ch[2], ch[1], ch[1])   #  64 +  32 →  32
+        self.up0  = UpBlock(ch[1], ch[0], ch[0])   #  32 +  16 →  16
+
+        # Head — same as CenterlineUNet
+        self.head = nn.Sequential(
+            nn.Conv2d(ch[0], ch[0] // 2, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch[0] // 2, 1, 1),
         )
-        
-    def _build_backbone(self):
-        """Build the encoder backbone."""
-        if self.backbone_name == 'resnet18':
-            backbone = models.resnet18(pretrained=self.pretrained)
-        elif self.backbone_name == 'resnet34':
-            backbone = models.resnet34(pretrained=self.pretrained)
-        elif self.backbone_name == 'resnet50':
-            backbone = models.resnet50(pretrained=self.pretrained)
-        else:
-            raise ValueError(f"Unknown backbone: {self.backbone_name}")
-        
-        # Extract feature layers (without avgpool and fc)
-        self.encoder = nn.Sequential(
-            backbone.conv1,
-            backbone.bn1,
-            backbone.relu,
-            backbone.maxpool,
-            backbone.layer1,
-            backbone.layer2,
-            backbone.layer3,
-            backbone.layer4
-        )
-        
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Same initialisation as CenterlineUNet."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            x: Input image tensor (B, 3, H, W)
-            
-        Returns:
-            Seed heatmap (B, 1, H, W)
-        """
-        # Encode
-        features = self.encoder(x)
-        
-        # Decode
-        heatmap = self.decoder(features)
-        
-        # Resize to match input if needed
-        if heatmap.shape[-2:] != x.shape[-2:]:
-            heatmap = F.interpolate(
-                heatmap, 
-                size=x.shape[-2:], 
-                mode='bilinear', 
-                align_corners=True
-            )
-        
-        return heatmap
-    
-    def detect_seeds(self, 
+        # Encoder — save skip tensors
+        s0 = self.enc0(x)
+        s1 = self.enc1(s0)
+        s2 = self.enc2(s1)
+        s3 = self.enc3(s2)
+
+        # Bottleneck
+        b = self.bot(s3)
+
+        # Decoder — skip connections from encoder
+        d3 = self.up3(b,  s3)
+        d2 = self.up2(d3, s2)
+        d1 = self.up1(d2, s1)
+        d0 = self.up0(d1, s0)
+
+        return torch.sigmoid(self.head(d0))   # (B, 1, H, W) in [0, 1]
+
+    # ------------------------------------------------------------------
+    # Inference helpers — identical to previous ResNet version
+    # ------------------------------------------------------------------
+
+    def detect_seeds(self,
                      image: torch.Tensor,
-                     return_heatmap: bool = False
+                     obs_half: int = 32,
+                     return_heatmap: bool = False,
                      ) -> Tuple[List[List[Tuple[int, int, float]]], Optional[torch.Tensor]]:
         """
-        Detect seed points in an image.
-        
+        Run inference and return ranked seed points per image.
+
         Args:
-            image: Input image tensor (B, 3, H, W)
-            return_heatmap: Whether to also return the heatmap
-            
+            image:          (B, 3, H, W) float32 tensor
+            obs_half:       half of observation patch size — seeds within
+                            this margin from the border are clipped inward
+                            so the environment never crashes on out-of-bounds
+            return_heatmap: also return the raw heatmap tensor
+
         Returns:
-            seeds: List of seed points per image [(y, x, confidence), ...]
-            heatmap: Optional heatmap tensor
+            batch_seeds:  list (len B) of [(y, x, confidence), ...] sorted
+                          by confidence descending, top_k max per image
+            heatmap:      (B,1,H,W) tensor if return_heatmap else None
         """
         self.eval()
         with torch.no_grad():
             heatmap = self.forward(image)
-        
+
+        h, w   = image.shape[-2], image.shape[-1]
+        margin = obs_half + 5    # matches _pick_frontier_seed clip
+
         batch_seeds = []
-        
         for b in range(heatmap.shape[0]):
-            hmap = heatmap[b, 0].cpu().numpy()
-            seeds = self._extract_seeds_nms(hmap)
+            hmap  = heatmap[b, 0].cpu().numpy()
+            seeds = self._extract_seeds_nms(hmap, h, w, margin)
             batch_seeds.append(seeds)
-        
-        if return_heatmap:
-            return batch_seeds, heatmap
-        return batch_seeds, None
-    
-    def _extract_seeds_nms(self, 
-                           heatmap: np.ndarray
+
+        return batch_seeds, (heatmap if return_heatmap else None)
+
+    def _extract_seeds_nms(self,
+                           heatmap: np.ndarray,
+                           h: int, w: int,
+                           margin: int,
                            ) -> List[Tuple[int, int, float]]:
         """
-        Extract seed points using non-maximum suppression.
-        
-        Args:
-            heatmap: 2D heatmap array
-            
-        Returns:
-            List of (y, x, confidence) tuples
+        Non-maximum suppression on heatmap → top-k seed list.
+
+        Seeds outside the border margin are clipped inward rather than
+        discarded, so we never lose coverage of near-border vessels.
         """
-        from scipy import ndimage
         from skimage.feature import peak_local_max
-        
-        # Apply threshold
-        mask = heatmap > self.confidence_threshold
-        
-        if not mask.any():
-            # Return center of image if no seeds found
-            h, w = heatmap.shape
+
+        if not (heatmap > self.confidence_threshold).any():
+            # Fallback: image centre if no confident peaks found
             return [(h // 2, w // 2, 0.5)]
-        
-        # Find local maxima
-        coordinates = peak_local_max(
+
+        coords = peak_local_max(
             heatmap,
             min_distance=self.nms_radius,
             threshold_abs=self.confidence_threshold,
-            num_peaks=self.top_k
+            num_peaks=self.top_k,
         )
-        
-        # Extract seeds with confidence
+
         seeds = []
-        for y, x in coordinates:
-            confidence = float(heatmap[y, x])
-            seeds.append((int(y), int(x), confidence))
-        
-        # Sort by confidence (descending)
+        for y, x in coords:
+            y = int(np.clip(y, margin, h - margin - 1))
+            x = int(np.clip(x, margin, w - margin - 1))
+            seeds.append((y, x, float(heatmap[y, x])))
+
         seeds.sort(key=lambda s: s[2], reverse=True)
-        
         return seeds[:self.top_k]
-
-
-class SeedDetectorTrainer:
-    """Training utilities for seed detector."""
-    
-    def __init__(self, 
-                 model: SeedDetector,
-                 config: Dict[str, Any],
-                 device: torch.device):
-        self.model = model
-        self.config = config
-        self.device = device
-        
-        self.optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=config.get('seed_detector', {}).get('learning_rate', 1e-4)
-        )
-        
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', patience=5, factor=0.5
-        )
-        
-    def create_seed_heatmap(self,
-                            centerline: np.ndarray,
-                            sigma: float = 3.0) -> np.ndarray:
-        """
-        Create ground truth seed heatmap from centerline.
-        
-        Args:
-            centerline: Binary centerline mask
-            sigma: Gaussian sigma for heatmap generation
-            
-        Returns:
-            Seed heatmap with Gaussian blobs at endpoints and junctions
-        """
-        from data.centerline_extraction import CenterlineExtractor
-        from scipy.ndimage import gaussian_filter
-        
-        extractor = CenterlineExtractor()
-        
-        # Find endpoints and junctions
-        endpoints = extractor._find_endpoints(centerline)
-        junctions = extractor._find_junctions(centerline)
-        
-        # Create heatmap
-        heatmap = np.zeros_like(centerline, dtype=np.float32)
-        
-        # Place points
-        for y, x in endpoints + junctions:
-            if 0 <= y < heatmap.shape[0] and 0 <= x < heatmap.shape[1]:
-                heatmap[y, x] = 1.0
-        
-        # Apply Gaussian smoothing
-        heatmap = gaussian_filter(heatmap, sigma=sigma)
-        
-        # Normalize to [0, 1]
-        if heatmap.max() > 0:
-            heatmap = heatmap / heatmap.max()
-        
-        return heatmap
-    
-    def compute_loss(self,
-                     pred_heatmap: torch.Tensor,
-                     gt_heatmap: torch.Tensor,
-                     mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Compute weighted binary cross-entropy loss.
-        
-        Args:
-            pred_heatmap: Predicted heatmap (B, 1, H, W)
-            gt_heatmap: Ground truth heatmap (B, 1, H, W)
-            mask: Optional FOV mask
-            
-        Returns:
-            Loss value
-        """
-        # Focal loss for handling class imbalance
-        alpha = 0.25
-        gamma = 2.0
-        
-        bce = F.binary_cross_entropy(pred_heatmap, gt_heatmap, reduction='none')
-        
-        pt = torch.where(gt_heatmap > 0.5, pred_heatmap, 1 - pred_heatmap)
-        focal_weight = alpha * (1 - pt) ** gamma
-        
-        loss = focal_weight * bce
-        
-        if mask is not None:
-            loss = loss * mask
-            return loss.sum() / (mask.sum() + 1e-8)
-        
-        return loss.mean()
-    
-    def train_step(self,
-                   images: torch.Tensor,
-                   centerlines: torch.Tensor,
-                   masks: Optional[torch.Tensor] = None) -> float:
-        """
-        Single training step.
-        
-        Args:
-            images: Batch of images (B, 3, H, W)
-            centerlines: Batch of centerlines (B, 1, H, W)
-            masks: Optional FOV masks
-            
-        Returns:
-            Loss value
-        """
-        self.model.train()
-        self.optimizer.zero_grad()
-        
-        # Create GT heatmaps
-        gt_heatmaps = []
-        for i in range(centerlines.shape[0]):
-            cl = centerlines[i, 0].cpu().numpy()
-            hm = self.create_seed_heatmap(cl)
-            gt_heatmaps.append(hm)
-        gt_heatmaps = torch.tensor(np.stack(gt_heatmaps)).unsqueeze(1).to(self.device)
-        
-        # Forward pass
-        pred_heatmaps = self.model(images)
-        
-        # Compute loss
-        loss = self.compute_loss(pred_heatmaps, gt_heatmaps, masks)
-        
-        # Backward pass
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
-        
-        return loss.item()
