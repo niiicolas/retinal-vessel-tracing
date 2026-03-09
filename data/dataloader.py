@@ -8,10 +8,10 @@ DRIVE, STARE, CHASEDB1, HRF, DRHAGIS, FIVES, LES_AV, AV_WIDE, IOSTAR
 
 Supported target models
 -----------------------
-unet           – (1,H,W) CLAHE-preprocessed grayscale + skeleton GT
-frangi         – (H,W,3) raw RGB uint8 + binary annotations (numpy)
-greedy_tracer  – same as frangi
-rl_agent       – (3,H,W) float32 RGB + centerline, distance transform, …
+unet           - (1,H,W) CLAHE-preprocessed grayscale + skeleton GT
+frangi         - (H,W,3) raw RGB uint8 + binary annotations (numpy)
+greedy_tracer  - same as frangi
+rl_agent       - (3,H,W) float32 RGB + centerline, distance transform, …
 
 Split logic
 -----------

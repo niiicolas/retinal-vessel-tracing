@@ -20,8 +20,8 @@ import matplotlib.patches as mpatches
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.policy_network import ActorCriticNetwork
-from environment.vessel_env import VesselTracingEnv
+from rl_models.policy_network import ActorCriticNetwork
+from rl_environment.vessel_env import VesselTracingEnv
 from data.centerline_extraction import CenterlineExtractor, compute_centerline_f1
 from data.fundus_preprocessor import FundusPreprocessor
 
