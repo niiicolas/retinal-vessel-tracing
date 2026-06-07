@@ -23,45 +23,68 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
-from data.dataloader import TEST_DATASETS, WEIGHTS_DIR, get_data, get_test_data
+from data.dataloader import (
+    OUTPUT_DIR as _OUTPUT_BASE,
+)
+from data.dataloader import (
+    TEST_DATASETS,
+    WEIGHTS_DIR,
+    get_data,
+    get_test_data,
+)
 from evaluation.metrics import CenterlineMetrics
-from models.unet import CenterlineLoss, CenterlinePredictor, CenterlineUNet
+from evaluation.scoring import (
+    score_prediction,
+    write_eval_csvs,
+)
+from models.unet import (
+    CenterlineLoss,
+    CenterlinePredictor,
+    CenterlineUNet,
+)
+from config import TOLERANCE
+from data.centerline_extraction import (
+    CenterlineExtractor,
+)
+
+_extractor = CenterlineExtractor()
 
 # ==========================================
 # CONFIG
 # ==========================================
-SAVE_PATH = str(WEIGHTS_DIR / "centerline_unet.pt")
-OUTPUT_DIR = str(_OUTPUT_BASE / "unet")
+SAVE_PATH = str(WEIGHTS_DIR / 'centerline_unet.pt')
+OUTPUT_DIR = str(_OUTPUT_BASE / 'unet')
 
 EPOCHS = 10
 BATCH_SIZE = 2
 LR = 1e-3
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 MODEL_CFG = dict(in_channels=1, base_ch=16)
 RESIZE = (512, 512)
 
 # Standardised metric columns — shared across all baseline scripts
 METRIC_COLS = [
-    "iou",
-    "clDice",
-    "betti_0_error",
-    "hd95",
-    "f1@1px",
-    "precision@1px",
-    "recall@1px",
-    "f1@2px",
-    "precision@2px",
-    "recall@2px",
-    "f1@3px",
-    "precision@3px",
-    "recall@3px",
+    'iou',
+    'clDice',
+    'betti_0_error',
+    'hd95',
+    'f1@1px',
+    'precision@1px',
+    'recall@1px',
+    'f1@2px',
+    'precision@2px',
+    'recall@2px',
+    'f1@3px',
+    'precision@3px',
+    'recall@3px',
 ]
 
 
@@ -74,7 +97,11 @@ def get_train_transforms():
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2,
+                contrast_limit=0.2,
+                p=0.3,
+            ),
             A.OneOf(
                 [
                     A.ElasticTransform(alpha=1, sigma=50, p=1.0),
@@ -84,7 +111,10 @@ def get_train_transforms():
             ),
             A.GaussianBlur(blur_limit=(3, 5), p=0.1),
         ],
-        additional_targets={"fov": "mask", "thick_gt": "mask"},
+        additional_targets={
+            'fov': 'mask',
+            'thick_gt': 'mask',
+        },
     )
 
 
@@ -122,14 +152,21 @@ def get_val_transforms():
 # ==========================================
 # TRAINING HELPERS
 # ==========================================
-def run_epoch(model, loader, criterion, optimizer=None, device="cpu", desc=""):
+def run_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer=None,
+    device='cpu',
+    desc='',
+):
     model.train() if optimizer else model.eval()
     total_loss = 0
     with torch.set_grad_enabled(optimizer is not None):
         for batch in tqdm(loader, desc=desc, leave=False):
-            img = batch["image"].to(device)
-            target = batch["centerline"].to(device)
-            mask = batch["fov_mask"].to(device)
+            img = batch['image'].to(device)
+            target = batch['centerline'].to(device)
+            mask = batch['fov_mask'].to(device)
             if optimizer:
                 optimizer.zero_grad()
             pred = model(img)
@@ -146,21 +183,25 @@ def plot_loss_curves(train_losses, val_losses, save_path):
     plt.plot(
         range(1, len(train_losses) + 1),
         train_losses,
-        label="Train Loss",
-        color="#1f77b4",
+        label='Train Loss',
+        color='#1f77b4',
         lw=2,
     )
     plt.plot(
         range(1, len(val_losses) + 1),
         val_losses,
-        label="Val Loss",
-        color="#ff7f0e",
+        label='Val Loss',
+        color='#ff7f0e',
         lw=2,
-        linestyle="--",
+        linestyle='--',
     )
-    plt.title("CNN Training Progression", fontsize=14, fontweight="bold")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
+    plt.title(
+        'CNN Training Progression',
+        fontsize=14,
+        fontweight='bold',
+    )
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -173,49 +214,51 @@ def plot_loss_curves(train_losses, val_losses, save_path):
 # ==========================================
 @torch.no_grad()
 def evaluate_and_visualize(
-    checkpoint_path, test_dataset, split_label="Test", output_dir=None
+    checkpoint_path,
+    test_dataset,
+    split_label='Test',
+    output_dir=None,
 ):
     if output_dir is None:
-        output_dir = str(_OUTPUT_BASE / "unet")
-    print(f"\nEvaluating on {split_label} set ({len(test_dataset)} images)")
-    panels_dir = os.path.join(output_dir, "panels")
+        output_dir = str(_OUTPUT_BASE / 'unet')
+    print(f'\nEvaluating on {split_label} set ({len(test_dataset)} images)')
+    panels_dir = os.path.join(output_dir, 'panels')
 
     os.makedirs(panels_dir, exist_ok=True)
 
     loader = DataLoader(test_dataset, batch_size=1, num_workers=0)
 
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        predictor = CenterlinePredictor.from_checkpoint(
-            checkpoint_path,
-            device=DEVICE,
-        )
+        warnings.simplefilter('ignore')
+        predictor = CenterlinePredictor.from_checkpoint(checkpoint_path, device=DEVICE)
 
     metrics_fn = CenterlineMetrics(tolerance_levels=[1, 2, 3])
     all_metrics = []
     mosaic_data = []
 
-    for batch in tqdm(loader, desc=f"Evaluating ({split_label})"):
-        img_np = batch["image"][0, 0].numpy()
-        mask_np = (batch["fov_mask"][0, 0].numpy() * 255).astype(np.uint8)
-        gt_skel = (batch["centerline"][0, 0].numpy() * 255).astype(np.uint8)
-        vessel_mask = (batch["vessel_mask"][0, 0].numpy() * 255).astype(np.uint8)
-        image_id = batch["id"][0]
+    for batch in tqdm(loader, desc=f'Evaluating ({split_label})'):
+        img_np = batch['image'][0, 0].numpy()
+        mask_np = (batch['fov_mask'][0, 0].numpy() * 255).astype(np.uint8)
+        gt_skel = (batch['centerline'][0, 0].numpy() * 255).astype(np.uint8)
+        vessel_mask = (batch['vessel_mask'][0, 0].numpy() * 255).astype(np.uint8)
+        image_id = batch['id'][0]
 
         prob_map, pred_skel = predictor.predict(img_np, fov_mask=mask_np)
 
-        # Threshold prob map → binary vessel mask for IoU + clDice
-        pred_vessel_mask = (prob_map >= 0.5).astype(np.uint8) * 255
-
-        res = metrics_fn.compute_all_metrics(
-            pred_skeleton=pred_skel,
-            gt_skeleton=gt_skel,
-            pred_vessel_mask=pred_vessel_mask,
-            gt_vessel_mask=vessel_mask,
-            pred_prob=prob_map,
-            fov_mask=mask_np,
+        # Same GT + SHARED scorer as the RL agent → directly comparable to v12.
+        dt = _extractor.compute_distance_transform(
+            (gt_skel > 0).astype(np.float32),
+            TOLERANCE,
         )
-        res["image_id"] = image_id
+        res = score_prediction(
+            pred_skel,
+            centerline=gt_skel,
+            vessel_mask=vessel_mask,
+            fov_mask=mask_np,
+            distance_transform=dt,
+            tolerance=TOLERANCE,
+        )
+        res['image_id'] = image_id
         all_metrics.append(res)
 
         gt_vis = (gt_skel > 0).astype(np.uint8) * 255
@@ -230,24 +273,36 @@ def evaluate_and_visualize(
         )
 
         # Per-image panel
-        fig, axes = plt.subplots(1, 4, figsize=(24, 7), facecolor="white")
-        axes[0].imshow(img_np, cmap="gray")
-        axes[0].set_title(f"Preprocessed ({image_id})")
-        axes[1].imshow(prob_map * (mask_np > 0), cmap="gray")
-        axes[1].set_title("Probability Map")
-        axes[2].imshow(np.concatenate([gt_vis, pred_vis], axis=1), cmap="gray")
-        axes[2].set_title("GT | Pred")
+        fig, axes = plt.subplots(
+            1,
+            4,
+            figsize=(24, 7),
+            facecolor='white',
+        )
+        axes[0].imshow(img_np, cmap='gray')
+        axes[0].set_title(f'Preprocessed ({image_id})')
+        axes[1].imshow(prob_map * (mask_np > 0), cmap='gray')
+        axes[1].set_title('Probability Map')
+        axes[2].imshow(
+            np.concatenate([gt_vis, pred_vis], axis=1),
+            cmap='gray',
+        )
+        axes[2].set_title('GT | Pred')
         overlay = np.zeros((*img_np.shape[:2], 3), dtype=np.uint8)
         overlay[..., 1] = gt_vis
         overlay[..., 0] = pred_vis
         axes[3].imshow(overlay)
-        axes[3].set_title(
-            f"F1@2px: {res.get('f1@2px', 0):.3f} | IoU: {res.get('iou', 0):.3f}"
-        )
+        axes[3].set_title(f'F1@2px: {res.get("f1@2px", 0):.3f} | IoU: {res.get("iou", 0):.3f}')
         for ax in axes:
-            ax.axis("off")
+            ax.axis('off')
         plt.tight_layout()
-        plt.savefig(os.path.join(panels_dir, f"{image_id}_panel.png"), dpi=150)
+        plt.savefig(
+            os.path.join(
+                panels_dir,
+                f'{image_id}_panel.png',
+            ),
+            dpi=150,
+        )
         plt.close()
 
     # Mosaic
@@ -255,82 +310,85 @@ def evaluate_and_visualize(
         n = len(mosaic_data)
         n_cols = min(n, 4)
         n_rows = int(np.ceil(n / n_cols))
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 5))
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(n_cols * 5, n_rows * 5),
+        )
         axes = np.array(axes).reshape(-1)
         for i, d in enumerate(mosaic_data):
-            h, w = d["gt_skeleton"].shape
+            h, w = d['gt_skeleton'].shape
             ov = np.zeros((h, w, 3), dtype=np.uint8)
-            ov[..., 1] = d["gt_skeleton"]
-            ov[..., 0] = d["pred_skeleton"]
+            ov[..., 1] = d['gt_skeleton']
+            ov[..., 0] = d['pred_skeleton']
             axes[i].imshow(ov)
             axes[i].set_title(
-                f"{d['image_id']}\n"
-                f"F1@2px: {d['metrics'].get('f1@2px', 0):.3f} | "
-                f"IoU: {d['metrics'].get('iou', 0):.3f}",
-                fontweight="bold",
+                f'{d["image_id"]}\nF1@2px: {d["metrics"].get("f1@2px", 0):.3f} | IoU: {d["metrics"].get("iou", 0):.3f}',
+                fontweight='bold',
             )
-            axes[i].axis("off")
+            axes[i].axis('off')
         for j in range(i + 1, len(axes)):
-            axes[j].axis("off")
+            axes[j].axis('off')
         plt.tight_layout()
         plt.savefig(
-            os.path.join(output_dir, f"mosaic_{split_label.lower()}.png"), dpi=200
+            os.path.join(
+                output_dir,
+                f'mosaic_{split_label.lower()}.png',
+            ),
+            dpi=200,
         )
         plt.close()
 
-    # Summary table + CSV
-    df = pd.DataFrame(all_metrics)
-    summary_rows = [
-        {"Metric": c, "Mean +/- Std": f"{df[c].mean():.4f} +/- {df[c].std():.4f}"}
-        for c in METRIC_COLS
-        if c in df.columns
-    ]
-    summary_df = pd.DataFrame(summary_rows)
-
-    print("\n" + "=" * 50)
-    print(f"   FINAL RESULTS — {split_label}")
-    print("=" * 50)
-    print(summary_df.to_string(index=False))
-    print("=" * 50)
-
-    df.to_csv(os.path.join(output_dir, "metrics_per_image.csv"), index=False)
-    summary_df.to_csv(os.path.join(output_dir, "metrics_summary.csv"), index=False)
-
-    print(f"CSVs saved → {output_dir}")
+    # Summary — written in the RL eval format via the shared writer.
+    write_eval_csvs(output_dir, all_metrics)
+    f1 = np.mean([m['f1@2px'] for m in all_metrics]) if all_metrics else float('nan')
+    print(f'\n[unet/{split_label}] {len(all_metrics)} imgs  f1@2px={f1:.4f}  → {output_dir}')
 
 
 # ==========================================
 # MAIN
 # ==========================================
-if __name__ == "__main__":
+if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train", action="store_true", help="Train the model")
-    parser.add_argument("--eval", action="store_true", help="Evaluate on val set")
-    parser.add_argument("--test", action="store_true", help="Test on external datasets")
+    parser.add_argument(
+        '--train',
+        action='store_true',
+        help='Train the model',
+    )
+    parser.add_argument(
+        '--eval',
+        action='store_true',
+        help='Evaluate on val set',
+    )
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help='Test on external datasets',
+    )
     args = parser.parse_args()
 
     if not args.train and not args.eval and not args.test:
         args.train = args.eval = args.test = True
 
-    OUTPUT_DIR = str(_OUTPUT_BASE / "unet")
+    OUTPUT_DIR = str(_OUTPUT_BASE / 'unet')
 
     if args.train:
         train_ds, train_loader = get_data(
-            "unet",
-            "train",
+            'unet',
+            'train',
             batch_size=BATCH_SIZE,
             resize=RESIZE,
             transform=get_train_transforms(),
         )
         val_ds, val_loader = get_data(
-            "unet",
-            "val",
+            'unet',
+            'val',
             batch_size=1,
             resize=RESIZE,
         )
-        print(f"[Combined]  train={len(train_ds)}  val={len(val_ds)}")
+        print(f'[Combined]  train={len(train_ds)}  val={len(val_ds)}')
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
         model = CenterlineUNet(**MODEL_CFG).to(DEVICE)
@@ -339,53 +397,93 @@ if __name__ == "__main__":
         scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
 
         train_hist, val_hist = [], []
-        best_val_loss = float("inf")
+        best_val_loss = float('inf')
 
-        print(f"--- Training ({EPOCHS} epochs) ---")
+        print(f'--- Training ({EPOCHS} epochs) ---')
         for epoch in range(1, EPOCHS + 1):
             t_loss = run_epoch(
-                model, train_loader, criterion, optimizer, DEVICE, "Train"
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                DEVICE,
+                'Train',
             )
-            v_loss = run_epoch(model, val_loader, criterion, None, DEVICE, "Val")
+            v_loss = run_epoch(
+                model,
+                val_loader,
+                criterion,
+                None,
+                DEVICE,
+                'Val',
+            )
             train_hist.append(t_loss)
             val_hist.append(v_loss)
             scheduler.step()
 
             if v_loss < best_val_loss:
                 best_val_loss = v_loss
-                os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+                os.makedirs(
+                    os.path.dirname(SAVE_PATH),
+                    exist_ok=True,
+                )
                 torch.save(
-                    {"model_state": model.state_dict(), "model_cfg": MODEL_CFG},
+                    {
+                        'model_state': model.state_dict(),
+                        'model_cfg': MODEL_CFG,
+                    },
                     SAVE_PATH,
                 )
 
             if epoch % 10 == 0 or epoch == 1:
-                print(
-                    f"  Epoch {epoch:>3}/{EPOCHS}  train={t_loss:.4f}  val={v_loss:.4f}"
-                )
+                print(f'  Epoch {epoch:>3}/{EPOCHS}  train={t_loss:.4f}  val={v_loss:.4f}')
 
         plot_loss_curves(
-            train_hist, val_hist, os.path.join(OUTPUT_DIR, "training_val_curves.png")
+            train_hist,
+            val_hist,
+            os.path.join(
+                OUTPUT_DIR,
+                'training_val_curves.png',
+            ),
         )
-        print(f"Best val loss: {best_val_loss:.4f}")
+        print(f'Best val loss: {best_val_loss:.4f}')
 
     if args.eval and os.path.exists(SAVE_PATH):
-        val_ds, _ = get_data("unet", "val", batch_size=1, resize=RESIZE)
-        val_output_dir = str(_OUTPUT_BASE / "unet" / "val")
+        val_ds, _ = get_data(
+            'unet',
+            'val',
+            batch_size=1,
+            resize=RESIZE,
+        )
+        val_output_dir = str(_OUTPUT_BASE / 'unet' / 'RL_tracing_e2e' / 'val')
         os.makedirs(val_output_dir, exist_ok=True)
         evaluate_and_visualize(
-            SAVE_PATH, val_ds, split_label="Val", output_dir=val_output_dir
+            SAVE_PATH,
+            val_ds,
+            split_label='Val',
+            output_dir=val_output_dir,
         )
 
     if args.test and os.path.exists(SAVE_PATH):
         for ext_name in TEST_DATASETS:
             try:
-                ext_ds, _ = get_test_data(ext_name, "unet", batch_size=1, resize=RESIZE)
-            except (KeyError, FileNotFoundError) as exc:
-                print(f"Skipping external test set {ext_name}: {exc}")
+                ext_ds, _ = get_test_data(
+                    ext_name,
+                    'unet',
+                    batch_size=1,
+                    resize=RESIZE,
+                )
+            except (
+                KeyError,
+                FileNotFoundError,
+            ) as exc:
+                print(f'Skipping external test set {ext_name}: {exc}')
                 continue
-            ext_output_dir = str(_OUTPUT_BASE / "unet" / ext_name)
+            ext_output_dir = str(_OUTPUT_BASE / 'unet' / 'RL_tracing_e2e' / ext_name)
             os.makedirs(ext_output_dir, exist_ok=True)
             evaluate_and_visualize(
-                SAVE_PATH, ext_ds, split_label=ext_name, output_dir=ext_output_dir
+                SAVE_PATH,
+                ext_ds,
+                split_label=ext_name,
+                output_dir=ext_output_dir,
             )

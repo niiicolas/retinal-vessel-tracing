@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-matplotlib.use("Agg")
+matplotlib.use('Agg')
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 from skimage.morphology import skeletonize
@@ -31,26 +31,40 @@ from config import (
     SEED_WEIGHTS_PATH,
     TOLERANCE,
     get_inference_config,
-    get_seed_inference_config,
+    # get_seed_inference_config,
 )
 
-_inf = MODEL_CONFIG["inference"]
-MODE            = _inf["mode"]
-MAX_TRACES      = _inf["max_traces"]
-MIN_COV_GAIN    = _inf["min_cov_gain"]
-DILATION_RADIUS = _inf["dilation_radius"]
-N_RING_SEEDS    = _inf["n_ring_seeds"]
-RING_INSET_PX   = _inf["ring_inset_px"]
-from data.dataloader import TEST_DATASETS, get_data, get_test_data
-from environment.frontier_tracer import FrontierTracer
+_inf = MODEL_CONFIG['inference']
+MODE = _inf['mode']
+MAX_TRACES = _inf['max_traces']
+MIN_COV_GAIN = _inf['min_cov_gain']
+DILATION_RADIUS = _inf['dilation_radius']
+N_RING_SEEDS = _inf['n_ring_seeds']
+RING_INSET_PX = _inf['ring_inset_px']
+from data.dataloader import (
+    TEST_DATASETS,
+    get_data,
+    get_test_data,
+)
+from environment.frontier_tracer import (
+    FrontierTracer,
+)
 from environment.seeding_utils import merge_seeds
-from environment.vessel_env import VesselTracingEnv
-from evaluation.metrics import CenterlineMetrics
-from models.policy_network import ActorCriticNetwork
+from environment.vessel_env import (
+    VesselTracingEnv,
+)
+from evaluation.metrics import (
+    CenterlineMetrics,
+    compute_gt_graph_metrics,
+)
+from evaluation.scoring import score_prediction
+from models.policy_network import (
+    ActorCriticNetwork,
+)
 from models.seed_detector import SeedDetector
 
 INFERENCE_CFG = get_inference_config()
-SEED_INF_CFG = get_seed_inference_config()
+# SEED_INF_CFG = get_seed_inference_config()
 
 
 # # ==========================================
@@ -63,18 +77,22 @@ metrics_calc = CenterlineMetrics(tolerance_levels=[1, 2, 3])
 # DATA LOADING
 # ==========================================
 def _load_all_samples(dataset_name):
-    ds, _ = get_test_data(dataset_name, "rl_agent", tolerance=TOLERANCE)
+    ds, _ = get_test_data(
+        dataset_name,
+        'rl_agent',
+        tolerance=TOLERANCE,
+    )
     samples = {}
     for i in range(len(ds)):
         s = ds[i]
-        samples[s["id"]] = {
-            "id": s["id"],
-            "image_orig": s["image_orig"].permute(1, 2, 0).numpy(),
-            "image": s["image"].permute(1, 2, 0).numpy(),
-            "vessel_mask": (s["vessel_mask"].squeeze(0).numpy() > 0).astype(np.uint8),
-            "centerline": s["centerline"].squeeze(0).numpy(),
-            "distance_transform": s["distance_transform"].squeeze(0).numpy(),
-            "fov_mask": s["fov_mask"].squeeze(0).numpy(),
+        samples[s['id']] = {
+            'id': s['id'],
+            'image_orig': s['image_orig'].permute(1, 2, 0).numpy(),
+            'image': s['image'].permute(1, 2, 0).numpy(),
+            'vessel_mask': (s['vessel_mask'].squeeze(0).numpy() > 0).astype(np.uint8),
+            'centerline': s['centerline'].squeeze(0).numpy(),
+            'distance_transform': s['distance_transform'].squeeze(0).numpy(),
+            'fov_mask': s['fov_mask'].squeeze(0).numpy(),
         }
     return samples
 
@@ -85,7 +103,8 @@ def _load_all_samples(dataset_name):
 
 
 def postprocess_skeleton(
-    traced: np.ndarray, dilation_radius: int = DILATION_RADIUS
+    traced: np.ndarray,
+    dilation_radius: int = DILATION_RADIUS,
 ) -> np.ndarray:
     """Merge disconnected RL path segments into a cleaner skeleton.
 
@@ -120,7 +139,10 @@ def _pick_frontier_seed_gt(gt_centerline, covered, half):
 
     if covered_bin.any():
         dist = cv2.distanceTransform(1 - covered_bin, cv2.DIST_L2, 5)
-        scores = dist[uncovered_pts[:, 0], uncovered_pts[:, 1]]
+        scores = dist[
+            uncovered_pts[:, 0],
+            uncovered_pts[:, 1],
+        ]
         best = uncovered_pts[np.argmax(scores)]
     else:
         centre = np.array([h // 2, w // 2])
@@ -140,29 +162,38 @@ def _pick_frontier_seed_gt(gt_centerline, covered, half):
 def trace_gt_mode(ppo_model, sample):
     env = VesselTracingEnv(INFERENCE_CFG)
     env.set_data(
-        image=sample["image"],
-        centerline=sample["centerline"],
-        distance_transform=sample["distance_transform"],
-        fov_mask=sample["fov_mask"],
+        image=sample['image'],
+        centerline=sample['centerline'],
+        distance_transform=sample['distance_transform'],
+        fov_mask=sample['fov_mask'],
+        vessel_orientation=sample.get('vessel_orientation'),
+        unet_prior=sample.get('unet_prior'),
+        pred_centerline=sample.get('pred_centerline'),
+        pred_distance_transform=sample.get('pred_distance_transform'),
+        pred_dt_gradient=sample.get('pred_dt_gradient'),
     )
 
-    h, w = sample["image"].shape[:2]
+    h, w = sample['image'].shape[:2]
     half = OBS_SIZE // 2
     combined = np.zeros((h, w), dtype=np.float32)
     paths = []
-    gt_total = float(max(sample["centerline"].sum(), 1))
+    gt_total = float(max(sample['centerline'].sum(), 1))
 
     ppo_model.eval()
     with torch.no_grad():
         for trace_idx in tqdm(
             range(MAX_TRACES),
-            desc=f"Img {sample['id']} Tracing",
-            unit="trace",
+            desc=f'Img {sample["id"]} Tracing',
+            unit='trace',
             leave=False,
         ):
-            start = _pick_frontier_seed_gt(sample["centerline"], combined, half)
+            start = _pick_frontier_seed_gt(
+                sample['centerline'],
+                combined,
+                half,
+            )
             if start is None:
-                tqdm.write(f"    Full GT coverage after {trace_idx} traces.")
+                tqdm.write(f'    Full GT coverage after {trace_idx} traces.')
                 break
 
             obs, _ = env.reset(start_position=start)
@@ -174,7 +205,13 @@ def trace_gt_mode(ppo_model, sample):
                 obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(DEVICE)
                 logits, _, _ = ppo_model(obs_t)
                 action = logits.argmax(dim=-1).item()
-                obs, _, terminated, truncated, _ = env.step(action)
+                (
+                    obs,
+                    _,
+                    terminated,
+                    truncated,
+                    _,
+                ) = env.step(action)
                 done = terminated or truncated
                 y, x = env.position
                 path.append((y, x))
@@ -183,13 +220,11 @@ def trace_gt_mode(ppo_model, sample):
             gain = (combined.sum() - covered_before) / gt_total
             coverage_pct = combined.sum() / gt_total
 
-            tqdm.write(
-                f"    Trace {trace_idx+1:3d} gain={gain:.3f} coverage={coverage_pct:.3f}"
-            )
+            tqdm.write(f'    Trace {trace_idx + 1:3d} gain={gain:.3f} coverage={coverage_pct:.3f}')
             paths.append(path)
 
             if trace_idx >= 3 and gain < MIN_COV_GAIN:
-                tqdm.write(f"    Early stop: gain {gain:.4f} < {MIN_COV_GAIN}")
+                tqdm.write(f'    Early stop: gain {gain:.4f} < {MIN_COV_GAIN}')
                 break
 
     return combined, paths
@@ -201,71 +236,68 @@ def trace_gt_mode(ppo_model, sample):
 
 
 def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
-    img_t = (
-        torch.from_numpy(sample["image"].transpose(2, 0, 1))
-        .unsqueeze(0)
-        .float()
-        .to(DEVICE)
-    )
+    img_t = torch.from_numpy(sample['image'].transpose(2, 0, 1)).unsqueeze(0).float().to(DEVICE)
 
-    fov_t = (
-        torch.from_numpy(sample["fov_mask"])
-        .unsqueeze(0)
-        .unsqueeze(0)
-        .float()
-        .to(DEVICE)
-    )
+    fov_t = torch.from_numpy(sample['fov_mask']).unsqueeze(0).unsqueeze(0).float().to(DEVICE)
 
-    batch_seeds, heatmap_out = seed_model.detect_seeds(
+    batch_seeds, heatmap_out, vessel_prob_out = seed_model.detect_seeds(
         img_t,
         obs_half=OBS_SIZE // 2,
         return_heatmap=True,
         fov_mask=fov_t,
     )
     seeds = batch_seeds[0]
+    # vmap is the model's vessel-probability map; we use it to gate the
+    # grid fallback below so we don't seed the agent in pure background.
+    vmap = vessel_prob_out[0, 0].cpu().numpy()
 
-    tqdm.write(f"    Seed detector: {len(seeds)} seeds predicted")
+    tqdm.write(f'    Seed detector: {len(seeds)} seeds predicted')
 
     if not seeds:
-        tqdm.write("    WARNING: No seeds found, falling back to image centre")
-        h, w = sample["image"].shape[:2]
+        tqdm.write('    WARNING: No seeds found, falling back to image centre')
+        h, w = sample['image'].shape[:2]
         seeds = [(h // 2, w // 2, 0.5)]
 
     merged, n_ring_added = merge_seeds(
         detector_seeds=seeds,
-        fov_mask=sample["fov_mask"],
+        fov_mask=sample['fov_mask'],
         max_traces=MAX_TRACES,
         n_ring_seeds=N_RING_SEEDS,
         inset_px=RING_INSET_PX,
         obs_half=OBS_SIZE // 2,
     )
 
-    # Fallback: if seeding pipeline produced very few points, add a grid
-    if len(merged) < 5:
-        h, w = sample["image"].shape[:2]
+    # Fallback: if seeding pipeline produced few points, add a grid.
+    # Threshold raised from 5 → MAX_TRACES // 4 because n_ring_seeds=0
+    # leaves the grid as the only rescue path for under-detection cases
+    # (e.g. pathology images the trained detector handles poorly).
+    # Each grid candidate is vessel-gated against vmap so seeds in pure
+    # background are skipped — addresses the off-vessel-seed concern that
+    # motivated turning ring seeds off in the first place.
+    GRID_FALLBACK_THRESHOLD = max(5, MAX_TRACES // 4)
+    if len(merged) < GRID_FALLBACK_THRESHOLD:
+        h, w = sample['image'].shape[:2]
         half = OBS_SIZE // 2
-        fov = sample["fov_mask"]
+        fov = sample['fov_mask']
         grid_seeds = []
         for gy in range(half + 5, h - half - 5, 60):
             for gx in range(half + 5, w - half - 5, 60):
-                if fov[gy, gx] > 0:
+                if fov[gy, gx] > 0 and vmap[gy, gx] > 0.3:
                     grid_seeds.append((gy, gx))
-        merged = list(merged) + grid_seeds[:MAX_TRACES - len(merged)]
-        tqdm.write(f"    WARNING: Seeding failed, added {len(grid_seeds)} grid seeds")
+        merged = list(merged) + grid_seeds[: MAX_TRACES - len(merged)]
+        tqdm.write(
+            f'    WARNING: Seeding under-produced ({len(merged)} seeds), added {len(grid_seeds)} vessel-gated grid seeds'
+        )
 
     tqdm.write(
-        f"    Detector seeds (capped): {min(len(seeds), MAX_TRACES - N_RING_SEEDS)}  "
-        f"Ring seeds added: {n_ring_added}  "
-        f"Total: {len(merged)}"
+        f'    Detector seeds (capped): {min(len(seeds), MAX_TRACES - N_RING_SEEDS)}  Ring seeds added: {n_ring_added}  Total: {len(merged)}'
     )
 
     env = VesselTracingEnv(INFERENCE_CFG)
     tracer = FrontierTracer(env, ppo_model, DEVICE, obs_size=OBS_SIZE)
 
     combined, paths = tracer.trace_from_seeds(sample, merged)
-
     return combined, paths
-
 
 
 # ==========================================
@@ -275,7 +307,10 @@ def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
 
 def make_overlay(image_orig, gt_centerline, traced, paths):
     """Creates a darkened grayscale background with colored traces over it."""
-    gray = cv2.cvtColor((image_orig * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    gray = cv2.cvtColor(
+        (image_orig * 255).astype(np.uint8),
+        cv2.COLOR_RGB2GRAY,
+    )
     dark_gray = (gray * 0.4).astype(np.uint8)
     overlay = cv2.cvtColor(dark_gray, cv2.COLOR_GRAY2RGB)
 
@@ -285,107 +320,127 @@ def make_overlay(image_orig, gt_centerline, traced, paths):
     for path in paths:
         if path:
             y, x = path[0]
-            cv2.circle(overlay, (x, y), 4, (0, 255, 255), -1)
+            cv2.circle(
+                overlay,
+                (x, y),
+                4,
+                (0, 255, 255),
+                -1,
+            )
     return overlay
 
 
 def visualize_sample(ppo_model, seed_model, sample, output_dir):
-    img_id = sample["id"]
-    tqdm.write(f"\nProcessing Image {img_id} [Mode: {MODE}]")
+    img_id = sample['id']
+    tqdm.write(f'\nProcessing Image {img_id} [Mode: {MODE}]')
 
-    if MODE == "gt":
+    if MODE == 'gt':
         traced, paths = trace_gt_mode(ppo_model, sample)
     else:
         traced, paths = trace_e2e_mode(ppo_model, seed_model, sample)
 
-    raw_skel = (traced > 0).astype(np.uint8)
-    gt_skel = (sample["centerline"] > 0).astype(np.uint8)
-
-    # Post-process the traced skeleton (dilate → reskeletonize) so nearby
-    # disconnected segments are bridged before metric computation.  This is the
-    # mask we actually care about — it's what a downstream consumer would use.
-    pred_skel = postprocess_skeleton(traced)
-    if sample["fov_mask"] is not None:
-        pred_skel = pred_skel * (sample["fov_mask"] > 0)
-
-    # ----------------------------------------------------------
-    # Metrics on POST-PROCESSED skeleton (clDice / F1 / HD95 / IoU / Betti-0).
-    # pred_vessel_mask = pred_skel (RL produces a skeleton, not a filled mask)
-    # ----------------------------------------------------------
-    metrics = metrics_calc.compute_all_metrics(
-        pred_skeleton=pred_skel,
-        gt_skeleton=gt_skel,
-        pred_vessel_mask=pred_skel,
-        gt_vessel_mask=sample["vessel_mask"],
-        fov_mask=sample["fov_mask"],
+    # Single shared scorer (evaluation/scoring.py) — the SAME code path every
+    # model is scored through (RL, frangi, greedy, unet) so the numbers are
+    # comparable. This is a verbatim relocation of the former inline block, so
+    # the recorded v12 metrics are unchanged.
+    metrics = score_prediction(
+        traced,
+        centerline=sample['centerline'],
+        vessel_mask=sample['vessel_mask'],
+        fov_mask=sample['fov_mask'],
+        distance_transform=sample.get('distance_transform'),
+        tolerance=TOLERANCE,
+        dilation_radius=DILATION_RADIUS,
+        metrics_calc=metrics_calc,
     )
-    metrics["image_id"] = img_id
-    metrics["betti_0_error_postproc"] = metrics.pop("betti_0_error")
-
-    # ----------------------------------------------------------
-    # Raw-skeleton Betti-0 for reference (measures pre-bridging fragmentation).
-    # ----------------------------------------------------------
-    metrics["betti_0_error_raw"] = metrics_calc.betti_0_error(raw_skel, gt_skel)
+    metrics['image_id'] = img_id
 
     n_traces_used = len(paths)
     tqdm.write(
-        f"  F1@2={metrics['f1@2px']:.3f}  "
-        f"P@2={metrics['precision@2px']:.3f}  "
-        f"R@2={metrics['recall@2px']:.3f}  "
-        f"IoU={metrics.get('iou', 0):.3f}  "
-        f"HD95={metrics['hd95']:.1f}px  "
-        f"Betti0(raw)={metrics['betti_0_error_raw']:.0f}  "
-        f"Betti0(post)={metrics['betti_0_error_postproc']:.0f}"
+        f'  F1@2={metrics["f1@2px"]:.3f}  '
+        f'P@2={metrics["precision@2px"]:.3f}  '
+        f'R@2={metrics["recall@2px"]:.3f}  '
+        f'R@2 thin/med/thick='
+        f'{metrics.get("recall@2px_thin", 0):.3f}/'
+        f'{metrics.get("recall@2px_med", 0):.3f}/'
+        f'{metrics.get("recall@2px_thick", 0):.3f}  '
+        f'IoU={metrics.get("iou", 0):.3f}  '
+        f'HD95={metrics["hd95"]:.1f}px  '
+        f'Betti0(raw)={metrics["betti_0_error_raw"]:.0f}  '
+        f'Betti0(post)={metrics["betti_0_error_postproc"]:.0f}  '
+        f'Betti0(cov)={metrics["betti_0_covered"]:.0f}  '
+        f'EdgeCov@80={metrics["gt_edge_cov80_frac"]:.3f}'
     )
 
-    overlay = make_overlay(sample["image_orig"], sample["centerline"], traced, paths)
+    overlay = make_overlay(
+        sample['image_orig'],
+        sample['centerline'],
+        traced,
+        paths,
+    )
 
     # 4-panel figure
     fig, axes = plt.subplots(1, 4, figsize=(20, 5))
 
     title_str = (
-        f"Image {img_id}  |  "
-        f"F1@2={metrics['f1@2px']:.3f}  "
-        f"P@2={metrics['precision@2px']:.3f}  "
-        f"R@2={metrics['recall@2px']:.3f}  "
-        f"IoU={metrics.get('iou', 0):.3f}  "
-        f"HD95={metrics['hd95']:.1f}px  "
-        f"Betti0 raw={metrics['betti_0_error_raw']:.0f} → post={metrics['betti_0_error_postproc']:.0f}  "
-        f"({n_traces_used} traces)"
+        f'Image {img_id}  |  '
+        f'F1@2={metrics["f1@2px"]:.3f}  '
+        f'P@2={metrics["precision@2px"]:.3f}  '
+        f'R@2={metrics["recall@2px"]:.3f}  '
+        f'IoU={metrics.get("iou", 0):.3f}  '
+        f'HD95={metrics["hd95"]:.1f}px  '
+        f'Betti0 raw={metrics["betti_0_error_raw"]:.0f} → post={metrics["betti_0_error_postproc"]:.0f}  '
+        f'({n_traces_used} traces)'
     )
-    fig.suptitle(title_str, fontsize=12, fontweight="bold")
+    fig.suptitle(title_str, fontsize=12, fontweight='bold')
 
-    axes[0].imshow(sample["image_orig"])
-    axes[0].set_title("(a) Original RGB Fundus", fontsize=10)
-    axes[0].axis("off")
+    axes[0].imshow(sample['image_orig'])
+    axes[0].set_title('(a) Original RGB Fundus', fontsize=10)
+    axes[0].axis('off')
 
-    axes[1].imshow(sample["centerline"], cmap="gray")
-    axes[1].set_title("(b) GT Centerline", fontsize=10)
-    axes[1].axis("off")
+    axes[1].imshow(sample['centerline'], cmap='gray')
+    axes[1].set_title('(b) GT Centerline', fontsize=10)
+    axes[1].axis('off')
 
-    axes[2].imshow(traced, cmap="gray")
-    axes[2].set_title(f"(c) Agent Traced ({n_traces_used} paths)", fontsize=10)
-    axes[2].axis("off")
+    axes[2].imshow(traced, cmap='gray')
+    axes[2].set_title(
+        f'(c) Agent Traced ({n_traces_used} paths)',
+        fontsize=10,
+    )
+    axes[2].axis('off')
 
     axes[3].imshow(overlay)
-    axes[3].set_title("(d) Overlay (TP / GT-miss / FP / Seeds)", fontsize=10)
-    axes[3].axis("off")
+    axes[3].set_title(
+        '(d) Overlay (TP / GT-miss / FP / Seeds)',
+        fontsize=10,
+    )
+    axes[3].axis('off')
 
     legend = [
-        mpatches.Patch(color="#00C800", label="GT only (miss)"),
-        mpatches.Patch(color="#FFDC00", label="True positive"),
-        mpatches.Patch(color="#DC3232", label="Traced only (FP)"),
-        mpatches.Patch(color="#00FFFF", label="Seed point"),
+        mpatches.Patch(
+            color='#00C800',
+            label='GT only (miss)',
+        ),
+        mpatches.Patch(color='#FFDC00', label='True positive'),
+        mpatches.Patch(
+            color='#DC3232',
+            label='Traced only (FP)',
+        ),
+        mpatches.Patch(color='#00FFFF', label='Seed point'),
     ]
     axes[3].legend(
-        handles=legend, loc="lower right", fontsize=8, framealpha=0.8, ncol=2
+        handles=legend,
+        loc='lower right',
+        fontsize=8,
+        framealpha=0.8,
+        ncol=2,
     )
 
     plt.tight_layout()
-    out_path = os.path.join(output_dir, f"trace_{img_id}_{MODE}.png")
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    out_path = os.path.join(output_dir, f'trace_{img_id}_{MODE}.png')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close()
-    tqdm.write(f"  Saved → {out_path}")
+    tqdm.write(f'  Saved → {out_path}')
 
     return metrics
 
@@ -396,14 +451,18 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir):
 
 
 def init_csv(csv_path: str):
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=CSV_COLUMNS,
+            extrasaction='ignore',
+        )
         writer.writeheader()
 
 
 def append_csv(csv_path: str, metrics: dict):
-    row = {col: metrics.get(col, "") for col in CSV_COLUMNS}
-    with open(csv_path, "a", newline="") as f:
+    row = {col: metrics.get(col, '') for col in CSV_COLUMNS}
+    with open(csv_path, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writerow(row)
 
@@ -415,111 +474,151 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--eval", action="store_true", help="Evaluate on val set")
-    parser.add_argument("--test", action="store_true", help="Test on external datasets")
+    parser.add_argument(
+        '--eval',
+        action='store_true',
+        help='Evaluate on val set',
+    )
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help='Test on external datasets',
+    )
     args = parser.parse_args()
 
     if not args.eval and not args.test:
         args.eval = args.test = True
 
-    print(f"Device: {DEVICE}  |  Mode: {MODE}  |  Dilation radius: {DILATION_RADIUS}px")
+    print(f'Device: {DEVICE}  |  Mode: {MODE}  |  Dilation radius: {DILATION_RADIUS}px')
 
     # Load PPO model
     if not os.path.exists(PPO_WEIGHTS_PATH):
-        print(f"ERROR: No trained weights found at {PPO_WEIGHTS_PATH}")
-        print("Run scripts/train_ppo.py first to train the model.")
+        print(f'ERROR: No trained weights found at {PPO_WEIGHTS_PATH}')
+        print('Run scripts/train_ppo.py first to train the model.')
         raise SystemExit(1)
-    ppo_ckpt = torch.load(PPO_WEIGHTS_PATH, map_location=DEVICE, weights_only=True)
+    ppo_ckpt = torch.load(
+        PPO_WEIGHTS_PATH,
+        map_location=DEVICE,
+        weights_only=True,
+    )
     ppo_model = ActorCriticNetwork(INFERENCE_CFG).to(DEVICE)
-    ppo_model.load_state_dict(ppo_ckpt["model_state_dict"])
+    ppo_model.load_state_dict(ppo_ckpt['model_state_dict'])
     ppo_model.eval()
 
     # Load seed detector
     seed_model = None
-    if MODE == "e2e":
+    if MODE == 'e2e':
         seed_ckpt = torch.load(
-            SEED_WEIGHTS_PATH, map_location=DEVICE, weights_only=True
+            SEED_WEIGHTS_PATH,
+            map_location=DEVICE,
+            weights_only=True,
         )
-        seed_model = SeedDetector(SEED_INF_CFG).to(DEVICE)
-        seed_model.load_state_dict(seed_ckpt["model_state_dict"])
+        # seed_model = SeedDetector(SEED_INF_CFG).to(DEVICE)
+        seed_model = SeedDetector().to(DEVICE)
+        seed_model.load_state_dict(seed_ckpt['model_state_dict'])
         seed_model.eval()
 
     if args.eval:
-        _run_on_datasets(ppo_model, seed_model, ("val",), label="val")
+        _run_on_datasets(
+            ppo_model,
+            seed_model,
+            ('val',),
+            label='val',
+        )
 
     if args.test:
-        _run_on_datasets(ppo_model, seed_model, TEST_DATASETS, label="test")
+        _run_on_datasets(
+            ppo_model,
+            seed_model,
+            TEST_DATASETS,
+            label='test',
+        )
 
 
-def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
+def _run_on_datasets(
+    ppo_model,
+    seed_model,
+    dataset_names,
+    label='test',
+):
     """Run tracing + evaluation on a list of datasets."""
     for dataset_name in dataset_names:
         # Load data
-        if dataset_name == "val":
-            ds, _ = get_data("rl_agent", "val", tolerance=TOLERANCE, resize=(512, 512))
+        if dataset_name == 'val':
+            ds, _ = get_data(
+                'rl_agent',
+                'val',
+                tolerance=TOLERANCE,
+                resize=(512, 512),
+            )
             samples = {}
             for i in range(len(ds)):
                 s = ds[i]
-                samples[s["id"]] = {
-                    "id": s["id"],
-                    "image_orig": s["image_orig"].permute(1, 2, 0).numpy(),
-                    "image": s["image"].permute(1, 2, 0).numpy(),
-                    "vessel_mask": (s["vessel_mask"].squeeze(0).numpy() > 0).astype(
-                        np.uint8
-                    ),
-                    "centerline": s["centerline"].squeeze(0).numpy(),
-                    "distance_transform": s["distance_transform"].squeeze(0).numpy(),
-                    "fov_mask": s["fov_mask"].squeeze(0).numpy(),
+                samples[s['id']] = {
+                    'id': s['id'],
+                    'image_orig': s['image_orig'].permute(1, 2, 0).numpy(),
+                    'image': s['image'].permute(1, 2, 0).numpy(),
+                    'vessel_mask': (s['vessel_mask'].squeeze(0).numpy() > 0).astype(np.uint8),
+                    'centerline': s['centerline'].squeeze(0).numpy(),
+                    'distance_transform': s['distance_transform'].squeeze(0).numpy(),
+                    'fov_mask': s['fov_mask'].squeeze(0).numpy(),
                 }
         else:
             samples = _load_all_samples(dataset_name)
 
-        output_dir = str(OUTPUT_BASE / f"RL_tracing_{MODE}" / dataset_name)
+        output_dir = str(OUTPUT_BASE / f'RL_tracing_{MODE}' / dataset_name)
         os.makedirs(output_dir, exist_ok=True)
 
-        csv_path = os.path.join(output_dir, f"metrics_{MODE}.csv")
+        csv_path = os.path.join(output_dir, f'metrics_{MODE}.csv')
         init_csv(csv_path)
-        print(f"\n[{dataset_name}] CSV → {csv_path}")
+        print(f'\n[{dataset_name}] CSV → {csv_path}')
 
         all_metrics = []
 
         for img_id in tqdm(
-            samples.keys(), desc=f"RL Tracing — {dataset_name}", unit="img"
+            samples.keys(),
+            desc=f'RL Tracing — {dataset_name}',
+            unit='img',
         ):
             sample = samples[img_id]
-            metrics = visualize_sample(ppo_model, seed_model, sample, output_dir)
+            metrics = visualize_sample(
+                ppo_model,
+                seed_model,
+                sample,
+                output_dir,
+            )
             append_csv(csv_path, metrics)
             all_metrics.append(metrics)
 
         # Summary
         if all_metrics:
-            print("\n" + "=" * 65)
-            print(f"SUMMARY — {dataset_name}  ({len(all_metrics)} images, mode={MODE})")
-            print("=" * 65)
+            print('\n' + '=' * 65)
+            print(f'SUMMARY — {dataset_name}  ({len(all_metrics)} images, mode={MODE})')
+            print('=' * 65)
             for k in METRIC_COLS:
                 vals = [m[k] for m in all_metrics if k in m]
                 if vals:
-                    print(
-                        f"  {k:<28s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}"
-                    )
-            print("=" * 65)
+                    print(f'  {k:<28s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}')
+            print('=' * 65)
 
             import pandas as pd
 
             summary_rows = [
                 {
-                    "Metric": k,
-                    "Mean +/- Std": f"{np.mean([m[k] for m in all_metrics if k in m]):.4f} +/- "
-                    f"{np.std([m[k] for m in all_metrics if k in m]):.4f}",
+                    'Metric': k,
+                    'Mean +/- Std': f'{np.mean([m[k] for m in all_metrics if k in m]):.4f} +/- {np.std([m[k] for m in all_metrics if k in m]):.4f}',
                 }
                 for k in METRIC_COLS
                 if any(k in m for m in all_metrics)
             ]
             summary_df = pd.DataFrame(summary_rows)
-            summary_csv = os.path.join(output_dir, f"metrics_summary_{MODE}.csv")
+            summary_csv = os.path.join(
+                output_dir,
+                f'metrics_summary_{MODE}.csv',
+            )
             summary_df.to_csv(summary_csv, index=False)
-            print(f"Summary CSV → {summary_csv}")
+            print(f'Summary CSV → {summary_csv}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
