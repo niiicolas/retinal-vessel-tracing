@@ -1,349 +1,539 @@
-# training/seed_detector_trainer.py
-"""Seed detector training logic with Recall-Focused Focal Loss.
+"""Seed detector trainer — multi-task with heavy augmentation.
 
-- Seed Head: Focal Loss configured via config.py (targeting high FN).
-- Vessel Head: Focal Loss + Soft Dice for structural connectivity.
-- Visualization: Generates Epoch Error Maps and a 2-panel Training Summary.
+Pairs with `models.seed_detector.SeedDetector` (Attention U-Net + 5 heads
++ aux deep-supervision heads).
+
+Key differences from the v2/v3 trainers (ignored on purpose):
+  * Five-task target stack (centerline tube, vessel mask, radius map,
+    orientation map, FOV mask) built on the *augmented* image so geometric
+    transforms stay consistent.
+  * AdamW + linear warmup + cosine decay over the full schedule.
+  * Augmentations: 90° rotations, flips, mild affine, colour jitter, CLAHE-
+    free, Gaussian noise, gamma — matches the cross-dataset domain shift
+    between FIVES/STARE/CHASEDB1/HRF/LES-AV and the test sets DRIVE/DRHAGIS.
+  * Optional Frangi auxiliary channel precomputed on the augmented green
+    channel (the model expects it when ``use_frangi_input`` is on).
+  * Best-checkpoint selection by validation centerline F1 (peak-recall) so
+    we save the model that's actually best at *seed placement*, not just at
+    minimising the multi-task loss.
 """
 
-from typing import Dict, List, Optional
-import os
+from __future__ import annotations
 
+import math
+import os
+import time
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
+
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from scipy.ndimage import gaussian_filter
 
-import matplotlib.pyplot as plt
-from skimage.feature import peak_local_max
-from scipy.spatial.distance import cdist
+from models.seed_detector import (
+    SeedDetector,
+    build_centerline_tube,
+    build_radius_map,
+    build_orientation_map,
+    frangi_vesselness,
+    seed_detector_loss,
+)
 
-from models.seed_detector import build_seed_targets
-from config import SEED_CONFIG
+
+# ===========================================================================
+# Augmented multi-task dataset
+# ===========================================================================
 
 
-# ==========================================
-# GT HEATMAP GENERATION
-# ==========================================
-def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0, n_seeds: int = 50) -> np.ndarray:
-    """Build ground-truth seed heatmap using farthest-point sampling for coverage."""
-    points = np.argwhere(centerline > 0)
-    if len(points) == 0:
-        return np.zeros_like(centerline, dtype=np.float32)
-
-    n_seeds = min(n_seeds, len(points))
-    h, w = centerline.shape
-    center = np.array([h / 2, w / 2])
-    dists_to_center = np.linalg.norm(points - center, axis=1)
-    seeds = [points[np.argmin(dists_to_center)]]
-
-    min_dists = np.full(len(points), np.inf)
-    for _ in range(n_seeds - 1):
-        last_seed = seeds[-1]
-        d = np.linalg.norm(points - last_seed, axis=1)
-        min_dists = np.minimum(min_dists, d)
-        seeds.append(points[np.argmax(min_dists)])
-
-    heatmap = np.zeros_like(centerline, dtype=np.float32)
-    for y, x in seeds:
-        if 0 <= y < h and 0 <= x < w:
-            heatmap[y, x] = 1.0
-
-    heatmap = gaussian_filter(heatmap, sigma=sigma)
-    if heatmap.max() > 0:
-        heatmap /= heatmap.max()
-    return heatmap
-
-# ==========================================
-# DATASET
-# ==========================================
 class SeedDataset(Dataset):
-    def __init__(self, samples: List[Dict], sigma: float = 3.0, resize: tuple = (512, 512), aux_spacing: int = 20):
-        self.items = []
-        for s in samples:
-            vessel_mask = s.get("vessel_mask", s["centerline"])
-            gt_hm = build_seed_targets(s["centerline"], vessel_mask, sigma=sigma, aux_spacing=aux_spacing)
+    """On-the-fly augmented dataset with multi-task target generation.
 
-            img_t = torch.from_numpy(s["image"].transpose(2, 0, 1)).float()
-            hm_t = torch.from_numpy(gt_hm).unsqueeze(0).float()
-            fov_t = torch.from_numpy(s["fov_mask"]).unsqueeze(0).float()
-            vessel_t = torch.from_numpy(vessel_mask.astype(np.float32)).unsqueeze(0).float()
+    All geometric augmentations are applied BEFORE building targets, so the
+    centerline tube, radius map and orientation map are all in the same
+    augmented frame as the image. Photometric augmentations touch the image
+    only.
+    """
 
-            if resize is not None:
-                h, w = resize
-                img_t = F.interpolate(img_t.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
-                hm_t = F.interpolate(hm_t.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
-                fov_t = F.interpolate(fov_t.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
-                vessel_t = F.interpolate(vessel_t.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
-
-            self.items.append((img_t, hm_t, fov_t, vessel_t))
-
-    def __len__(self): return len(self.items)
-    def __getitem__(self, idx): return self.items[idx]
-
-
-# ==========================================
-# LOSS FUNCTIONS
-# ==========================================
-
-def focal_loss(
-    pred: torch.Tensor,
-    gt: torch.Tensor,
-    mask: Optional[torch.Tensor] = None,
-    alpha: float = 0.25,
-    gamma: float = 2.0,
-) -> torch.Tensor:
-    """Focal Loss to handle extreme class imbalance."""
-    bce = F.binary_cross_entropy(pred, gt, reduction="none")
-    pt = torch.where(gt > 0.5, pred, 1.0 - pred)
-    loss = alpha * (1.0 - pt) ** gamma * bce
-
-    if mask is not None:
-        loss = loss * mask
-        return loss.sum() / (mask.sum() + 1e-8)
-    return loss.mean()
-
-def soft_dice_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
-    """Soft Dice loss for tubular structure overlap."""
-    pred_flat = pred.view(pred.size(0), -1)
-    target_flat = target.view(target.size(0), -1)
-    intersection = (pred_flat * target_flat).sum(dim=1)
-    union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
-    dice = (2.0 * intersection + smooth) / (union + smooth)
-    return 1.0 - dice.mean()
-
-
-# ==========================================
-# TRAINER
-# ==========================================
-
-class SeedDetectorTrainer:
     def __init__(
         self,
-        model: nn.Module,
+        samples: List[Dict[str, Any]],
+        sigma: float = 1.5,
+        resize: Tuple[int, int] = (512, 512),
+        augment: bool = False,
+        use_frangi_input: bool = True,
+    ):
+        self.samples = samples
+        self.sigma = sigma
+        self.resize = resize
+        self.augment = augment
+        self.use_frangi_input = use_frangi_input
+
+    def __len__(self):
+        return len(self.samples)
+
+    # ------------------------------------------------------------------
+    def _augment(
+        self,
+        img: np.ndarray,
+        vessel: np.ndarray,
+        fov: np.ndarray,
+        frangi: Optional[np.ndarray] = None,
+    ):
+        """Geometric + photometric augmentation kept consistent across
+        image / vessel / fov (and the cached Frangi channel, if given).
+
+        Photometric transforms are applied to the image only — Frangi is a
+        purely geometric vessel response so it should NOT be re-photometried,
+        otherwise the cached value would drift away from "Frangi on the
+        clean image". Geometric augs (rotation / flip / affine) are applied
+        identically to the Frangi map so it stays spatially registered with
+        image/vessel/fov.
+        """
+        # 90° rotation
+        k = np.random.randint(0, 4)
+        if k > 0:
+            img = np.rot90(img, k, axes=(0, 1)).copy()
+            vessel = np.rot90(vessel, k, axes=(0, 1)).copy()
+            fov = np.rot90(fov, k, axes=(0, 1)).copy()
+            if frangi is not None:
+                frangi = np.rot90(frangi, k, axes=(0, 1)).copy()
+        # Flips
+        if np.random.rand() < 0.5:
+            img, vessel, fov = (np.fliplr(a).copy() for a in (img, vessel, fov))
+            if frangi is not None:
+                frangi = np.fliplr(frangi).copy()
+        if np.random.rand() < 0.5:
+            img, vessel, fov = (np.flipud(a).copy() for a in (img, vessel, fov))
+            if frangi is not None:
+                frangi = np.flipud(frangi).copy()
+        # Small in-plane rotation (±15°) + minor scale
+        if np.random.rand() < 0.5:
+            h, w = img.shape[:2]
+            angle = np.random.uniform(-15.0, 15.0)
+            scale = np.random.uniform(0.92, 1.08)
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, scale)
+            img = cv2.warpAffine(
+                img,
+                M,
+                (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT_101,
+            )
+            vessel = cv2.warpAffine(
+                vessel,
+                M,
+                (w, h),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            fov = cv2.warpAffine(
+                fov,
+                M,
+                (w, h),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            if frangi is not None:
+                frangi = cv2.warpAffine(
+                    frangi,
+                    M,
+                    (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+        # Photometric — image only (NEVER Frangi)
+        if np.random.rand() < 0.8:
+            img = np.clip(
+                img + np.random.uniform(-0.12, 0.12),
+                0.0,
+                1.0,
+            )
+        if np.random.rand() < 0.8:
+            f = np.random.uniform(0.7, 1.3)
+            mu = img.mean()
+            img = np.clip((img - mu) * f + mu, 0.0, 1.0)
+        if np.random.rand() < 0.5:
+            for c in range(3):
+                img[:, :, c] = np.clip(
+                    img[:, :, c] + np.random.uniform(-0.08, 0.08),
+                    0,
+                    1,
+                )
+        if np.random.rand() < 0.5:
+            gamma = np.random.uniform(0.7, 1.4)
+            img = np.clip(img**gamma, 0.0, 1.0)
+        if np.random.rand() < 0.3:
+            noise = np.random.randn(*img.shape).astype(np.float32) * np.random.uniform(0.01, 0.04)
+            img = np.clip(img + noise, 0.0, 1.0)
+        return img, vessel, fov, frangi
+
+    # ------------------------------------------------------------------
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        img = s['image'].copy()
+        vessel = s['vessel_mask'].copy()
+        fov = s['fov_mask'].copy()
+        # Cached Frangi (precomputed in load_samples). If missing and the
+        # caller asked for the Frangi input channel, compute it lazily —
+        # but warn-once because that's the slow path that caused the 12 h
+        # SLURM timeout.
+        frangi = s.get('frangi')
+        if self.use_frangi_input and frangi is None:
+            if not getattr(
+                SeedDataset,
+                '_warned_no_cache',
+                False,
+            ):
+                print(
+                    'WARN: SeedDataset received samples without a '
+                    "precomputed 'frangi' key — falling back to per-getitem "
+                    'Frangi (slow). Precompute it in load_samples().',
+                    flush=True,
+                )
+                SeedDataset._warned_no_cache = True
+            frangi = frangi_vesselness(img[..., 1])
+        elif frangi is not None:
+            frangi = frangi.copy()
+
+        if self.augment:
+            img, vessel, fov, frangi = self._augment(img, vessel, fov, frangi)
+
+        if self.resize is not None:
+            th, tw = self.resize
+            img = cv2.resize(
+                img,
+                (tw, th),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            vessel = cv2.resize(
+                vessel.astype(np.float32),
+                (tw, th),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            fov = cv2.resize(
+                fov.astype(np.float32),
+                (tw, th),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            if frangi is not None:
+                frangi = cv2.resize(
+                    frangi,
+                    (tw, th),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+        from skimage.morphology import skeletonize
+
+        vessel_bin = vessel > 0.5
+        skel = skeletonize(vessel_bin).astype(np.float32)
+
+        cl_tube = build_centerline_tube(skel, sigma=self.sigma)
+        rad_map = build_radius_map(vessel_bin)
+        orient = build_orientation_map(skel)  # (2, H, W)
+
+        if self.use_frangi_input:
+            img4 = np.concatenate([img, frangi[..., None]], axis=-1)
+        else:
+            img4 = img
+
+        img_t = torch.from_numpy(img4.transpose(2, 0, 1)).float()
+        cl_t = torch.from_numpy(cl_tube).unsqueeze(0).float()
+        ve_t = torch.from_numpy(vessel_bin.astype(np.float32)).unsqueeze(0).float()
+        rad_t = torch.from_numpy(rad_map).unsqueeze(0).float()
+        or_t = torch.from_numpy(orient).float()  # (2, H, W) already
+        fov_t = torch.from_numpy(fov.astype(np.float32)).unsqueeze(0).float()
+
+        return (
+            img_t,
+            cl_t,
+            ve_t,
+            rad_t,
+            or_t,
+            fov_t,
+        )
+
+
+# ===========================================================================
+# Trainer
+# ===========================================================================
+
+
+class SeedDetectorTrainer:
+    """Multi-task seed-detector trainer with cosine schedule + deep super.
+
+    Best-checkpoint selection uses a validation centerline F1@2px against
+    the GT skeleton (a proxy for downstream RL success) — not raw loss —
+    so we save the checkpoint that best places seed candidates.
+    """
+
+    def __init__(
+        self,
+        model: SeedDetector,
         device: torch.device,
-        lr: float = 1e-4,
+        lr: float = 1e-3,
         batch_size: int = 4,
-        num_epochs: int = 30,
-        sigma: float = 3.0,
+        num_epochs: int = 100,
+        warmup_epochs: int = 5,
+        sigma: float = 1.5,
+        use_frangi_input: bool = True,
+        num_workers: int = 2,
+        weight_decay: float = 1e-4,
+        max_grad_norm: float = 1.0,
     ):
         self.model = model
         self.device = device
         self.batch_size = batch_size
         self.num_epochs = num_epochs
+        self.warmup_epochs = warmup_epochs
         self.sigma = sigma
-        
-        # --- Config Link: Read Focal Loss parameters from config.py ---
-        train_cfg = SEED_CONFIG.get("training", {})
-        self.ep_alpha = train_cfg.get("ep_alpha", 0.80)
-        self.ep_gamma = train_cfg.get("ep_gamma", 4.0)
-        self.v_alpha  = train_cfg.get("vessel_alpha", 0.75)
-        self.v_gamma  = train_cfg.get("vessel_gamma", 2.0)
-        self.aux_spacing = train_cfg.get("aux_spacing", 20)
+        self.use_frangi_input = use_frangi_input
+        self.num_workers = num_workers
+        self.max_grad_norm = max_grad_norm
+        self._last_loss_components: Dict[str, float] = {}
 
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode="min", patience=5, factor=0.5
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        self.scheduler = None  # built in train() once dataset is known
+
+    # ------------------------------------------------------------------
+    def train(
+        self,
+        train_samples: List[Dict[str, Any]],
+        val_samples: List[Dict[str, Any]],
+        save_path: str,
+        config: Dict[str, Any],
+    ):
+        os.makedirs(
+            os.path.dirname(save_path) or '.',
+            exist_ok=True,
         )
 
-    def train(self, train_samples: List[Dict], val_samples: List[Dict], save_path: str, config: dict) -> None:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
+        train_ds = SeedDataset(
+            train_samples,
+            sigma=self.sigma,
+            augment=True,
+            use_frangi_input=self.use_frangi_input,
+        )
+        val_ds = SeedDataset(
+            val_samples,
+            sigma=self.sigma,
+            augment=False,
+            use_frangi_input=self.use_frangi_input,
+        )
         train_loader = DataLoader(
-            SeedDataset(train_samples, sigma=self.sigma, aux_spacing=self.aux_spacing),
-            batch_size=self.batch_size, shuffle=True, num_workers=0
+            train_ds,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
+            pin_memory=self.device.type == 'cuda',
         )
         val_loader = DataLoader(
-            SeedDataset(val_samples, sigma=self.sigma, aux_spacing=self.aux_spacing),
-            batch_size=self.batch_size, shuffle=False, num_workers=0
+            val_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
+            pin_memory=self.device.type == 'cuda',
         )
 
-        print(f"Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
+        total_steps = self.num_epochs * max(1, len(train_loader))
+        warmup_steps = self.warmup_epochs * max(1, len(train_loader))
 
-        best_val_loss = float("inf")
-        # 5 lists to track history for the final summary
-        history = {"tp": [], "fp": [], "fn": [], "t_loss": [], "v_loss": []}
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            p = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * p))
 
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+
+        print(
+            f'Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}',
+            flush=True,
+        )
+        print(
+            f'Epochs: {self.num_epochs} (warmup {self.warmup_epochs})  '
+            f'sigma={self.sigma}  frangi={self.use_frangi_input}  '
+            f'num_workers={self.num_workers}',
+            flush=True,
+        )
+
+        best_metric = -float('inf')
+        train_start = time.time()
         for epoch in range(1, self.num_epochs + 1):
+            t_epoch = time.time()
             train_loss = self._run_epoch(train_loader, train=True)
             val_loss = self._run_epoch(val_loader, train=False)
-            self.scheduler.step(val_loss)
+            val_f1 = self._val_seed_f1(val_samples)
 
-            print(f"Epoch {epoch:3d}/{self.num_epochs} train_loss={train_loss:.5f} val_loss={val_loss:.5f}", flush=True)
+            lr_now = self.optimizer.param_groups[0]['lr']
+            dt = time.time() - t_epoch
+            eta_h = (self.num_epochs - epoch) * dt / 3600.0
+            print(
+                f'Epoch {epoch:3d}/{self.num_epochs}  '
+                f'train={train_loss:.4f}  val={val_loss:.4f}  '
+                f'seed_f1={val_f1:.3f}  lr={lr_now:.2e}  '
+                f'dt={dt:.1f}s  ETA={eta_h:.2f}h',
+                flush=True,
+            )
 
-            # Capture spatial metrics and save per-epoch image
-            tp, fp, fn = self.visualize_performance(val_loader, epoch)
-            
-            history["tp"].append(tp)
-            history["fp"].append(fp)
-            history["fn"].append(fn)
-            history["t_loss"].append(train_loss)
-            history["v_loss"].append(val_loss)
+            if val_f1 > best_metric:
+                best_metric = val_f1
+                torch.save(
+                    {
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'val_loss': val_loss,
+                        'seed_f1': val_f1,
+                        'config': config,
+                    },
+                    save_path,
+                )
+                print(
+                    f'  ✓ Saved (seed_f1={val_f1:.3f})',
+                    flush=True,
+                )
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": self.model.state_dict(),
-                    "optimizer_state_dict": self.optimizer.state_dict(),
-                    "val_loss": val_loss,
-                    "config": config,
-                }, save_path)
-                print(f"  ✓ Saved best model (val_loss={val_loss:.5f})", flush=True)
+        total_h = (time.time() - train_start) / 3600.0
+        print(
+            f'\nDone in {total_h:.2f}h. Best val seed_f1={best_metric:.3f}  →  {save_path}',
+            flush=True,
+        )
 
-        # Generate the final summary with metrics and loss curves
-        self._plot_training_summary(history)
-
+    # ------------------------------------------------------------------
     def _run_epoch(self, loader: DataLoader, train: bool) -> float:
         self.model.train() if train else self.model.eval()
-        total_loss = 0.0
+        total = 0.0
+        comp_sums: Dict[str, float] = {}
         ctx = torch.enable_grad() if train else torch.no_grad()
-        
         with ctx:
-            for img, hm, fov, vessel in loader:
-                img, hm, fov, vessel = img.to(self.device), hm.to(self.device), fov.to(self.device), vessel.to(self.device)
-                
-                ep_pred, v_pred = self.model(img)
+            for (
+                img,
+                cl,
+                ve,
+                ra,
+                ori,
+                fov,
+            ) in loader:
+                img = img.to(self.device)
+                cl = cl.to(self.device)
+                ve = ve.to(self.device)
+                ra = ra.to(self.device)
+                ori = ori.to(self.device)
+                fov = fov.to(self.device)
 
-                # Seed Loss (Focal) - Targeting high recall
-                ep_loss = focal_loss(ep_pred, hm, mask=fov, alpha=self.ep_alpha, gamma=self.ep_gamma)
-
-                # Vessel Loss (Focal + Dice)
-                v_foc = focal_loss(v_pred, vessel, alpha=self.v_alpha, gamma=self.v_gamma)
-                v_dice = soft_dice_loss(v_pred, vessel)
-                v_loss = v_foc + v_dice
-
-                # Penalty for seeds in non-vessel regions
-                fp_penalty = (ep_pred * (1.0 - vessel)).mean()
-
-                loss = ep_loss + 0.3 * v_loss + 0.2 * fp_penalty
-
+                preds = self.model(img, return_aux=True)
+                loss, comps = seed_detector_loss(
+                    preds,
+                    {
+                        'centerline_tube': cl,
+                        'vessel_mask': ve,
+                        'radius_map': ra,
+                        'orient_map': ori,
+                    },
+                    fov_mask=fov,
+                )
                 if train:
                     self.optimizer.zero_grad()
                     loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.max_grad_norm,
+                    )
                     self.optimizer.step()
-                total_loss += loss.item()
+                    if self.scheduler is not None:
+                        self.scheduler.step()
 
-        return total_loss / len(loader)
+                total += float(loss.item())
+                for k, v in comps.items():
+                    comp_sums[k] = comp_sums.get(k, 0.0) + v
 
-    def visualize_performance(self, val_loader: DataLoader, epoch: int, save_dir: str = "training_seed_detector"):
+        n = max(1, len(loader))
+        self._last_loss_components = {k: v / n for k, v in comp_sums.items()}
+        self._last_loss_components['phase'] = 'train' if train else 'val'
+        return total / n
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _val_seed_f1(
+        self,
+        val_samples: List[Dict[str, Any]],
+        n_images: int = 8,
+        tol_prec: int = 3,
+        tol_recall: int = 20,
+    ) -> float:
+        """Real F1 for best-checkpoint selection.
+
+        Precision (tight tol): fraction of predicted seeds whose pixel lies
+        within ``tol_prec`` of the GT centerline. Penalises off-vessel and
+        clustered-on-OD seeds.
+
+        Recall (loose tol): fraction of GT-centerline pixels that have AT
+        LEAST ONE predicted seed within ``tol_recall``. Penalises sparse /
+        peripheral-vessel-starved seed sets — the failure mode the prior
+        precision-only metric was blind to (it saturated at ≈0.97 across
+        every reasonable checkpoint and gave no discrimination signal).
+
+        F1 = 2·P·R / (P + R).
         """
-        Evaluates the seed detector on the validation set.
-        Calculates TP, FP, FN using local maxima and distance matching.
-        Saves a visual debug image for the first batch of every epoch.
-        """
+        import cv2 as _cv2
+
         self.model.eval()
-        os.makedirs(save_dir, exist_ok=True)
-        
-        total_tp = 0
-        total_fp = 0
-        total_fn = 0
-        
-        saved_image = False
+        tp_prec = fp_prec = 0
+        gt_total = 0
+        gt_covered = 0
+        for s in val_samples[:n_images]:
+            img_np = s['image']
+            fov_np = s['fov_mask']
+            cl_np = (s['centerline'] > 0).astype(np.uint8)
+            img_t = torch.from_numpy(img_np.transpose(2, 0, 1)).float().unsqueeze(0).to(self.device)
+            fov_t = torch.from_numpy(fov_np.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(self.device)
+            seeds, _, _ = self.model.detect_seeds(img_t, fov_mask=fov_t)
+            seeds = seeds[0]
 
-        with torch.no_grad():
-            for batch_idx, (img, hm, fov, vessel) in enumerate(val_loader):
-                img = img.to(self.device)
-                ep_pred, _ = self.model(img)
-                
-                # Move to CPU for numpy peak extraction
-                preds = ep_pred.cpu().numpy()
-                gts = hm.cpu().numpy()
-                imgs = img.cpu().numpy()
-                
-                for i in range(preds.shape[0]):
-                    # Extract coordinates of local maxima
-                    pred_pts = peak_local_max(preds[i, 0], min_distance=10, threshold_abs=0.1)
-                    gt_pts = peak_local_max(gts[i, 0], min_distance=10, threshold_abs=0.1)
-                    
-                    if len(gt_pts) == 0:
-                        total_fp += len(pred_pts)
-                        continue
-                    if len(pred_pts) == 0:
-                        total_fn += len(gt_pts)
-                        continue
-                        
-                    # Match predictions to GTs using distance matrix
-                    dists = cdist(pred_pts, gt_pts)
-                    matched_gt = set()
-                    tp = 0
-                    
-                    # Greedy matching within a 15-pixel radius
-                    for p_idx in range(len(pred_pts)):
-                        closest_gt = np.argmin(dists[p_idx])
-                        if dists[p_idx, closest_gt] < 15 and closest_gt not in matched_gt:
-                            tp += 1
-                            matched_gt.add(closest_gt)
-                            
-                    fp = len(pred_pts) - tp
-                    fn = len(gt_pts) - tp
-                    
-                    total_tp += tp
-                    total_fp += fp
-                    total_fn += fn
+            gt_total += int(cl_np.sum())
+            if not seeds:
+                continue
 
-                    # Save a debug visualization for the very first image of the epoch
-                    if not saved_image:
-                        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-                        
-                        # RGB Image
-                        axes[0].imshow(imgs[i].transpose(1, 2, 0))
-                        axes[0].set_title("Input RGB")
-                        
-                        # Ground Truth Heatmap + Peaks
-                        axes[1].imshow(gts[i, 0], cmap="magma")
-                        if len(gt_pts) > 0:
-                            axes[1].scatter(gt_pts[:, 1], gt_pts[:, 0], c='lime', s=10, marker='x')
-                        axes[1].set_title(f"GT Heatmap ({len(gt_pts)} seeds)")
-                        
-                        # Predicted Heatmap + Peaks
-                        axes[2].imshow(preds[i, 0], cmap="magma")
-                        if len(pred_pts) > 0:
-                            axes[2].scatter(pred_pts[:, 1], pred_pts[:, 0], c='cyan', s=10, marker='x')
-                        axes[2].set_title(f"Pred Heatmap ({len(pred_pts)} seeds)")
-                        
-                        for ax in axes: ax.axis('off')
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(save_dir, f"epoch_{epoch:03d}_val_sample.png"), dpi=150)
-                        plt.close()
-                        saved_image = True
+            # Precision: seeds inside GT-skel dilated by tol_prec
+            k_p = 2 * tol_prec + 1
+            cl_dil_p = _cv2.dilate(
+                cl_np,
+                np.ones((k_p, k_p), np.uint8),
+            )
+            hits = sum(1 for y, x, _ in seeds if cl_dil_p[y, x] > 0)
+            tp_prec += hits
+            fp_prec += len(seeds) - hits
 
-        # Calculate metrics and print to console
-        precision = total_tp / max(total_tp + total_fp, 1)
-        recall = total_tp / max(total_tp + total_fn, 1)
-        f1 = 2 * (precision * recall) / max(precision + recall, 1e-8)
-        
-        print(f"   -> [Validation] TP: {total_tp:4d} | FP: {total_fp:4d} | FN: {total_fn:4d} | Precision: {precision:.3f} | Recall: {recall:.3f} | F1: {f1:.3f}", flush=True)
+            # Recall: GT-skel pixels with a seed within tol_recall
+            seed_mask = np.zeros_like(cl_np)
+            for y, x, _ in seeds:
+                if 0 <= y < cl_np.shape[0] and 0 <= x < cl_np.shape[1]:
+                    seed_mask[y, x] = 1
+            k_r = 2 * tol_recall + 1
+            seed_dil = _cv2.dilate(
+                seed_mask,
+                np.ones((k_r, k_r), np.uint8),
+            )
+            gt_covered += int(((cl_np > 0) & (seed_dil > 0)).sum())
 
-        self.model.train()
-        return total_tp, total_fp, total_fn
-
-
-    def _plot_training_summary(self, history, save_dir="training_seed_detector"):
-        """Plots a two-panel summary: TP/FP/FN Metrics and Loss Curves."""
-        epochs = range(1, len(history["tp"]) + 1)
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
-        
-        # Panel 1: Metrics
-        ax1.plot(epochs, history["tp"], label='True Positives', color='lime', marker='o', markersize=4)
-        ax1.plot(epochs, history["fp"], label='False Positives', color='red', marker='x', markersize=4)
-        ax1.plot(epochs, history["fn"], label='False Negatives', color='cyan', marker='s', markersize=4)
-        ax1.set_title('Performance Metrics Progression', fontsize=14); ax1.set_xlabel('Epoch'); ax1.legend(); ax1.grid(True)
-        
-        # Panel 2: Loss Curves
-        ax2.plot(epochs, history["t_loss"], label='Train Loss', color='orange', linewidth=2)
-        ax2.plot(epochs, history["v_loss"], label='Val Loss', color='blue', linewidth=2, linestyle='--')
-        ax2.set_title('Loss Curves', fontsize=14); ax2.set_xlabel('Epoch'); ax2.legend(); ax2.grid(True)
-        
-        # Visual Warning if overfitting occurs
-        if history["v_loss"][-1] > min(history["v_loss"]) * 1.1:
-            ax2.text(0.5, 0.5, 'OVERFITTING DETECTED', transform=ax2.transAxes, 
-                     fontsize=20, color='red', alpha=0.4, ha='center', fontweight='bold')
-
-        summary_path = os.path.join(save_dir, "Training_Summary.png")
-        plt.tight_layout()
-        plt.savefig(summary_path, dpi=150)
-        plt.close()
-        print(f"Saved complete training summary to: {summary_path}")
+        prec = tp_prec / max(1, tp_prec + fp_prec)
+        recall = gt_covered / max(1, gt_total)
+        f1 = 2.0 * prec * recall / max(1e-6, prec + recall)
+        return f1
