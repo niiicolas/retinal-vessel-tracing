@@ -34,9 +34,80 @@ def compute_betti0(binary_mask: np.ndarray, connectivity: int = 2) -> int:
     if binary_mask.sum() == 0:
         return 0
     _, n_components = measure.label(
-        binary_mask > 0, return_num=True, connectivity=connectivity
+        binary_mask > 0,
+        return_num=True,
+        connectivity=connectivity,
     )
     return int(n_components)
+
+
+def compute_gt_graph_metrics(
+    pred_mask: np.ndarray,
+    gt_centerline: np.ndarray,
+    gt_graph=None,
+    tolerance: float = 2.0,
+    edge_coverage_threshold: float = 0.80,
+) -> Dict[str, float]:
+    """Graph-aware metrics that mirror the env-side ``covered_centerline`` view.
+
+    Returns:
+      betti_0_covered     — connected-component count of the covered GT centerline
+                             (GT centerline pixels within ``tolerance`` of any pred
+                             pixel).  Lower is better; matches Diag-3-style topology
+                             feedback at the GT-skeleton level rather than at the
+                             prediction level.
+      gt_edge_cov80_frac  — fraction of GT graph edges (junction-to-junction or
+                             junction-to-endpoint) where >= ``edge_coverage_threshold``
+                             of the path pixels are covered.  Higher is better.
+
+    If ``gt_graph`` is None, builds it inline via CenterlineExtractor.
+    """
+    pred_bool = pred_mask > 0
+    gt_bool = gt_centerline > 0
+
+    if not pred_bool.any() or not gt_bool.any():
+        return {
+            'betti_0_covered': 0,
+            'gt_edge_cov80_frac': 0.0,
+        }
+
+    dist_to_pred = ndimage.distance_transform_edt(~pred_bool)
+    covered_centerline = gt_bool & (dist_to_pred <= tolerance)
+
+    if covered_centerline.any():
+        _, n_components = measure.label(
+            covered_centerline,
+            return_num=True,
+            connectivity=2,
+        )
+    else:
+        n_components = 0
+
+    if gt_graph is None:
+        from data.centerline_extraction import (
+            CenterlineExtractor,
+        )
+
+        gt_graph = CenterlineExtractor().skeleton_to_graph(gt_bool.astype(np.uint8))
+
+    n_edges = gt_graph.number_of_edges()
+    if n_edges == 0:
+        edge_cov_frac = 0.0
+    else:
+        n_covered_edges = 0
+        for _, _, data in gt_graph.edges(data=True):
+            path = data.get('path', [])
+            if not path:
+                continue
+            n_covered = sum(1 for (y, x) in path if covered_centerline[y, x])
+            if n_covered / len(path) >= edge_coverage_threshold:
+                n_covered_edges += 1
+        edge_cov_frac = n_covered_edges / n_edges
+
+    return {
+        'betti_0_covered': int(n_components),
+        'gt_edge_cov80_frac': float(edge_cov_frac),
+    }
 
 
 class CenterlineMetrics:
@@ -44,7 +115,10 @@ class CenterlineMetrics:
     and vessel masks.
     """
 
-    def __init__(self, tolerance_levels: List[int] = [1, 2, 3]):
+    def __init__(
+        self,
+        tolerance_levels: List[int] = [1, 2, 3],
+    ):
         self.tolerance_levels = tolerance_levels
 
     # ============================================================
@@ -58,9 +132,7 @@ class CenterlineMetrics:
         pred_vessel_mask: Optional[np.ndarray] = None,
         gt_vessel_mask: Optional[np.ndarray] = None,
         pred_prob: Optional[np.ndarray] = None,  # raw model prob map (H, W) float [0,1]
-        fov_mask: Optional[
-            np.ndarray
-        ] = None,  # FOV mask — metrics computed inside ROI only
+        fov_mask: Optional[np.ndarray] = None,  # FOV mask — metrics computed inside ROI only
     ) -> Dict[str, float]:
         """Compute all metrics for a single prediction.
 
@@ -101,9 +173,9 @@ class CenterlineMetrics:
                 gt_skeleton,
                 tau,
             )
-            metrics[f"precision@{tau}px"] = precision
-            metrics[f"recall@{tau}px"] = recall
-            metrics[f"f1@{tau}px"] = f1
+            metrics[f'precision@{tau}px'] = precision
+            metrics[f'recall@{tau}px'] = recall
+            metrics[f'f1@{tau}px'] = f1
 
         # --------------------------------------------------------
         # 2. clDice (mask-based)
@@ -113,21 +185,37 @@ class CenterlineMetrics:
         # --------------------------------------------------------
         if gt_vessel_mask is not None:
             if pred_prob is not None:
-                metrics["clDice"] = self.cl_dice_from_probs(pred_prob, gt_vessel_mask)
+                metrics['clDice'] = self.cl_dice_from_probs(pred_prob, gt_vessel_mask)
             elif pred_vessel_mask is not None:
-                metrics["clDice"] = self.cl_dice(pred_vessel_mask, gt_vessel_mask)
+                metrics['clDice'] = self.cl_dice(
+                    pred_vessel_mask,
+                    gt_vessel_mask,
+                )
 
         # --------------------------------------------------------
         # 3. IoU (mask-based)
         # --------------------------------------------------------
         if pred_vessel_mask is not None and gt_vessel_mask is not None:
-            metrics["iou"] = self.iou(pred_vessel_mask, gt_vessel_mask)
+            metrics['iou'] = self.iou(pred_vessel_mask, gt_vessel_mask)
 
         # --------------------------------------------------------
         # 4. Topology Metrics
         # --------------------------------------------------------
-        metrics["betti_0_error"] = self.betti_0_error(pred_skeleton, gt_skeleton)
-        metrics["hd95"] = self.hd95(pred_skeleton, gt_skeleton)
+        metrics['betti_0_error'] = self.betti_0_error(pred_skeleton, gt_skeleton)
+        metrics['hd95'] = self.hd95(pred_skeleton, gt_skeleton)
+
+        # --------------------------------------------------------
+        # 5. Width-stratified recall (diagnostic)
+        # --------------------------------------------------------
+        if gt_vessel_mask is not None:
+            metrics.update(
+                self.recall_by_width(
+                    pred_skeleton,
+                    gt_skeleton,
+                    gt_vessel_mask,
+                    tolerance=2,
+                )
+            )
 
         return metrics
 
@@ -168,6 +256,74 @@ class CenterlineMetrics:
 
         f1 = 2 * precision * recall / (precision + recall)
         return precision, recall, f1
+
+    # ============================================================
+    # WIDTH-STRATIFIED RECALL (diagnostic)
+    # ============================================================
+
+    def recall_by_width(
+        self,
+        pred: np.ndarray,
+        gt_skeleton: np.ndarray,
+        gt_vessel_mask: np.ndarray,
+        tolerance: int = 2,
+        thin_max: float = 3.0,
+        med_max: float = 6.0,
+    ) -> Dict[str, float]:
+        """Recall@tolerance stratified by local vessel width.
+
+        Width at each GT centerline pixel is 2 × inward distance transform of
+        the vessel mask (i.e. local vessel diameter in px).  Bins:
+            thin   : width <= thin_max
+            medium : thin_max < width <= med_max
+            thick  : width >  med_max
+
+        Recall in each bin = fraction of GT centerline pixels in that bin
+        that lie within `tolerance` px of any predicted skeleton pixel.
+        Comparable to ``recall@{tolerance}px`` from ``centerline_f1``.
+
+        Returns counts as well so per-image rows can be aggregated.
+        """
+        out: Dict[str, float] = {
+            f'recall@{tolerance}px_thin': 0.0,
+            f'recall@{tolerance}px_med': 0.0,
+            f'recall@{tolerance}px_thick': 0.0,
+            'n_centerline_thin': 0.0,
+            'n_centerline_med': 0.0,
+            'n_centerline_thick': 0.0,
+        }
+
+        gt_bin = gt_skeleton > 0
+        if not gt_bin.any() or not (gt_vessel_mask > 0).any():
+            return out
+
+        inward = ndimage.distance_transform_edt(gt_vessel_mask > 0).astype(np.float32)
+        width = 2.0 * inward  # local diameter in px
+
+        if (pred > 0).sum() == 0:
+            pred_dist = np.full(
+                pred.shape,
+                np.inf,
+                dtype=np.float32,
+            )
+        else:
+            pred_dist = ndimage.distance_transform_edt(~(pred > 0))
+
+        gt_idx = np.argwhere(gt_bin)
+        widths = width[gt_idx[:, 0], gt_idx[:, 1]]
+        within = pred_dist[gt_idx[:, 0], gt_idx[:, 1]] <= tolerance
+
+        bins = {
+            'thin': widths <= thin_max,
+            'med': (widths > thin_max) & (widths <= med_max),
+            'thick': widths > med_max,
+        }
+        for name, mask in bins.items():
+            n = int(mask.sum())
+            out[f'n_centerline_{name}'] = float(n)
+            if n > 0:
+                out[f'recall@{tolerance}px_{name}'] = float(within[mask].sum()) / n
+        return out
 
     # ============================================================
     # clDice (Hard, Mask-Based — evaluation only)
@@ -285,11 +441,7 @@ class CenterlineMetrics:
     # HD95 (Symmetric)
     # ============================================================
 
-    def hd95(
-        self,
-        pred: np.ndarray,
-        gt: np.ndarray,
-    ) -> float:
+    def hd95(self, pred: np.ndarray, gt: np.ndarray) -> float:
         """95th percentile symmetric Hausdorff distance (pixels).
 
         When one input is empty, returns the image diagonal as a
