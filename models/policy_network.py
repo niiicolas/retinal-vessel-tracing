@@ -8,67 +8,51 @@ Two forward modes:
   forward_sequence() — T-step chunk with done masks, used during PPO training
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _compute_in_channels(config: Dict[str, Any]) -> int:
-    """Single source of truth for observation channel count.
+def _compute_in_channels(
+    config: Dict[str, Any],
+) -> int:
+    """Observation channel count — thin shim over ``ObservationBuilder.n_channels``.
 
-    Base channels (always present, 10):
-      RGB                : 3
-      visited mask       : 1
-      distance transform : 1
-      vessel grad dy     : 1
-      vessel grad dx     : 1
-      centerline mask    : 1
-      vessel tangent dy  : 1
-      vessel tangent dx  : 1
-
-    Optional channels (in this order):
-      curvature   (use_curvature,   default True)
-      junction    (use_junction,    default True)
-      vesselness  (use_vesselness,  default False)
-      unet_prior  (use_unet_prior,  default False)
-      prev_action (use_prev_action, default False) — adds 2 channels
-
-    Must stay in sync with ObservationBuilder in environment/observation.py.
+    Both helpers used to maintain their own copy of the arithmetic and the
+    docstring listing every channel. The single source of truth now lives
+    in [environment/observation.py](../environment/observation.py) on
+    ``ObservationBuilder._OPTIONAL_CHANNELS``; add new channels there.
     """
-    env = config.get("environment", {})
-    n = 10
-    if env.get("use_curvature", True):
-        n += 1
-    if env.get("use_junction", True):
-        n += 1
-    if env.get("use_vesselness", False):
-        n += 1
-    if env.get("use_unet_prior", False):
-        n += 1
-    if env.get("use_global_visited", False):
-        n += 1
-    if env.get("use_prior_coverage", False):
-        n += 1
-    if env.get("use_prev_action", False):
-        n += 2
-    return n
+    from environment.observation import (
+        ObservationBuilder,
+    )
+
+    return ObservationBuilder.n_channels(config)
 
 
-def _junction_channel_idx(config: Dict[str, Any]) -> Optional[int]:
-    """Return the observation channel index of the junction map, or None.
+def _junction_channel_idx(
+    config: Dict[str, Any],
+) -> Optional[int]:
+    """Observation channel index of the junction map (None if disabled).
 
-    Used by the PPO trainer to extract per-step junction supervision targets
-    from the stored observation batch without re-running the environment.
+    Used by the PPO trainer to extract per-step junction supervision
+    targets from the stored observation batch without re-running the
+    environment. Delegates to ``ObservationBuilder.junction_channel_idx``.
     """
-    env = config.get("environment", {})
-    if not env.get("use_junction", True):
-        return None
-    n = 10  # base channels
-    if env.get("use_curvature", True):
-        n += 1  # curvature precedes junction in stacked sources
-    return n  # junction channel index
+    from environment.observation import (
+        ObservationBuilder,
+    )
+
+    return ObservationBuilder.junction_channel_idx(config)
 
 
 # ------------------------------------------------------------------
@@ -77,13 +61,20 @@ def _junction_channel_idx(config: Dict[str, Any]) -> Optional[int]:
 
 
 class CNNEncoder(nn.Module):
-    """Deeper CNN encoder with BatchNorm + Global Average Pooling.
+    """Deeper CNN encoder with GroupNorm + Global Average Pooling.
 
     5-layer conv stack with dilated convolutions in the last two blocks.
     Receptive field covers the full 65px crop (~81px theoretical) so
     branch-point context is visible even at the edge of the observation.
     GAP replaces the 2.3M-param Linear bottleneck so total encoder
     params drop by ~6× while feature extraction capacity goes up.
+
+    Normalisation is GroupNorm rather than BatchNorm: PPO toggles the
+    model between eval() (rollout) and train() (update), which under
+    BatchNorm makes the encoder produce different features for the same
+    observation (running stats vs batch stats) — contaminating the
+    importance ratio. GroupNorm is batch-size-invariant and mode-
+    independent, so rollout-time and update-time features match.
 
     RF derivation (k=kernel, s=stride, d=dilation, j=jump):
       L1  k5 s2 d1  → j=2,  RF=5
@@ -93,28 +84,70 @@ class CNNEncoder(nn.Module):
       L5  k3 s1 d3  → j=8,  RF=81
     """
 
-    def __init__(self, in_channels: int, hidden_dim: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_dim: int,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.conv_layers = nn.Sequential(
             # 65 -> 33,  RF=5
-            nn.Conv2d(in_channels, 32, kernel_size=5, stride=2, padding=2, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(
+                in_channels,
+                32,
+                kernel_size=5,
+                stride=2,
+                padding=2,
+                bias=False,
+            ),
+            nn.GroupNorm(8, 32),
             nn.ReLU(),
             # 33 -> 17,  RF=9
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(
+                32,
+                64,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(8, 64),
             nn.ReLU(),
             # 17 -> 17,  RF=17
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(
+                64,
+                64,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(8, 64),
             nn.ReLU(),
             # 17 -> 9,   RF=33  (dilation=2)
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=2, dilation=2, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(
+                64,
+                128,
+                kernel_size=3,
+                stride=2,
+                padding=2,
+                dilation=2,
+                bias=False,
+            ),
+            nn.GroupNorm(8, 128),
             nn.ReLU(),
             # 9  -> 9,   RF=81  (dilation=3)
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=3, dilation=3, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=3,
+                stride=1,
+                padding=3,
+                dilation=3,
+                bias=False,
+            ),
+            nn.GroupNorm(8, 128),
             nn.ReLU(),
         )
         # Soft spatial attention + global-max readout.
@@ -134,16 +167,18 @@ class CNNEncoder(nn.Module):
         self.output_dim = hidden_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv_layers(x)              # (B, 128, 9, 9)
+        x = self.conv_layers(x)  # (B, 128, H', W')  — 9×9 at obs_size=65
         B = x.shape[0]
         # Soft spatial attention: learn which spatial positions are relevant.
-        attn = self.attn_conv(x)             # (B, 1, 9, 9)
-        attn = F.softmax(attn.view(B, -1), dim=-1).view(B, 1, 9, 9)
-        x_attn = (x * attn).sum(dim=(2, 3)) # (B, 128) — spatially attended mean
+        # Reshape uses the actual feature-map size so the encoder works at any
+        # observation_size (was hardcoded 9×9, which only matched obs_size=65).
+        attn = self.attn_conv(x)  # (B, 1, H', W')
+        attn = F.softmax(attn.view(B, -1), dim=-1).view(B, 1, *x.shape[2:])
+        x_attn = (x * attn).sum(dim=(2, 3))  # (B, 128) — spatially attended mean
         x_max = self.gap_max(x).flatten(1)  # (B, 128)
         x = torch.cat([x_attn, x_max], dim=1)  # (B, 256)
         x = self.dropout(x)
-        return self.fc(x)                    # (B, hidden_dim)
+        return self.fc(x)  # (B, hidden_dim)
 
 
 class ResNetEncoder(nn.Module):
@@ -153,25 +188,56 @@ class ResNetEncoder(nn.Module):
         def __init__(self, channels: int):
             super().__init__()
             self.block = nn.Sequential(
-                nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-                nn.BatchNorm2d(channels),
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    3,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.GroupNorm(8, channels),
                 nn.ReLU(),
-                nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-                nn.BatchNorm2d(channels),
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    3,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.GroupNorm(8, channels),
             )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return F.relu(x + self.block(x))
 
-    def __init__(self, in_channels: int, hidden_dim: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_dim: int,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 5, stride=2, padding=2, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(
+                in_channels,
+                32,
+                5,
+                stride=2,
+                padding=2,
+                bias=False,
+            ),
+            nn.GroupNorm(8, 32),
             nn.ReLU(),
         )
         self.layer1 = self.ResBlock(32)
-        self.down1 = nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False)
+        self.down1 = nn.Conv2d(
+            32,
+            64,
+            3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
         self.layer2 = self.ResBlock(64)
         # Soft spatial attention + global-max (same rationale as CNNEncoder).
         self.attn_conv = nn.Conv2d(64, 1, kernel_size=1, bias=True)
@@ -189,9 +255,9 @@ class ResNetEncoder(nn.Module):
         x = self.down1(x)
         x = self.layer2(x)
         B = x.shape[0]
-        attn = self.attn_conv(x)             # (B, 1, H', W')
+        attn = self.attn_conv(x)  # (B, 1, H', W')
         attn = F.softmax(attn.view(B, -1), dim=-1).view(B, 1, *x.shape[2:])
-        x_attn = (x * attn).sum(dim=(2, 3)) # (B, 64)
+        x_attn = (x * attn).sum(dim=(2, 3))  # (B, 64)
         x_max = self.gap_max(x).flatten(1)  # (B, 64)
         x = torch.cat([x_attn, x_max], dim=1)  # (B, 128)
         x = self.dropout(x)
@@ -229,7 +295,10 @@ class LSTMHead(nn.Module):
         self,
         x: torch.Tensor,
         state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+    ]:
         x = self.ln(x)
         if state is None:
             B = x.size(0)
@@ -261,43 +330,68 @@ class ActorCriticNetwork(nn.Module):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
-        policy_cfg = config.get("policy", {})
+        policy_cfg = config.get('policy', {})
 
-        hidden_dim = policy_cfg.get("hidden_dim", 128)
-        lstm_hidden = policy_cfg.get("lstm_hidden", 128)
-        head_hidden = policy_cfg.get("head_hidden", 128)
-        self.use_lstm = policy_cfg.get("use_lstm", False)
-        dropout = policy_cfg.get("dropout", 0.0)
-        encoder_type = policy_cfg.get("encoder_type", "cnn")
+        hidden_dim = policy_cfg.get('hidden_dim', 128)
+        lstm_hidden = policy_cfg.get('lstm_hidden', 128)
+        head_hidden = policy_cfg.get('head_hidden', 128)
+        self.use_lstm = policy_cfg.get('use_lstm', False)
+        dropout = policy_cfg.get('dropout', 0.0)
+        encoder_type = policy_cfg.get('encoder_type', 'cnn')
 
-        in_channels = _compute_in_channels(config)
+        # Split the observation into a spatial block (consumed by the CNN
+        # encoder) and a scalar block (broadcast-constant channels — fed
+        # directly to the MLP head). The scalar channels (prev_action,
+        # topology_memory) carry agent-state vectors that don't benefit
+        # from spatial convolution and would otherwise waste obs_size²
+        # values per channel per step.
+        from environment.observation import (
+            ObservationBuilder,
+        )
+
+        in_channels_spatial = ObservationBuilder.n_spatial_channels(config)
+        self.n_scalar_channels = ObservationBuilder.n_scalar_channels(config)
 
         # ---- encoder ----
-        if encoder_type == "resnet":
-            self.encoder = ResNetEncoder(in_channels, hidden_dim, dropout)
+        if encoder_type == 'resnet':
+            self.encoder = ResNetEncoder(
+                in_channels_spatial,
+                hidden_dim,
+                dropout,
+            )
         else:
-            self.encoder = CNNEncoder(in_channels, hidden_dim, dropout)
+            self.encoder = CNNEncoder(
+                in_channels_spatial,
+                hidden_dim,
+                dropout,
+            )
 
         # ---- optional recurrence ----
+        # LSTM operates on encoder output only — scalars are concatenated
+        # AFTER the LSTM so its input width stays at ``hidden_dim``. The
+        # LSTM still picks up past scalar information indirectly via the
+        # encoder (e.g. agent moved → next obs's encoded features differ),
+        # but the heads also see the current scalars directly.
         if self.use_lstm:
             self.lstm_head = LSTMHead(hidden_dim, lstm_hidden)
-            feature_dim = lstm_hidden
+            feature_dim_post_lstm = lstm_hidden
         else:
             self.lstm_head = None
-            feature_dim = hidden_dim
+            feature_dim_post_lstm = hidden_dim
+        head_input_dim = feature_dim_post_lstm + self.n_scalar_channels
 
         # ---- heads ----
         # LayerNorm + Tanh after the head bottleneck stabilises PPO updates
         # against the intra-epoch feature distribution drift caused by
         # multiple gradient passes over the same rollout buffer.
         self.actor_head = nn.Sequential(
-            nn.Linear(feature_dim, head_hidden),
+            nn.Linear(head_input_dim, head_hidden),
             nn.LayerNorm(head_hidden),
             nn.Tanh(),
             nn.Linear(head_hidden, self.N_ACTIONS),
         )
         self.value_head = nn.Sequential(
-            nn.Linear(feature_dim, head_hidden),
+            nn.Linear(head_input_dim, head_hidden),
             nn.LayerNorm(head_hidden),
             nn.Tanh(),
             nn.Linear(head_hidden, 1),
@@ -310,11 +404,8 @@ class ActorCriticNetwork(nn.Module):
         #   1 = endpoint   (~0.5 on junction map)
         #   2 = junction   (~1.0 on junction map)
         # Supervised by the junction-map value at the center pixel of each obs.
-        env_cfg = config.get("environment", {})
-        use_junction_aux = (
-            policy_cfg.get("use_junction_aux", True)
-            and env_cfg.get("use_junction", True)
-        )
+        env_cfg = config.get('environment', {})
+        use_junction_aux = policy_cfg.get('use_junction_aux', True) and env_cfg.get('use_junction', True)
         if use_junction_aux:
             self.junction_head: Optional[nn.Sequential] = nn.Sequential(
                 nn.Linear(hidden_dim, 64),
@@ -331,7 +422,10 @@ class ActorCriticNetwork(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain("relu"))
+                nn.init.orthogonal_(
+                    m.weight,
+                    gain=nn.init.calculate_gain('relu'),
+                )
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
@@ -349,12 +443,14 @@ class ActorCriticNetwork(nn.Module):
         # Attention conv starts with zero weights → uniform softmax over the
         # 9×9 spatial grid, equivalent to the original average pooling.
         # The network diverges from uniform attention as it encounters junctions.
-        if hasattr(self.encoder, "attn_conv"):
+        if hasattr(self.encoder, 'attn_conv'):
             nn.init.zeros_(self.encoder.attn_conv.weight)
             nn.init.zeros_(self.encoder.attn_conv.bias)
 
     def init_hidden(
-        self, batch_size: int = 1, device: Union[torch.device, str] = "cpu"
+        self,
+        batch_size: int = 1,
+        device: Union[torch.device, str] = 'cpu',
     ):
         """Return the learnable initial hidden state, broadcast over batch.
 
@@ -366,25 +462,30 @@ class ActorCriticNetwork(nn.Module):
         """
         if not self.use_lstm:
             return None
-        h = (
-            self.lstm_head.init_h.detach()
-            .to(device)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-            .contiguous()
-        )
-        c = (
-            self.lstm_head.init_c.detach()
-            .to(device)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-            .contiguous()
-        )
+        h = self.lstm_head.init_h.detach().to(device).unsqueeze(0).expand(batch_size, -1).contiguous()
+        c = self.lstm_head.init_c.detach().to(device).unsqueeze(0).expand(batch_size, -1).contiguous()
         return h, c
 
+    def _split_obs(self, obs: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Split ``obs`` into (spatial, scalar) along the channel dim.
+
+        Scalar channels are broadcast-constant — we read the (0, 0) pixel
+        to recover the actual scalar value. Returns ``scalars=None`` when
+        no scalar channels are configured.
+        """
+        if self.n_scalar_channels == 0:
+            return obs, None
+        n = self.n_scalar_channels
+        return obs[:, :-n], obs[:, -n:, 0, 0]
+
     def encode(self, obs: torch.Tensor) -> torch.Tensor:
-        """Return CNN encoder features (before LSTM) for auxiliary losses."""
-        return self.encoder(obs)
+        """Return CNN encoder features (before LSTM) for auxiliary losses.
+
+        Strips the scalar tail off ``obs`` so auxiliary heads attached to
+        encoder features see the same input the CNN does.
+        """
+        spatial, _ = self._split_obs(obs)
+        return self.encoder(spatial)
 
     # ---- single-step forward (rollout) ----
 
@@ -392,11 +493,15 @@ class ActorCriticNetwork(nn.Module):
         self,
         obs: torch.Tensor,
         state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[Tuple],
+    ]:
         """Process one timestep.
 
         Args:
-            obs:   (B, C, H, W)
+            obs:   (B, C, H, W)  — C = spatial channels + scalar channels
             state: (h, c) each (B, lstm_hidden) or None
 
         Returns:
@@ -404,14 +509,17 @@ class ActorCriticNetwork(nn.Module):
             values: (B,)
             state:  updated (h, c) or None
         """
-        features = self.encoder(obs)
+        spatial, scalars = self._split_obs(obs)
+        features = self.encoder(spatial)
 
         if self.lstm_head is not None:
             features, state = self.lstm_head(features, state)
 
+        if scalars is not None:
+            features = torch.cat([features, scalars], dim=-1)
+
         logits = self.actor_head(features)
-        # 10% gradient leak: critic can weakly shape the encoder without dominating actor
-        values = self.value_head(features * 0.1 + features.detach() * 0.9).squeeze(-1)
+        values = self.value_head(features).squeeze(-1)
         return logits, values, state
 
     # ---- sequence forward (PPO training) ----
@@ -446,18 +554,41 @@ class ActorCriticNetwork(nn.Module):
         """
         T, B = obs_seq.shape[:2]
 
+        # Slice scalars off once at the front: spatial (T*B, Cs, H, W) goes
+        # through the CNN, scalars (T, B, Ns) are concatenated to the
+        # post-LSTM feature for each step.
+        flat = obs_seq.reshape(T * B, *obs_seq.shape[2:])
+        flat_spatial, flat_scalars = self._split_obs(flat)
+        if flat_scalars is not None:
+            scalars_seq = flat_scalars.view(T, B, -1)
+        else:
+            scalars_seq = None
+
         if not self.use_lstm:
-            flat = obs_seq.reshape(T * B, *obs_seq.shape[2:])
-            features = self.encoder(flat)
+            features = self.encoder(flat_spatial)
+            if flat_scalars is not None:
+                features = torch.cat(
+                    [features, flat_scalars],
+                    dim=-1,
+                )
             logits = self.actor_head(features).view(T, B, -1)
-            values = self.value_head(features * 0.1 + features.detach() * 0.9).squeeze(-1).view(T, B)
+            values = self.value_head(features).squeeze(-1).view(T, B)
             if return_enc_features:
-                return logits, values, features  # (T*B, hidden_dim)
+                # Auxiliary heads consume PRE-concat encoder features so
+                # they only see what the CNN sees. Reshape back to (T*B, *).
+                enc_only = (
+                    features[
+                        :,
+                        : -self.n_scalar_channels,
+                    ]
+                    if self.n_scalar_channels
+                    else features
+                )
+                return logits, values, enc_only
             return logits, values
 
         # Recurrent path: encode all frames in one batch, then loop LSTM
-        flat = obs_seq.reshape(T * B, *obs_seq.shape[2:])
-        all_features = self.encoder(flat).view(T, B, -1)  # (T, B, hidden_dim)
+        all_features = self.encoder(flat_spatial).view(T, B, -1)  # (T, B, hidden_dim)
 
         h, c = init_state
         all_logits = []
@@ -476,12 +607,21 @@ class ActorCriticNetwork(nn.Module):
                 c = c * (1.0 - done_mask) + init_c_b * done_mask
 
             features_t, (h, c) = self.lstm_head(all_features[t], (h, c))
+            if scalars_seq is not None:
+                features_t = torch.cat(
+                    [features_t, scalars_seq[t]],
+                    dim=-1,
+                )
             all_logits.append(self.actor_head(features_t))
-            all_values.append(self.value_head(features_t * 0.1 + features_t.detach() * 0.9).squeeze(-1))
+            all_values.append(self.value_head(features_t).squeeze(-1))
 
         if return_enc_features:
             # Return pre-LSTM encoder features (T*B, hidden_dim) for aux losses
-            return torch.stack(all_logits), torch.stack(all_values), all_features.reshape(T * B, -1)
+            return (
+                torch.stack(all_logits),
+                torch.stack(all_values),
+                all_features.reshape(T * B, -1),
+            )
         return torch.stack(all_logits), torch.stack(all_values)
 
     # ---- convenience methods ----
@@ -490,12 +630,24 @@ class ActorCriticNetwork(nn.Module):
         self,
         obs: torch.Tensor,
         state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[Tuple],
+    ]:
         """Sample action + compute log_prob, entropy, value. Used during rollout."""
         logits, values, state = self.forward(obs, state)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), values, state
+        return (
+            action,
+            dist.log_prob(action),
+            dist.entropy(),
+            values,
+            state,
+        )
 
     def get_value(
         self,

@@ -27,7 +27,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.greedy_tracer import GreedyTracer
-from models.unet_blocks import DownBlock, DSConvBlock, UpBlock
+from models.unet_blocks import (
+    DownBlock,
+    DSConvBlock,
+    UpBlock,
+)
 
 # ==========================================
 # CENTERLINE UNET
@@ -86,7 +90,7 @@ class CenterlineUNet(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.BatchNorm2d):
@@ -117,14 +121,23 @@ class CenterlineUNet(nn.Module):
 # ==========================================
 
 
-def _soft_erode(img: torch.Tensor) -> torch.Tensor:
+def _soft_erode(
+    img: torch.Tensor,
+) -> torch.Tensor:
     """Morphological min-pool (2-connectivity)."""
     if img.ndim == 4:  # (B, 1, H, W)
-        return -F.max_pool2d(-img, kernel_size=3, stride=1, padding=1)
-    raise ValueError("Expected 4-D tensor.")
+        return -F.max_pool2d(
+            -img,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+    raise ValueError('Expected 4-D tensor.')
 
 
-def _soft_dilate(img: torch.Tensor) -> torch.Tensor:
+def _soft_dilate(
+    img: torch.Tensor,
+) -> torch.Tensor:
     return F.max_pool2d(img, kernel_size=3, stride=1, padding=1)
 
 
@@ -178,7 +191,11 @@ class CenterlineLoss(nn.Module):
         self.skeleton_iter = skeleton_iter
         self.pos_weight = torch.tensor([pos_weight]) if pos_weight is not None else None
 
-    def _soft_cl_dice(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _soft_cl_dice(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
         """Soft clDice ∈ [0, 1], higher is better.
         pred, target: (B, 1, H, W) float, [0, 1]
         """
@@ -186,13 +203,9 @@ class CenterlineLoss(nn.Module):
         skel_target = soft_skeleton(target, self.skeleton_iter)
 
         # Topology-Precision: how much of pred-skeleton lies on target
-        tprec = (skel_pred * target).sum(dim=[1, 2, 3]) / (
-            skel_pred.sum(dim=[1, 2, 3]) + 1e-5
-        )
+        tprec = (skel_pred * target).sum(dim=[1, 2, 3]) / (skel_pred.sum(dim=[1, 2, 3]) + 1e-5)
         # Topology-Sensitivity: how much of gt-skeleton is covered by pred
-        tsens = (skel_target * pred).sum(dim=[1, 2, 3]) / (
-            skel_target.sum(dim=[1, 2, 3]) + 1e-5
-        )
+        tsens = (skel_target * pred).sum(dim=[1, 2, 3]) / (skel_target.sum(dim=[1, 2, 3]) + 1e-5)
 
         cl_dice = 2 * tprec * tsens / (tprec + tsens + 1e-5)
         return cl_dice.mean()
@@ -223,19 +236,17 @@ class CenterlineLoss(nn.Module):
         pw = self.pos_weight.to(pred.device) if self.pos_weight is not None else None
         if pw is not None:
             # Weighted BCE: penalises false negatives on rare centerline pixels
-            bce = -(
-                pw * t * torch.log(p + 1e-5) + (1 - t) * torch.log(1 - p + 1e-5)
-            ).mean()
+            bce = -(pw * t * torch.log(p + 1e-5) + (1 - t) * torch.log(1 - p + 1e-5)).mean()
         else:
-            bce = F.binary_cross_entropy(p, t, reduction="mean")
+            bce = F.binary_cross_entropy(p, t, reduction='mean')
 
         cl_d = self._soft_cl_dice(pred, target)
         total = self.bce_weight * bce + self.cl_weight * (1.0 - cl_d)
 
         return total, {
-            "bce": bce.item(),
-            "cl_dice": cl_d.item(),
-            "total": total.item(),
+            'bce': bce.item(),
+            'cl_dice': cl_d.item(),
+            'total': total.item(),
         }
 
 
@@ -256,7 +267,7 @@ class CenterlinePredictor:
         self,
         model: CenterlineUNet,
         tracer: Optional[GreedyTracer] = None,
-        device: str = "cpu",
+        device: str = 'cpu',
         patch_size: Optional[int] = None,
         patch_stride: Optional[int] = None,
     ):
@@ -270,13 +281,17 @@ class CenterlinePredictor:
     def from_checkpoint(
         cls,
         path: str,
-        device: str = "cpu",
+        device: str = 'cpu',
         **kwargs,
-    ) -> "CenterlinePredictor":
-        ckpt = torch.load(path, map_location=device, weights_only=False)
-        cfg = ckpt.get("model_cfg", {})
+    ) -> 'CenterlinePredictor':
+        ckpt = torch.load(
+            path,
+            map_location=device,
+            weights_only=False,
+        )
+        cfg = ckpt.get('model_cfg', {})
         model = CenterlineUNet(**cfg)
-        model.load_state_dict(ckpt["model_state"])
+        model.load_state_dict(ckpt['model_state'])
         return cls(model, device=device, **kwargs)
 
     @torch.no_grad()
@@ -336,15 +351,15 @@ class CenterlinePredictor:
 # Sanity check
 # ==========================================
 
-if __name__ == "__main__":
-    print("=== CenterlineUNet Sanity Check ===")
+if __name__ == '__main__':
+    print('=== CenterlineUNet Sanity Check ===')
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # ── Model ──
     model = CenterlineUNet(in_channels=1, base_ch=16).to(device)
     total = sum(p.numel() for p in model.parameters())
-    print(f"Parameters : {total:,}  (~{total/1e6:.2f}M)")
+    print(f'Parameters : {total:,}  (~{total / 1e6:.2f}M)')
 
     # ── Forward pass ──
     x = torch.rand(2, 1, 512, 512, device=device)
@@ -352,18 +367,26 @@ if __name__ == "__main__":
     target[:, :, 100:400, 254:258] = 1.0  # thin vertical line
 
     pred = model(x)
-    print(f"Input      : {tuple(x.shape)}  →  Output: {tuple(pred.shape)}")
-    print(f"Pred range : [{pred.min():.3f}, {pred.max():.3f}]")
+    print(f'Input      : {tuple(x.shape)}  →  Output: {tuple(pred.shape)}')
+    print(f'Pred range : [{pred.min():.3f}, {pred.max():.3f}]')
 
     # ── Loss ──
-    criterion = CenterlineLoss(bce_weight=0.4, cl_weight=0.6, pos_weight=10.0)
+    criterion = CenterlineLoss(
+        bce_weight=0.4,
+        cl_weight=0.6,
+        pos_weight=10.0,
+    )
     loss, breakdown = criterion(pred, target)
-    print(f"Loss       : {loss.item():.4f}  |  {breakdown}")
+    print(f'Loss       : {loss.item():.4f}  |  {breakdown}')
 
     # ── Greedy Tracer ──
-    tracer = GreedyTracer(seed_thresh=0.5, step_thresh=0.3, min_length=5)
+    tracer = GreedyTracer(
+        seed_thresh=0.5,
+        step_thresh=0.3,
+        min_length=5,
+    )
     prob_np = pred[0, 0].detach().cpu().numpy()
     skeleton, _ = tracer.trace(prob_np)
-    print(f"Skeleton   : {skeleton.shape}, nonzero pixels: {skeleton.sum() // 255}")
+    print(f'Skeleton   : {skeleton.shape}, nonzero pixels: {skeleton.sum() // 255}')
 
-    print("=== All OK ===")
+    print('=== All OK ===')

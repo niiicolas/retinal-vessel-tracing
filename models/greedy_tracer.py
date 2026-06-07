@@ -15,11 +15,17 @@ Workflow:
 from typing import List, Optional, Tuple
 
 import numpy as np
-from scipy.ndimage import binary_erosion, gaussian_filter
+from scipy.ndimage import (
+    binary_erosion,
+    gaussian_filter,
+)
 from skan import Skeleton as SkanSkeleton
 from skan import summarize
 from skimage import filters
-from skimage.morphology import remove_small_objects, skeletonize
+from skimage.morphology import (
+    remove_small_objects,
+    skeletonize,
+)
 
 # ==========================================
 # TRAJECTORY-RECORDING GREEDY TRACER
@@ -69,14 +75,20 @@ class GreedyTracer:
 
     def _local_maxima(self, prob: np.ndarray) -> np.ndarray:
         """Boolean mask of strict 8-neighbour local maxima."""
-        padded = np.pad(prob, 1, mode="constant", constant_values=0)
+        padded = np.pad(
+            prob,
+            1,
+            mode='constant',
+            constant_values=0,
+        )
         lm = np.ones_like(prob, dtype=bool)
         for dy in range(-1, 2):
             for dx in range(-1, 2):
                 if dy == 0 and dx == 0:
                     continue
                 shifted = padded[
-                    1 + dy : 1 + dy + prob.shape[0], 1 + dx : 1 + dx + prob.shape[1]
+                    1 + dy : 1 + dy + prob.shape[0],
+                    1 + dx : 1 + dx + prob.shape[1],
                 ]
                 lm &= prob >= shifted
         return lm
@@ -163,13 +175,10 @@ class GreedyTracer:
             # --- SKAN Pruning Step ---
             try:
                 skel = SkanSkeleton(skeleton_bool)
-                stats = summarize(skel, separator="_")
+                stats = summarize(skel, separator='_')
 
                 # Find short Type 1 (tip-to-junction) branches
-                short_tips = stats[
-                    (stats["branch-type"] == 1)
-                    & (stats["branch-distance"] < self.min_length)
-                ]
+                short_tips = stats[(stats['branch-type'] == 1) & (stats['branch-distance'] < self.min_length)]
 
                 pruned = skeleton_bool.copy()
                 for edge_idx in short_tips.index:
@@ -245,7 +254,11 @@ class GreedyTracerBaseline:
         Gaussian smoothing suppresses noisy local maxima in background texture
         while preserving the strong ridges of real vessel centerlines.
         """
-        sigmas = np.linspace(self.sigma_min, self.sigma_max, self.num_scales)
+        sigmas = np.linspace(
+            self.sigma_min,
+            self.sigma_max,
+            self.num_scales,
+        )
         vesselness = filters.frangi(
             preprocessed.astype(np.float64),
             sigmas=sigmas,
@@ -253,7 +266,10 @@ class GreedyTracerBaseline:
         )
 
         # Normalize to [0, 1]
-        vmin, vmax = vesselness.min(), vesselness.max()
+        vmin, vmax = (
+            vesselness.min(),
+            vesselness.max(),
+        )
         vesselness = (vesselness - vmin) / (vmax - vmin + 1e-8)
 
         # Smooth to suppress noisy local maxima in background
@@ -282,14 +298,19 @@ class GreedyTracerBaseline:
         mask = (
             fov_mask
             if fov_mask is not None
-            else np.ones(preprocessed.shape[:2], dtype=np.uint8) * 255
+            else np.ones(
+                preprocessed.shape[:2],
+                dtype=np.uint8,
+            )
+            * 255
         )
         vesselness = self._compute_vesselness(preprocessed, mask)
         skeleton, traces = self.tracer.trace(vesselness, fov_mask=mask)
 
         if skeleton.any() and self.min_obj_size > 0:
             skeleton_bool = remove_small_objects(
-                skeleton > 0, min_size=self.min_obj_size
+                skeleton > 0,
+                min_size=self.min_obj_size,
             )
             skeleton = (skeleton_bool * 255).astype(np.uint8)
 

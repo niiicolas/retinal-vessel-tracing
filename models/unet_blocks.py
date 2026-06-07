@@ -18,12 +18,26 @@ class DSConvBlock(nn.Module):
         super().__init__()
         self.block = nn.Sequential(
             # first DS conv
-            nn.Conv2d(in_ch, in_ch, 3, padding=1, groups=in_ch, bias=False),
+            nn.Conv2d(
+                in_ch,
+                in_ch,
+                3,
+                padding=1,
+                groups=in_ch,
+                bias=False,
+            ),
             nn.Conv2d(in_ch, out_ch, 1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
             # second DS conv
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, groups=out_ch, bias=False),
+            nn.Conv2d(
+                out_ch,
+                out_ch,
+                3,
+                padding=1,
+                groups=out_ch,
+                bias=False,
+            ),
             nn.Conv2d(out_ch, out_ch, 1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
@@ -48,9 +62,18 @@ class DownBlock(nn.Module):
 class UpBlock(nn.Module):
     """Bilinear upsample → cat skip → DSConvBlock."""
 
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+    def __init__(
+        self,
+        in_ch: int,
+        skip_ch: int,
+        out_ch: int,
+    ):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.up = nn.Upsample(
+            scale_factor=2,
+            mode='bilinear',
+            align_corners=False,
+        )
         self.conv = DSConvBlock(in_ch + skip_ch, out_ch)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -58,6 +81,9 @@ class UpBlock(nn.Module):
         # handle odd spatial dims
         if x.shape != skip.shape:
             x = F.interpolate(
-                x, size=skip.shape[2:], mode="bilinear", align_corners=False
+                x,
+                size=skip.shape[2:],
+                mode='bilinear',
+                align_corners=False,
             )
         return self.conv(torch.cat([x, skip], dim=1))

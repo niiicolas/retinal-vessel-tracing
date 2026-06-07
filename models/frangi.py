@@ -18,7 +18,10 @@ from scipy.ndimage import gaussian_filter
 from skan import Skeleton as SkanSkeleton
 from skan import summarize
 from skimage import filters, morphology
-from skimage.morphology import remove_small_objects, skeletonize
+from skimage.morphology import (
+    remove_small_objects,
+    skeletonize,
+)
 
 
 class FrangiBaseline:
@@ -47,20 +50,28 @@ class FrangiBaseline:
         preprocessed: np.ndarray,
         fov_mask: Optional[np.ndarray] = None,
         return_vesselness: bool = False,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+    ) -> Tuple[
+        np.ndarray,
+        Optional[np.ndarray],
+        np.ndarray,
+    ]:
         """Extract a 1-pixel skeleton from a preprocessed fundus image.
 
         Args:
             preprocessed: (H, W) float32 CLAHE-enhanced grayscale [0, 1]
             fov_mask:     (H, W) uint8 FOV mask {0, 255}
         """
-        sigmas = np.linspace(self.sigma_min, self.sigma_max, self.num_scales)
+        sigmas = np.linspace(
+            self.sigma_min,
+            self.sigma_max,
+            self.num_scales,
+        )
         vesselness = filters.frangi(
-            preprocessed.astype(np.float64), sigmas=sigmas, black_ridges=True
+            preprocessed.astype(np.float64),
+            sigmas=sigmas,
+            black_ridges=True,
         )
-        vesselness = (vesselness - vesselness.min()) / (
-            vesselness.max() - vesselness.min() + 1e-8
-        )
+        vesselness = (vesselness - vesselness.min()) / (vesselness.max() - vesselness.min() + 1e-8)
 
         if self.gauss_sigma > 0:
             vesselness = gaussian_filter(vesselness, sigma=self.gauss_sigma)
@@ -70,7 +81,10 @@ class FrangiBaseline:
 
         binary = vesselness > self.threshold
         binary = morphology.binary_closing(binary, morphology.disk(1))
-        binary = remove_small_objects(binary.astype(bool), min_size=self.min_size)
+        binary = remove_small_objects(
+            binary.astype(bool),
+            min_size=self.min_size,
+        )
 
         skeleton = skeletonize(binary)
 
@@ -80,16 +94,17 @@ class FrangiBaseline:
         if not return_vesselness:
             vesselness = None
 
-        return skeleton.astype(np.float32), vesselness, binary.astype(np.uint8)
+        return (
+            skeleton.astype(np.float32),
+            vesselness,
+            binary.astype(np.uint8),
+        )
 
     def _prune_with_skan(self, skeleton_img):
         try:
             skel = SkanSkeleton(skeleton_img)
-            stats = summarize(skel, separator="_")
-            short_tips = stats[
-                (stats["branch-type"] == 1)
-                & (stats["branch-distance"] < self.prune_length)
-            ]
+            stats = summarize(skel, separator='_')
+            short_tips = stats[(stats['branch-type'] == 1) & (stats['branch-distance'] < self.prune_length)]
             pruned_skeleton = skeleton_img.copy()
             for edge_idx in short_tips.index:
                 coords = skel.path_coordinates(edge_idx)
