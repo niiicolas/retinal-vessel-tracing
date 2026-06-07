@@ -1,78 +1,34 @@
-"""Unified dataloader for retinal vessel segmentation.
+"""Unified dataloader for retinal vessel segmentation across multiple fundus datasets.
 
-Datasets
---------
-Training / validation (combined, balanced):
-    FIVES, STARE, CHASE_DB1, HRF, LES_AV
-
-External test (used in full, no split):
-    DRIVE, DR_HAGIS
-
-Supported targets
------------------
-unet           – (1,H,W) CLAHE-preprocessed grayscale + skeleton GT
-frangi         – (H,W,3) raw RGB uint8 + binary annotations (numpy)
-greedy_tracer  – (H,W,3) raw RGB uint8 + binary annotations (numpy)
-rl_agent       – (3,H,W) float32 RGB + centerline, distance transform, …
-
-Usage
------
-    from data.dataloader import get_data, get_test_data
-
-    # Training & validation (balanced across 5 datasets)
-    train_ds, train_loader = get_data("unet", "train", batch_size=4)
-    val_ds,   val_loader   = get_data("unet", "val",   batch_size=1)
-
-    # External test sets (entire dataset, no split)
-    test_ds, test_loader = get_test_data("AV_WIDE",  "unet", batch_size=1)
-    test_ds, test_loader = get_test_data("DR_HAGIS", "unet", batch_size=1)
+Combines five datasets into balanced train/val sets and serves DRIVE/DRHAGIS as
+external test sets, formatting each sample for the unet, frangi, greedy_tracer, or
+rl_agent target. Public entry points: ``get_data`` and ``get_test_data``.
 """
 
 import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import (
-    Any,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-)
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import (
-    ConcatDataset,
-    DataLoader,
-    Dataset,
-    WeightedRandomSampler,
-)
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, WeightedRandomSampler
 
-from .centerline_extraction import (
-    CenterlineExtractor,
-)
-from .fundus_preprocessor import (
-    FundusPreprocessor,
-)
-from environment.observation import (
-    ObservationBuilder,
-)
+from .centerline_extraction import CenterlineExtractor
+from .fundus_preprocessor import FundusPreprocessor
+from environment.observation import ObservationBuilder
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Dataset root resolution
-# ---------------------------------------------------------------------------
 _DATA_BASE = Path('/cfs/earth/scratch/icls/shared/icls-retinal-vessel-tracing/retinal-vessel-tracing/data')
 
 _PROJECT_ROOT = _DATA_BASE.parent
 
-# When RVT_RUN_NAME is set, namespace all weights/results under a per-run
-# subdirectory so concurrent ablation jobs don't clobber each other's
-# checkpoints and CSV logs. When unset, behaviour is unchanged.
+# Namespace weights/results under RVT_RUN_NAME so concurrent ablation jobs don't
+# clobber each other's checkpoints/logs; unset keeps the default flat layout.
 _RUN_NAME = os.environ.get('RVT_RUN_NAME', '').strip()
 if _RUN_NAME:
     WEIGHTS_DIR = _PROJECT_ROOT / 'weights' / _RUN_NAME
@@ -83,38 +39,26 @@ else:
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_SAMPLES = 5
+MAX_SAMPLES = None
 
-# ---------------------------------------------------------------------------
-# Centerline-probability predictor — lazy singleton.
-#
-# Source: the *multi-task* SeedDetector's centerline_prob head, loaded from
-# ``weights/seed_detector.pt``. The RL pipeline used to pull this signal
-# from a separate standalone CenterlineUNet (weights/centerline_unet.pt) for
-# historical reasons — that checkpoint is the thesis comparison baseline
-# (frangi vs greedy vs unet vs RL) and remains untouched. The RL prior
-# now reuses the seed detector's already-trained centerline head so we
-# don't maintain two centerline models.
-# ---------------------------------------------------------------------------
+# Centerline-probability predictor, a lazy per-process singleton: the multi-task
+# SeedDetector's centerline_prob head (weights/seed_detector.pt), reused as the RL
+# centerline prior so two centerline models aren't maintained.
 _UNET_PREDICTOR = None
 _UNET_LOAD_FAILED = False
 
 
 def _get_unet_predictor():
-    """Return a cached SeedDetector (eval mode) or None if checkpoint missing.
+    """Return the cached eval-mode SeedDetector, or None if the checkpoint is missing.
 
-    Loaded once per process. The returned model is the *frozen* multi-task
-    seed detector; the RL pipeline only consumes its centerline_prob head.
+    Loaded once per process; the RL pipeline consumes only its centerline_prob head.
     """
     global _UNET_PREDICTOR, _UNET_LOAD_FAILED
     if _UNET_PREDICTOR is not None or _UNET_LOAD_FAILED:
         return _UNET_PREDICTOR
     try:
         import torch as _torch
-
-        from models.seed_detector import (
-            SeedDetector,
-        )
+        from models.seed_detector import SeedDetector
 
         ckpt_path = WEIGHTS_DIR / 'seed_detector.pt'
         if not ckpt_path.exists():
@@ -126,40 +70,28 @@ def _get_unet_predictor():
             )
             _UNET_LOAD_FAILED = True
             return None
+
         device = 'cuda' if _torch.cuda.is_available() else 'cpu'
-        ckpt = _torch.load(
-            str(ckpt_path),
-            map_location=device,
-            weights_only=True,
-        )
+        ckpt = _torch.load(str(ckpt_path), map_location=device, weights_only=True)
         model = SeedDetector().to(device)
         model.load_state_dict(ckpt['model_state_dict'])
         model.eval()
         _UNET_PREDICTOR = model
-        logger.info(
-            'Loaded seed detector (used as RL centerline prior) from %s (device=%s)',
-            ckpt_path,
-            device,
-        )
+        logger.info('Loaded seed detector (used as RL centerline prior) from %s (device=%s)', ckpt_path, device)
+
         return _UNET_PREDICTOR
+
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            'Failed to load seed detector for UNet prior: %s',
-            exc,
-        )
+        logger.warning('Failed to load seed detector for UNet prior: %s', exc)
         _UNET_LOAD_FAILED = True
         return None
 
 
-def compute_unet_prior(
-    image: np.ndarray,
-) -> Optional[np.ndarray]:
-    """Run the frozen seed-detector and return its centerline probability map.
+def compute_unet_prior(image: np.ndarray) -> Optional[np.ndarray]:
+    """Run the frozen seed detector and return its (H, W) float32 centerline probability map.
 
-    ``image`` is the (H, W, 3) RGB float32 array produced by ``_fmt_rl_agent``.
-    The seed detector accepts 3-channel RGB and internally prepends a Frangi
-    vesselness channel when its ``use_frangi_input`` flag is on (the default).
-    Returns (H, W) float32 in [0, 1], or None if the checkpoint is unavailable.
+    ``image`` is the (H, W, 3) RGB float array from ``_fmt_rl_agent``; a 2-D input is
+    triplicated to RGB. Returns None if the checkpoint is unavailable.
     """
     predictor = _get_unet_predictor()
     if predictor is None:
@@ -167,38 +99,26 @@ def compute_unet_prior(
     import torch as _torch
 
     if image.ndim == 2:
-        # Single-channel input — fake an RGB by triplicating.
         rgb = np.stack([image, image, image], axis=-1)
     else:
         rgb = image
-    img_t = (
-        _torch.from_numpy(rgb.astype(np.float32)).permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
-    )
+    img_t = _torch.from_numpy(rgb.astype(np.float32)).permute(2, 0, 1).unsqueeze(0)
     device = next(predictor.parameters()).device
     img_t = img_t.to(device)
     with _torch.no_grad():
-        # SeedDetector.forward returns (centerline, vessel, radius, orient, logvar)
         centerline_prob = predictor.forward(img_t, return_aux=False)[0]
     return centerline_prob.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
 
 
 def compute_predicted_priors(
-    image: np.ndarray,
-    tolerance: float,
-    threshold: float = 0.5,
-    centerline_extractor: Optional['CenterlineExtractor'] = None,
+    image: np.ndarray, tolerance: float, threshold: float = 0.5, centerline_extractor: Optional['CenterlineExtractor'] = None
 ) -> Optional[Dict[str, np.ndarray]]:
-    """Derive observation-channel geometry from the frozen centerline UNet.
+    """Derive RL observation geometry from the frozen UNet (never from ground truth).
 
-    Pipeline: UNet probability → threshold → skeletonise → DT (clipped at
-    ``tolerance``) → DT gradient. This is the only path producing the
-    centerline/DT/DT-gradient that go into the RL observation; the GT
-    skeleton is reserved for reward and coverage computation.
-
-    Returns a dict with keys {centerline, distance_transform, dt_gradient,
-    unet_prior} on success, or ``None`` if the centerline UNet checkpoint
-    is unavailable. Callers MUST treat None as an error — falling back to
-    GT here would re-introduce the leakage this pipeline exists to prevent.
+    Pipeline: UNet probability -> threshold -> skeletonize -> distance transform ->
+    DT gradient. Returns a dict {centerline, distance_transform, dt_gradient, unet_prior},
+    or None if the checkpoint is unavailable. Callers must treat None as an error;
+    falling back to GT here would reintroduce the leakage this path exists to prevent.
     """
     prob = compute_unet_prior(image)
     if prob is None:
@@ -217,7 +137,7 @@ def compute_predicted_priors(
 
 
 def get_root(dataset_name: str) -> Path:
-    """Return the root directory for a dataset."""
+    """Return the root directory for a dataset, honoring RETINAL_DATA_<NAME> overrides."""
     canon = dataset_name.upper()
     if canon not in DATASET_REGISTRY:
         raise KeyError(f"Unknown dataset '{dataset_name}'. Known: {sorted(set(DATASET_REGISTRY))}")
@@ -233,12 +153,9 @@ def get_root(dataset_name: str) -> Path:
     return root
 
 
-# ---------------------------------------------------------------------------
-# Dataset layout descriptors
-# ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class DatasetConfig:
-    """File-system layout for one retinal fundus dataset."""
+    """File-system layout descriptor for one retinal fundus dataset."""
 
     image_dir: str
     vessel_dir: str
@@ -250,23 +167,23 @@ class DatasetConfig:
     train_subdir: Optional[str] = None
 
     def vessel_filename(self, image_stem: str) -> str:
+        """Return the vessel-annotation filename for a given image stem."""
         stem = self._transform_stem(image_stem)
         return f'{stem}{self.vessel_suffix}'
 
     def mask_filename(self, image_stem: str) -> str:
+        """Return the FOV-mask filename for a given image stem (requires mask_suffix)."""
         if self.mask_suffix is None:
             raise ValueError('No mask_suffix configured.')
         return f'{image_stem}{self.mask_suffix}'
 
     def _transform_stem(self, stem: str) -> str:
+        """Apply dataset-specific stem rewrites (e.g. DRIVE image stem -> annotation naming)."""
         if self.stem_rule == 'drive':
             return stem.replace('_training', '_manual1').replace('_test', '_manual1')
         return stem
 
 
-# ---------------------------------------------------------------------------
-# Registry
-# ---------------------------------------------------------------------------
 DATASET_REGISTRY: Dict[str, DatasetConfig] = {
     'DRIVE': DatasetConfig(
         image_dir='images',
@@ -324,49 +241,21 @@ DATASET_REGISTRY: Dict[str, DatasetConfig] = {
 }
 
 
-TRAIN_DATASETS = (
-    'FIVES',
-    'STARE',
-    'CHASEDB1',
-    'HRF',
-    'LES-AV',
-)
+TRAIN_DATASETS = ('FIVES', 'STARE', 'CHASEDB1', 'HRF', 'LES-AV')
 TEST_DATASETS = ('DRIVE', 'DRHAGIS')
-VALID_TARGETS = (
-    'unet',
-    'frangi',
-    'greedy_tracer',
-    'rl_agent',
-)
+VALID_TARGETS = ('unet', 'frangi', 'greedy_tracer', 'rl_agent')
 
 
-# ---------------------------------------------------------------------------
-# Collate for numpy-dict targets (frangi / greedy_tracer)
-# ---------------------------------------------------------------------------
 def _list_collate(batch: list) -> list:
+    """Pass-through collate that keeps numpy-dict samples as a list (no tensor stacking)."""
     return batch
 
 
-# ---------------------------------------------------------------------------
-# Core dataset
-# ---------------------------------------------------------------------------
 class RetinalFundusDataset(Dataset):
-    """PyTorch Dataset for a single retinal fundus dataset.
+    """PyTorch Dataset for one retinal fundus dataset, formatted per the chosen target.
 
-    Parameters
-    ----------
-    root_dir      : top-level dataset directory (e.g. "data/DRIVE")
-    dataset_name  : key in DATASET_REGISTRY
-    target        : output format ("unet", "frangi", "greedy_tracer", "rl_agent")
-    split         : "train", "val", or None (= return all samples)
-    train_frac    : fraction of samples used for training (rest → val)
-    resize        : (H, W) to resize all images/masks, or None
-    tolerance     : distance-transform radius for rl_agent target
-    cache_centerlines : persist skeletons to disk
-    transform     : optional albumentations pipeline (unet target only)
-    preprocessor  : shared FundusPreprocessor instance
-    centerline_extractor : shared CenterlineExtractor instance
-
+    Discovers image/vessel(/mask) triples, optionally applies a deterministic train/val
+    split, aspect-preserving resize-and-pad, and disk-caches centerlines and UNet priors.
     """
 
     def __init__(
@@ -386,6 +275,12 @@ class RetinalFundusDataset(Dataset):
         use_unet_prior: bool = False,
         require_predicted_priors: bool = True,
     ):
+        """Configure dataset layout, split, and caching.
+
+        ``require_predicted_priors`` is True for RL-pipeline callers (so leakage stays
+        removed) and False only for the trainers that produce the seed-detector checkpoint.
+        ``use_unet_prior`` additionally exposes the raw probability map as a channel.
+        """
         if target not in VALID_TARGETS:
             raise ValueError(f"target must be one of {VALID_TARGETS}, got '{target}'")
 
@@ -402,23 +297,16 @@ class RetinalFundusDataset(Dataset):
         self.fundus_preprocessor = fundus_preprocessor or FundusPreprocessor()
         self.cl_extractor = centerline_extractor or CenterlineExtractor()
         self.use_unet_prior = use_unet_prior
-        # Predicted-prior derivation depends on the seed detector checkpoint.
-        # The trainers that PRODUCE that checkpoint (scripts/train_seed_detector,
-        # scripts/run_cnn for the standalone UNet baseline) can't depend on it
-        # being present yet — they set this to False so _fmt_rl_agent skips
-        # the prior bundle. RL-pipeline callers (PPO trainer, imitation,
-        # inference) keep the default True so leakage stays removed.
+        # False only for trainers producing the seed-detector/UNet checkpoint (they
+        # can't depend on the file they're about to write); skips the prior bundle.
         self.require_predicted_priors = require_predicted_priors
 
-        # Resolve root directory
         self.root = self._resolve_root(Path(root_dir))
 
-        # Discover and split samples
         self.samples = self._discover_samples()
         if split is not None:
             self.samples = self._apply_split(self.samples, split, train_frac)
 
-        # Cap samples
         if max_samples is not None and max_samples > 0:
             self.samples = self.samples[:max_samples]
 
@@ -429,7 +317,7 @@ class RetinalFundusDataset(Dataset):
                 f"'{self.cfg.image_glob}' with vessels in '{self.cfg.vessel_dir}/'."
             )
 
-        # Centerline cache — stores (skeleton, vessel_width_px) per sample
+        # In-memory + on-disk caches; only enabled at native resolution (resize=None).
         self._cl_mem: Dict[str, Tuple[np.ndarray, float]] = {}
         self._cache_dir: Optional[Path] = None
         if cache_centerlines and self.resize is None:
@@ -437,35 +325,23 @@ class RetinalFundusDataset(Dataset):
             self._cache_dir.mkdir(exist_ok=True)
 
         self._vo_mem: Dict[str, np.ndarray] = {}
-        self._up_mem: Dict[str, np.ndarray] = {}  # UNet prior cache
-        # Predicted-prior bundle cache (centerline / DT / DT-grad / UNet prob,
-        # all derived from the frozen UNet — the non-leaking replacement for
-        # GT geometry in the RL observation channels).
+        self._up_mem: Dict[str, np.ndarray] = {}
         self._pp_mem: Dict[str, Dict[str, np.ndarray]] = {}
 
-        logger.info(
-            '%s  %d samples  target=%s  split=%s',
-            canon,
-            len(self.samples),
-            target,
-            split,
-        )
+        logger.info('%s  %d samples  target=%s  split=%s', canon, len(self.samples), target, split)
 
-    # -- Root resolution ---------------------------------------------------
     def _resolve_root(self, root_dir: Path) -> Path:
-        """Find the directory that actually contains images."""
+        """Descend into the configured train subdirectory when it holds the images."""
         if self.cfg.train_subdir is not None:
             subdir = root_dir / self.cfg.train_subdir
             if subdir.is_dir():
                 return subdir
             if root_dir.name == self.cfg.train_subdir:
-                return root_dir  # user passed the subdir directly
+                return root_dir
         return root_dir
 
-    # -- Sample discovery --------------------------------------------------
-    def _discover_samples(
-        self,
-    ) -> List[Dict[str, Any]]:
+    def _discover_samples(self) -> List[Dict[str, Any]]:
+        """Scan for image/vessel(/mask) triples that exist on disk, keyed by image stem."""
         image_dir = self.root / self.cfg.image_dir
         vessel_dir = self.root / self.cfg.vessel_dir
         mask_dir = (self.root / self.cfg.mask_dir) if self.cfg.mask_dir else None
@@ -476,11 +352,7 @@ class RetinalFundusDataset(Dataset):
             if not vessel_path.exists():
                 continue
 
-            entry: Dict[str, Any] = {
-                'id': img_path.stem,
-                'image': img_path,
-                'vessel': vessel_path,
-            }
+            entry: Dict[str, Any] = {'id': img_path.stem, 'image': img_path, 'vessel': vessel_path}
             if mask_dir is not None and self.cfg.mask_suffix is not None:
                 mask_path = mask_dir / self.cfg.mask_filename(img_path.stem)
                 if mask_path.exists():
@@ -489,14 +361,9 @@ class RetinalFundusDataset(Dataset):
             samples.append(entry)
         return samples
 
-    # -- Train/val split ---------------------------------------------------
     @staticmethod
-    def _apply_split(
-        samples: List[Dict],
-        split: str,
-        train_frac: float,
-    ) -> List[Dict]:
-        """Deterministic train/val split (sorted filenames → reproducible)."""
+    def _apply_split(samples: List[Dict], split: str, train_frac: float) -> List[Dict]:
+        """Deterministically split sorted samples into 'train' or 'val'."""
         n = len(samples)
         t = max(1, min(int(train_frac * n), n - 1))
         if split == 'train':
@@ -506,57 +373,46 @@ class RetinalFundusDataset(Dataset):
         else:
             raise ValueError(f"split must be 'train' or 'val', got '{split}'")
 
-    # -- I/O ---------------------------------------------------------------
     @staticmethod
     def _load_rgb(path: Path) -> np.ndarray:
+        """Load an image as an (H, W, 3) RGB uint8 array."""
         return np.array(Image.open(path).convert('RGB'))
 
     @staticmethod
     def _load_gray(path: Path) -> np.ndarray:
+        """Load an image as an (H, W) grayscale uint8 array."""
         return np.array(Image.open(path).convert('L'))
 
     def _load_vessel(self, path: Path) -> np.ndarray:
+        """Load a vessel annotation as a binary {0, 1} float32 mask."""
         return (self._load_gray(path) > 127).astype(np.float32)
 
     def _load_fov(self, path: Path) -> np.ndarray:
+        """Load an FOV mask as a {0, 255} uint8 array."""
         return (self._load_gray(path) > 127).astype(np.uint8) * 255
 
-    # -- Cache helpers -----------------------------------------------------
     @staticmethod
-    def _cache_is_fresh(
-        cache_path: Path,
-        source_path: Optional[Path],
-    ) -> bool:
-        """True iff cache file is newer than the source it was derived from.
+    def _cache_is_fresh(cache_path: Path, source_path: Optional[Path]) -> bool:
+        """Return True iff the cache file exists and is no older than its source.
 
-        Mask regenerations are silent: with no mtime guard the dataloader
-        was happy to keep serving a stale skeleton forever. A cache file
-        whose mtime is older than its source is treated as invalid and
-        recomputed.
+        Guards against silently serving a stale skeleton after the source mask is
+        regenerated. ``source_path=None`` skips the check and trusts the cache.
         """
         if not cache_path.exists():
             return False
         if source_path is None or not source_path.exists():
-            return True  # no source to compare against — trust the cache
+            return True
         return cache_path.stat().st_mtime >= source_path.stat().st_mtime
 
-    # -- Centerline cache --------------------------------------------------
-    # v2: cache stores (skeleton, vessel_width_px) together so per-image
-    # width-aware tolerance / pruning thresholds survive reload. v1 .npy
-    # files from the old code are ignored (skeleton-only, no width).
+    # v2 caches (skeleton, vessel_width_px) together so width-aware thresholds survive
+    # reload; skeleton-only v1 .npy files from the old code are ignored.
     _CL_CACHE_VERSION = 'v2'
 
-    def _get_centerline(
-        self,
-        sid: str,
-        vessel: np.ndarray,
-        source_path: Optional[Path] = None,
-    ) -> Tuple[np.ndarray, float]:
-        """Return (skeleton, vessel_width_px) for sample ``sid``.
+    def _get_centerline(self, sid: str, vessel: np.ndarray, source_path: Optional[Path] = None) -> Tuple[np.ndarray, float]:
+        """Return (skeleton, vessel_width_px) for sample ``sid``, using mem/disk cache.
 
-        ``source_path`` is the on-disk vessel-mask file; used as the mtime
-        reference for cache freshness. Pass ``None`` to skip the freshness
-        check (e.g. when the mask was generated on the fly).
+        ``source_path`` is the on-disk vessel mask used as the cache-freshness mtime
+        reference; pass None to skip the freshness check.
         """
         if sid in self._cl_mem:
             return self._cl_mem[sid]
@@ -569,18 +425,12 @@ class RetinalFundusDataset(Dataset):
                 self._cl_mem[sid] = (cl, w)
                 return cl, w
         cl = self.cl_extractor.extract_centerline(vessel)
-        from .centerline_extraction import (
-            compute_vessel_width,
-        )
+        from .centerline_extraction import compute_vessel_width
 
         w = compute_vessel_width(vessel)
         self._cl_mem[sid] = (cl, w)
         if self._cache_dir is not None:
-            np.savez(
-                self._cache_dir / f'{sid}_cl_{self._CL_CACHE_VERSION}.npz',
-                skeleton=cl,
-                width_px=np.float32(w),
-            )
+            np.savez(self._cache_dir / f'{sid}_cl_{self._CL_CACHE_VERSION}.npz', skeleton=cl, width_px=np.float32(w))
         return cl, w
 
     def _get_vessel_orientation(
@@ -589,7 +439,7 @@ class RetinalFundusDataset(Dataset):
         image: np.ndarray,
         source_path: Optional[Path] = None,
     ) -> np.ndarray:
-        """Return cached vessel orientation, computing + persisting on first call."""
+        """Return the cached vessel orientation, computing and persisting on first call."""
         if sid in self._vo_mem:
             return self._vo_mem[sid]
         if self._cache_dir is not None:
@@ -601,19 +451,11 @@ class RetinalFundusDataset(Dataset):
         vo = ObservationBuilder.compute_vessel_orientation(image)
         self._vo_mem[sid] = vo
         if self._cache_dir is not None:
-            np.save(
-                self._cache_dir / f'{sid}_vessel_orientation.npy',
-                vo,
-            )
+            np.save(self._cache_dir / f'{sid}_vessel_orientation.npy', vo)
         return vo
 
-    def _get_unet_prior(
-        self,
-        sid: str,
-        image: np.ndarray,
-        source_path: Optional[Path] = None,
-    ) -> Optional[np.ndarray]:
-        """Return cached UNet prior, computing + persisting on first call."""
+    def _get_unet_prior(self, sid: str, image: np.ndarray, source_path: Optional[Path] = None) -> Optional[np.ndarray]:
+        """Return the cached UNet prior, computing and persisting on first call."""
         if sid in self._up_mem:
             return self._up_mem[sid]
         if self._cache_dir is not None:
@@ -627,25 +469,16 @@ class RetinalFundusDataset(Dataset):
             return None
         self._up_mem[sid] = up
         if self._cache_dir is not None:
-            np.save(
-                self._cache_dir / f'{sid}_unet_prior.npy',
-                up,
-            )
+            np.save(self._cache_dir / f'{sid}_unet_prior.npy', up)
         return up
 
     _PP_CACHE_VERSION = 'v1'
 
-    def _get_predicted_priors(
-        self,
-        sid: str,
-        image: np.ndarray,
-        source_path: Optional[Path] = None,
-    ) -> Optional[Dict[str, np.ndarray]]:
-        """Return cached predicted-prior bundle, computing + persisting on first call.
+    def _get_predicted_priors(self, sid: str, image: np.ndarray, source_path: Optional[Path] = None) -> Optional[Dict[str, np.ndarray]]:
+        """Return the cached predicted-prior bundle, computing and persisting on first call.
 
-        Bundle keys: ``centerline``, ``distance_transform``, ``dt_gradient``,
-        ``unet_prior``. Returns ``None`` if the UNet checkpoint is unavailable
-        (callers in the RL pipeline must surface this as a hard error).
+        Bundle keys: ``centerline``, ``distance_transform``, ``dt_gradient``, ``unet_prior``.
+        Returns None when the UNet checkpoint is unavailable (RL callers must hard-error).
         """
         if sid in self._pp_mem:
             return self._pp_mem[sid]
@@ -661,24 +494,16 @@ class RetinalFundusDataset(Dataset):
                     }
                 self._pp_mem[sid] = bundle
                 return bundle
-        bundle = compute_predicted_priors(
-            image,
-            self.tolerance,
-            centerline_extractor=self.cl_extractor,
-        )
+        bundle = compute_predicted_priors(image, self.tolerance, centerline_extractor=self.cl_extractor)
         if bundle is None:
             return None
         self._pp_mem[sid] = bundle
         if self._cache_dir is not None:
-            np.savez(
-                self._cache_dir / f'{sid}_pred_priors_{self._PP_CACHE_VERSION}.npz',
-                **bundle,
-            )
+            np.savez(self._cache_dir / f'{sid}_pred_priors_{self._PP_CACHE_VERSION}.npz', **bundle)
         return bundle
 
-    # -- FOV mask ----------------------------------------------------------
-
     def _get_fov(self, sample: Dict, rgb: np.ndarray) -> np.ndarray:
+        """Return the FOV mask: the supplied one if present, else synthesized from the green channel."""
         if 'mask' in sample:
             return self._load_fov(sample['mask'])
         green = self.fundus_preprocessor.extract_green_channel(rgb)
@@ -686,25 +511,21 @@ class RetinalFundusDataset(Dataset):
             green = np.clip(green * 255, 0, 255).astype(np.uint8)
         return self.fundus_preprocessor.create_fov_mask(green)
 
-    # -- Resize ------------------------------------------------------------
-    def _resize(
-        self,
-        *arrays: np.ndarray,
-        interp: Optional[List[int]] = None,
-    ) -> Tuple[np.ndarray, ...]:
+    def _resize(self, *arrays: np.ndarray, interp: Optional[List[int]] = None) -> Tuple[np.ndarray, ...]:
+        """Aspect-preserving resize + center-pad of co-registered arrays to self.resize.
+
+        All inputs share one scale factor and are zero-padded to the target (H, W) so
+        masks stay pixel-aligned. ``interp`` gives per-array flags; defaults to nearest
+        for 2-D and linear for 3-D.
+        """
         if self.resize is None:
             return arrays
         target_h, target_w = self.resize
         src_h, src_w = arrays[0].shape[:2]
 
-        # Scale to fit within target while preserving aspect ratio
         scale = min(target_h / src_h, target_w / src_w)
-        new_h, new_w = (
-            int(src_h * scale),
-            int(src_w * scale),
-        )
+        new_h, new_w = (int(src_h * scale), int(src_w * scale))
 
-        # Padding offsets (center the image)
         pad_top = (target_h - new_h) // 2
         pad_left = (target_w - new_w) // 2
 
@@ -717,41 +538,23 @@ class RetinalFundusDataset(Dataset):
             else:
                 flag = cv2.INTER_LINEAR
 
-            resized = cv2.resize(
-                arr,
-                (new_w, new_h),
-                interpolation=flag,
-            )
+            resized = cv2.resize(arr, (new_w, new_h), interpolation=flag)
 
-            # Create padded output (black/zero padding)
             if arr.ndim == 3:
-                padded = np.zeros(
-                    (
-                        target_h,
-                        target_w,
-                        arr.shape[2],
-                    ),
-                    dtype=arr.dtype,
-                )
+                padded = np.zeros((target_h, target_w, arr.shape[2]), dtype=arr.dtype)
             else:
-                padded = np.zeros(
-                    (target_h, target_w),
-                    dtype=arr.dtype,
-                )
+                padded = np.zeros((target_h, target_w), dtype=arr.dtype)
 
-            padded[
-                pad_top : pad_top + new_h,
-                pad_left : pad_left + new_w,
-            ] = resized
+            padded[pad_top : pad_top + new_h, pad_left : pad_left + new_w] = resized
             out.append(padded)
 
         return tuple(out)
 
-    # -- __len__ / __getitem__ ---------------------------------------------
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Load, resize, and format sample ``idx`` according to the configured target."""
         sample = self.samples[idx]
         sid = sample['id']
 
@@ -760,33 +563,16 @@ class RetinalFundusDataset(Dataset):
         fov = self._get_fov(sample, rgb)
 
         if self.resize is not None:
-            rgb, vessel, fov = self._resize(
-                rgb,
-                vessel,
-                fov,
-                interp=[
-                    cv2.INTER_LINEAR,
-                    cv2.INTER_NEAREST,
-                    cv2.INTER_NEAREST,
-                ],
-            )
+            rgb, vessel, fov = self._resize(rgb, vessel, fov, interp=[cv2.INTER_LINEAR, cv2.INTER_NEAREST, cv2.INTER_NEAREST])
             vessel = (vessel > 0.5).astype(np.float32)
 
         return getattr(self, f'_fmt_{self.target}')(sid, rgb, vessel, fov, sample)
 
-    # -- Target formatters -------------------------------------------------
-    def _fmt_unet(
-        self,
-        sid: str,
-        rgb: np.ndarray,
-        vessel: np.ndarray,
-        fov: np.ndarray,
-        sample: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    def _fmt_unet(self, sid: str, rgb: np.ndarray, vessel: np.ndarray, fov: np.ndarray, sample: Dict[str, Any]) -> Dict[str, Any]:
+        """Format a sample for UNet training: (1,H,W) preprocessed image + skeleton/vessel/FOV tensors."""
         ext_mask = fov if fov.max() > 0 else None
         preprocessed = self.fundus_preprocessor.preprocess(rgb, external_mask=ext_mask)
-        # Skeleton cache is only valid at native resolution; under resize
-        # the source path's mtime no longer matches the in-memory mask.
+        # Skeleton cache is only mtime-valid at native resolution; skip its source under resize.
         src = sample['vessel'] if self.resize is None else None
         cl, vessel_width_px = self._get_centerline(sid, vessel, source_path=src)
         fov_f = (fov > 0).astype(np.float32)
@@ -796,12 +582,7 @@ class RetinalFundusDataset(Dataset):
             assert img_u8.shape == cl.shape == fov_f.shape == vessel.shape, (
                 f'Shape mismatch: img={img_u8.shape} cl={cl.shape} fov={fov_f.shape} vessel={vessel.shape}'
             )
-            aug = self.transform(
-                image=img_u8,
-                mask=cl,
-                fov=fov_f,
-                thick_gt=vessel,
-            )
+            aug = self.transform(image=img_u8, mask=cl, fov=fov_f, thick_gt=vessel)
             preprocessed = aug['image'].astype(np.float32) / 255.0
             cl = aug['mask']
             fov_f = aug['fov']
@@ -817,6 +598,7 @@ class RetinalFundusDataset(Dataset):
         }
 
     def _fmt_frangi(self, sid, rgb, vessel, fov, sample):
+        """Format a sample for the Frangi baseline: raw RGB plus numpy uint8 masks/centerline."""
         ext_mask = fov if fov.max() > 0 else None
         preprocessed = self.fundus_preprocessor.preprocess(rgb, external_mask=ext_mask)
         src = sample['vessel'] if self.resize is None else None
@@ -831,24 +613,18 @@ class RetinalFundusDataset(Dataset):
             'vessel_width_px': float(vessel_width_px),
         }
 
-    def _fmt_greedy_tracer(
-        self,
-        sid: str,
-        rgb: np.ndarray,
-        vessel: np.ndarray,
-        fov: np.ndarray,
-        sample,
-    ) -> Dict[str, Any]:
+    def _fmt_greedy_tracer(self, sid: str, rgb: np.ndarray, vessel: np.ndarray, fov: np.ndarray, sample) -> Dict[str, Any]:
+        """Format a sample for the greedy tracer (identical layout to the Frangi target)."""
         return self._fmt_frangi(sid, rgb, vessel, fov, sample)
 
-    def _fmt_rl_agent(
-        self,
-        sid: str,
-        rgb: np.ndarray,
-        vessel: np.ndarray,
-        fov: np.ndarray,
-        sample: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    def _fmt_rl_agent(self, sid: str, rgb: np.ndarray, vessel: np.ndarray, fov: np.ndarray, sample: Dict[str, Any]) -> Dict[str, Any]:
+        """Format a sample for the RL agent: enhanced image, GT reward geometry, and UNet priors.
+
+        Builds the (3,H,W) image (CLAHE green + percentile-normalized R/B), the GT
+        centerline/DT/orientation used by the reward path, and (unless
+        ``require_predicted_priors`` is False) the UNet-derived observation priors.
+        Raises if the seed-detector checkpoint needed for those priors is missing.
+        """
         img_f = rgb.astype(np.float32) / 255.0
         img_orig = img_f.copy()
 
@@ -856,46 +632,28 @@ class RetinalFundusDataset(Dataset):
         enhanced_green = self.fundus_preprocessor.preprocess(rgb, external_mask=ext_mask)
         img_f[:, :, 1] = enhanced_green
 
-        # Per-channel percentile normalization for R and B channels.
-        # Green is already CLAHE-enhanced; R/B are raw [0,1] which lets the
-        # optic disc's high raw intensity dominate. Clip to [2nd, 98th]
-        # percentile within the FOV to suppress brightness outliers.
+        # Percentile-normalize raw R/B within the FOV so the bright optic disc
+        # doesn't dominate (green is already CLAHE-enhanced).
         fov_mask_bool = fov > 0
-        for ch in [0, 2]:  # Red, Blue
+        for ch in [0, 2]:
             channel = img_f[:, :, ch]
             roi = channel[fov_mask_bool] if fov_mask_bool.any() else channel.ravel()
             if roi.size > 0:
                 vmin, vmax = np.percentile(roi, [2.0, 98.0])
-                channel = np.clip(
-                    (channel - vmin) / (vmax - vmin + 1e-8),
-                    0.0,
-                    1.0,
-                )
+                channel = np.clip((channel - vmin) / (vmax - vmin + 1e-8), 0.0, 1.0)
             img_f[:, :, ch] = channel
 
         src_vessel = sample['vessel'] if self.resize is None else None
         src_image = sample['image'] if self.resize is None else None
-        cl, vessel_width_px = self._get_centerline(
-            sid,
-            vessel,
-            source_path=src_vessel,
-        )
+        cl, vessel_width_px = self._get_centerline(sid, vessel, source_path=src_vessel)
         dt = self.cl_extractor.compute_distance_transform(cl, self.tolerance)
         fov_f = (fov > 0).astype(np.float32)
 
-        # Precompute per-image arrays (vessel_orientation is disk-cached)
         vessel_orientation = self._get_vessel_orientation(sid, img_f, source_path=src_image)
 
-        # Predicted priors (UNet → skeleton → DT → DT-grad) replace GT
-        # centerline / DT in the RL observation channels. The GT versions
-        # below stay around so the reward path (coverage, on-track checks,
-        # terminal F-β) keeps its supervision signal.
-        #
-        # `require_predicted_priors` is False ONLY for the trainers that
-        # produce the seed-detector / UNet checkpoint (chicken-and-egg —
-        # they can't depend on the very file they're about to write). All
-        # RL-pipeline callers (PPO, imitation, inference) leave it True so
-        # leakage stays removed.
+        # UNet-derived priors replace GT geometry in the observation channels; the GT
+        # versions above stay for the reward path. require_predicted_priors is False
+        # only for the trainers that produce the checkpoint (chicken-and-egg).
         if self.require_predicted_priors:
             pred = self._get_predicted_priors(sid, img_f, source_path=src_image)
             if pred is None:
@@ -926,10 +684,7 @@ class RetinalFundusDataset(Dataset):
             'fov_mask': torch.from_numpy(fov_f).unsqueeze(0).float(),
             'distance_transform': torch.from_numpy(dt).unsqueeze(0).float(),
             'vessel_orientation': torch.from_numpy(vessel_orientation).float(),
-            # vessel_width_px is emitted for diagnostics / future use; it
-            # does NOT drive the env tolerance (which stays absolute, from
-            # config). Keeping it harmless and free lets downstream tools
-            # reason about per-image scale without a separate medial-axis pass.
+            # Diagnostic only — does NOT drive the (config-set absolute) env tolerance.
             'vessel_width_px': float(vessel_width_px),
         }
         if pred is not None:
@@ -942,9 +697,6 @@ class RetinalFundusDataset(Dataset):
         return out
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 def get_data(
     target: str = 'rl_agent',
     split: str = 'train',
@@ -956,26 +708,14 @@ def get_data(
     max_samples_per_dataset: Optional[int] = MAX_SAMPLES,
     **kwargs,
 ) -> Tuple[ConcatDataset, DataLoader]:
-    """Load the combined train/val set (DRIVE + STARE + CHASE_DB1 + HRF + LES_AV).
+    """Build the combined train/val set over TRAIN_DATASETS and its DataLoader.
 
-    For training with ``balance=True``, a WeightedRandomSampler ensures
-    each dataset contributes equally per epoch despite different sizes.
+    Missing datasets are skipped with a warning. With ``balance=True`` on the train
+    split, a WeightedRandomSampler equalizes per-dataset contribution despite size
+    differences. ``**kwargs`` are forwarded to RetinalFundusDataset.
 
-    Parameters
-    ----------
-    target      : output format
-    split       : "train" or "val"
-    batch_size  : batch size
-    num_workers : DataLoader workers
-    resize      : (H, W) — required for cross-dataset batching
-    train_frac  : fraction of each dataset used for training (rest → val)
-    balance     : use inverse-frequency weighted sampling for training
-    **kwargs    : forwarded to RetinalFundusDataset (transform, tolerance, …)
-
-    Returns
-    -------
-    (ConcatDataset, DataLoader)
-
+    Returns:
+        (ConcatDataset, DataLoader).
     """
     if split not in ('train', 'val'):
         raise ValueError(f"split must be 'train' or 'val', got '{split}'")
@@ -987,10 +727,7 @@ def get_data(
     for name in TRAIN_DATASETS:
         try:
             root = get_root(name)
-        except (
-            KeyError,
-            FileNotFoundError,
-        ) as exc:
+        except (KeyError, FileNotFoundError) as exc:
             logger.warning('Skipping %s: %s', name, exc)
             continue
         try:
@@ -1011,32 +748,21 @@ def get_data(
             logger.warning('Skipping %s: %s', name, exc)
 
     if not sub_datasets:
-        raise FileNotFoundError(
-            f'No datasets loaded. Check that at least one of {TRAIN_DATASETS} exists under the data root.'
-        )
+        raise FileNotFoundError(f'No datasets loaded. Check that at least one of {TRAIN_DATASETS} exists under the data root.')
 
     combined = ConcatDataset(sub_datasets)
     parts = [f'{ds.dataset_name}={len(ds)}' for ds in sub_datasets]
-    logger.info(
-        'Combined %s: %s  total=%d',
-        split,
-        '  '.join(parts),
-        len(combined),
-    )
+    logger.info('Combined %s: %s  total=%d', split, '  '.join(parts), len(combined))
 
-    # Balanced sampling for training
     sampler = None
     shuffle = False
     if split == 'train' and balance:
+        # Inverse-frequency weights so each dataset is sampled equally per epoch.
         weights: List[float] = []
         for ds in sub_datasets:
             w = 1.0 / len(ds)
             weights.extend([w] * len(ds))
-        sampler = WeightedRandomSampler(
-            weights,
-            num_samples=len(combined),
-            replacement=True,
-        )
+        sampler = WeightedRandomSampler(weights, num_samples=len(combined), replacement=True)
     elif split == 'train':
         shuffle = True
 
@@ -1058,46 +784,21 @@ def get_test_data(
     target: str = 'rl_agent',
     batch_size: int = 1,
     num_workers: int = 0,
-    resize: Optional[Tuple[int, int]] = (
-        512,
-        512,
-    ),
+    resize: Optional[Tuple[int, int]] = (512, 512),
     max_samples: Optional[int] = MAX_SAMPLES,
     **kwargs,
 ) -> Tuple[RetinalFundusDataset, DataLoader]:
-    """Load an external test dataset in full (no split).
+    """Build a single external test dataset (no split) and its DataLoader.
 
-    Parameters
-    ----------
-    dataset_name : "AV_WIDE" or "DR_HAGIS"
-    target       : output format
-    batch_size   : batch size
-    num_workers  : DataLoader workers
-    resize       : (H, W) or None
-    **kwargs     : forwarded to RetinalFundusDataset
+    ``**kwargs`` are forwarded to RetinalFundusDataset.
 
-    Returns
-    -------
-    (RetinalFundusDataset, DataLoader)
-
+    Returns:
+        (RetinalFundusDataset, DataLoader).
     """
     root = get_root(dataset_name)
-    ds = RetinalFundusDataset(
-        str(root),
-        dataset_name,
-        target=target,
-        split=None,
-        resize=resize,
-        max_samples=max_samples,
-        **kwargs,
-    )
+    ds = RetinalFundusDataset(str(root), dataset_name, target=target, split=None, resize=resize, max_samples=max_samples, **kwargs)
     collate_fn = _list_collate if target in ('frangi', 'greedy_tracer') else None
     loader = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        pin_memory=target in ('unet', 'rl_agent'),
+        ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn, pin_memory=target in ('unet', 'rl_agent')
     )
     return ds, loader

@@ -1,15 +1,4 @@
-# frangi_baseline.py
-"""==================
-Frangi Vesselness Baseline with Topological Pruning.
-
-Workflow:
-  1. Multi-scale Frangi filter (Hessian-based enhancement)
-  2. Gaussian smoothing to suppress background noise before thresholding
-  3. Morphological cleanup (Binary closing + size filtering)
-  4. Skeletonization (1-pixel centerline extraction)
-  5. Skan Pruning: Removes 'Type 1' spurs (Tip-to-Junction) below prune_length
-==================
-"""
+"""Frangi vesselness baseline: multi-scale Hessian filter, threshold, skeletonize, prune."""
 
 from typing import Optional, Tuple
 
@@ -18,14 +7,11 @@ from scipy.ndimage import gaussian_filter
 from skan import Skeleton as SkanSkeleton
 from skan import summarize
 from skimage import filters, morphology
-from skimage.morphology import (
-    remove_small_objects,
-    skeletonize,
-)
+from skimage.morphology import remove_small_objects, skeletonize
 
 
 class FrangiBaseline:
-    """Classical vessel segmentation using Frangi filter, with graph-based pruning."""
+    """Classical vessel centerline extractor: Frangi enhancement plus graph-based spur pruning."""
 
     def __init__(
         self,
@@ -37,6 +23,7 @@ class FrangiBaseline:
         prune_length: int = 10,
         gauss_sigma: float = 1.0,
     ):
+        """Store Frangi scale range, threshold, and morphological/pruning parameters."""
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.num_scales = num_scales
@@ -46,31 +33,20 @@ class FrangiBaseline:
         self.gauss_sigma = gauss_sigma
 
     def extract_centerline(
-        self,
-        preprocessed: np.ndarray,
-        fov_mask: Optional[np.ndarray] = None,
-        return_vesselness: bool = False,
-    ) -> Tuple[
-        np.ndarray,
-        Optional[np.ndarray],
-        np.ndarray,
-    ]:
-        """Extract a 1-pixel skeleton from a preprocessed fundus image.
+        self, preprocessed: np.ndarray, fov_mask: Optional[np.ndarray] = None, return_vesselness: bool = False
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+        """Extract a pruned 1-px skeleton from a preprocessed fundus image.
 
         Args:
-            preprocessed: (H, W) float32 CLAHE-enhanced grayscale [0, 1]
-            fov_mask:     (H, W) uint8 FOV mask {0, 255}
+            preprocessed: (H, W) float32 CLAHE-enhanced grayscale in [0, 1].
+            fov_mask: (H, W) uint8 FOV mask {0, 255}.
+            return_vesselness: when False the returned vesselness map is None.
+
+        Returns:
+            ``(skeleton float32, vesselness or None, binary vessel mask uint8)``.
         """
-        sigmas = np.linspace(
-            self.sigma_min,
-            self.sigma_max,
-            self.num_scales,
-        )
-        vesselness = filters.frangi(
-            preprocessed.astype(np.float64),
-            sigmas=sigmas,
-            black_ridges=True,
-        )
+        sigmas = np.linspace(self.sigma_min, self.sigma_max, self.num_scales)
+        vesselness = filters.frangi(preprocessed.astype(np.float64), sigmas=sigmas, black_ridges=True)
         vesselness = (vesselness - vesselness.min()) / (vesselness.max() - vesselness.min() + 1e-8)
 
         if self.gauss_sigma > 0:
@@ -81,10 +57,7 @@ class FrangiBaseline:
 
         binary = vesselness > self.threshold
         binary = morphology.binary_closing(binary, morphology.disk(1))
-        binary = remove_small_objects(
-            binary.astype(bool),
-            min_size=self.min_size,
-        )
+        binary = remove_small_objects(binary.astype(bool), min_size=self.min_size)
 
         skeleton = skeletonize(binary)
 
@@ -94,13 +67,13 @@ class FrangiBaseline:
         if not return_vesselness:
             vesselness = None
 
-        return (
-            skeleton.astype(np.float32),
-            vesselness,
-            binary.astype(np.uint8),
-        )
+        return (skeleton.astype(np.float32), vesselness, binary.astype(np.uint8))
 
     def _prune_with_skan(self, skeleton_img):
+        """Remove terminal spurs (branch-type 1, shorter than ``prune_length``) via skan, then re-skeletonize.
+
+        Returns the input unchanged if skan raises (e.g. graph too small).
+        """
         try:
             skel = SkanSkeleton(skeleton_img)
             stats = summarize(skel, separator='_')

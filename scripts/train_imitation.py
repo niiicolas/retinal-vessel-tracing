@@ -1,11 +1,7 @@
-"""Imitation Learning — Step 1 of 2 before PPO.
-Run this BEFORE train_ppo.py.
+"""Imitation-learning (behavior cloning) entry point — run before train_ppo.py.
 
-All logic lives in training/imitation.py.
-This script handles: paths, config, data loading via the unified dataloader,
-and wiring.
-
-Supports both feedforward and LSTM modes via CONFIG["policy"]["use_lstm"].
+Loads data via the unified dataloader, generates expert traces, and behavior-clones the
+policy; core logic lives in training/imitation.py. Supports feedforward and LSTM modes.
 """
 
 import os
@@ -20,9 +16,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 from config import DEVICE
-from config import (
-    IMITATION_WEIGHTS_PATH as SAVE_PATH,
-)
+from config import IMITATION_WEIGHTS_PATH as SAVE_PATH
 from config import IMITATION_LOG_PATH
 from config import MODEL_CONFIG as CONFIG
 from config import OBS_SIZE, TOLERANCE
@@ -33,35 +27,22 @@ BATCH_SIZE = _imi['batch_size']
 LSTM_BATCH_SIZE = _imi['lstm_batch_size']
 NUM_EPOCHS = _imi['num_epochs']
 USE_AUGMENT = _imi['use_augment']
-from data.centerline_extraction import (
-    CenterlineExtractor,
-)
+from data.centerline_extraction import CenterlineExtractor
 from data.dataloader import get_data
-from models.policy_network import (
-    ActorCriticNetwork,
-)
-from training.imitation import (
-    ImitationDataset,
-    ImitationTrainer,
-    augment_sample,
-    generate_expert_metadata,
-    generate_expert_sequence_metadata,
-)
+from models.policy_network import ActorCriticNetwork
+from training.imitation import ImitationDataset, ImitationTrainer, augment_sample, generate_expert_metadata, generate_expert_sequence_metadata
 
 USE_LSTM = CONFIG['policy']['use_lstm']
 
-# ==========================================
-# DATA LOADING (unified dataloader)
-# ==========================================
 process = psutil.Process()
 
 
 def _extract_single_sample(args):
-    """Worker function for parallel sample extraction.
+    """Build one imitation sample (image, GT maps, expert traces) for parallel extraction.
 
-    Expert traces are walked on the GT skeleton (that is the supervision
-    signal). Predicted priors travel alongside so the observation pipeline
-    can stack non-leaking geometry without re-running the UNet.
+    Expert traces are walked on the GT skeleton (the supervision signal); predicted priors
+    are carried alongside so the observation pipeline gets non-leaking geometry without
+    re-running the UNet.
     """
     raw_sample, extractor_kwargs = args
     extractor = CenterlineExtractor(**extractor_kwargs)
@@ -85,36 +66,27 @@ def _extract_single_sample(args):
 
 
 def load_training_samples():
-    """Load combined dataset training samples via the unified dataloader
-    and generate expert traces for imitation learning.
-    """
+    """Load combined training samples and generate their expert traces in parallel."""
     ds, _ = get_data('rl_agent', 'train', tolerance=TOLERANCE)
 
-    extractor_kwargs = {
-        'min_branch_length': 10,
-        'prune_iterations': 5,
-    }
+    extractor_kwargs = {'min_branch_length': 10, 'prune_iterations': 5}
     raw_samples = [ds[i] for i in range(len(ds))]
 
     n_workers = min(4, len(raw_samples))
     print(f'Extracting expert traces from {len(raw_samples)} images ({n_workers} workers)...')
 
     with Pool(n_workers) as pool:
-        samples = pool.map(
-            _extract_single_sample,
-            [(s, extractor_kwargs) for s in raw_samples],
-        )
+        samples = pool.map(_extract_single_sample, [(s, extractor_kwargs) for s in raw_samples])
 
     print(f'Loaded {len(samples)} training samples. Memory: {process.memory_info().rss / 1e9:.1f} GB\n')
     return samples
 
 
-# ==========================================
-# MAIN
-# ==========================================
-
-
 def main():
+    """Generate expert-trace metadata (and LSTM sequences), split it, and behavior-clone the policy.
+
+    Writes imitation-pretrained weights to IMITATION_WEIGHTS_PATH for PPO to warm-start from.
+    """
     print(f'Device: {DEVICE}')
     print(f'LSTM:   {"ON" if USE_LSTM else "OFF"}')
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
@@ -122,42 +94,22 @@ def main():
     print('\nLoading combined training samples...')
     all_samples = load_training_samples()
 
-    # ------------------------------------------------------------------
-    # Generate training data: metadata (FF) and/or sequences (LSTM)
-    # ------------------------------------------------------------------
-    all_samples = all_samples  # keep reference for on-the-fly patching
+    all_samples = all_samples  # kept mutable so augmented samples can be appended in place
     all_metadata = []
     all_sequences = []
 
-    # E2: imitation must walk the skeleton at the same stride the env will
-    # take per action so imitation→PPO action semantics match. Step size
-    # comes from the env config (1 by default).
+    # Walk the skeleton at the env's per-action stride so imitation→PPO action semantics match.
     STEP_SIZE = int(CONFIG['environment'].get('step_size', 1))
-    # Option B: invert env's tangent rotation at expert-gen time so action
-    # labels match what env executes. Now a SEPARATE flag (training.
-    # imitation.tangent_aware) — keep equal to environment.
-    # tangent_relative_actions for "frames agree" experiments; set them
-    # differently to deliberately test the frame-mismatch state.
+    # Invert the env's tangent rotation at expert-gen time so action labels match what the env
+    # executes; a separate flag from environment.tangent_relative_actions for mismatch experiments.
     TANGENT_AWARE = bool(CONFIG.get('training', {}).get('imitation', {}).get('tangent_aware', True))
 
     for sample_idx, sample in enumerate(all_samples):
-        meta = generate_expert_metadata(
-            sample,
-            sample_idx,
-            OBS_SIZE,
-            STEP_SIZE,
-            tangent_aware=TANGENT_AWARE,
-        )
+        meta = generate_expert_metadata(sample, sample_idx, OBS_SIZE, STEP_SIZE, tangent_aware=TANGENT_AWARE)
         all_metadata.extend(meta)
 
         if USE_LSTM:
-            seqs = generate_expert_sequence_metadata(
-                sample,
-                sample_idx,
-                OBS_SIZE,
-                STEP_SIZE,
-                tangent_aware=TANGENT_AWARE,
-            )
+            seqs = generate_expert_sequence_metadata(sample, sample_idx, OBS_SIZE, STEP_SIZE, tangent_aware=TANGENT_AWARE)
             all_sequences.extend(seqs)
 
         n_info = f'{len(meta)} steps'
@@ -169,37 +121,20 @@ def main():
             for aug in augment_sample(sample, TOLERANCE):
                 all_samples.append(aug)
                 aug_idx = len(all_samples) - 1
-                aug_meta = generate_expert_metadata(
-                    aug,
-                    aug_idx,
-                    OBS_SIZE,
-                    STEP_SIZE,
-                    tangent_aware=TANGENT_AWARE,
-                )
+                aug_meta = generate_expert_metadata(aug, aug_idx, OBS_SIZE, STEP_SIZE, tangent_aware=TANGENT_AWARE)
                 all_metadata.extend(aug_meta)
                 if USE_LSTM:
-                    aug_seqs = generate_expert_sequence_metadata(
-                        aug,
-                        aug_idx,
-                        OBS_SIZE,
-                        STEP_SIZE,
-                        tangent_aware=TANGENT_AWARE,
-                    )
+                    aug_seqs = generate_expert_sequence_metadata(aug, aug_idx, OBS_SIZE, STEP_SIZE, tangent_aware=TANGENT_AWARE)
                     all_sequences.extend(aug_seqs)
 
     print(f'\nTotal samples (incl. augmented): {len(all_samples)}')
     print(f'Total step metadata: {len(all_metadata)}')
 
-    # ------------------------------------------------------------------
-    # Train/val split
-    # ------------------------------------------------------------------
     train_sequences = None
     val_sequences = None
 
     if USE_LSTM:
-        print(
-            f'Total sequences: {len(all_sequences)}  (avg length {np.mean([s["length"] for s in all_sequences]):.1f})'
-        )
+        print(f'Total sequences: {len(all_sequences)}  (avg length {np.mean([s["length"] for s in all_sequences]):.1f})')
 
         indices = np.random.permutation(len(all_sequences))
         split = int(len(all_sequences) * 0.9)
@@ -211,7 +146,7 @@ def main():
         print('ERROR: No metadata generated. Check data paths.')
         return
 
-    # Split metadata indices for FF train/val datasets
+    # Deterministic-by-seed 90/10 split of feedforward step metadata.
     indices = np.random.permutation(len(all_metadata))
     split = int(len(all_metadata) * 0.9)
     train_meta = [all_metadata[i] for i in indices[:split]]
@@ -222,26 +157,14 @@ def main():
     train_ds = ImitationDataset(all_samples, train_meta, CONFIG)
     val_ds = ImitationDataset(all_samples, val_meta, CONFIG)
 
-    # Share pre-computed stacked sources + vesselness maps + unet priors
-    # with the LSTM dataset so they aren't recomputed.
+    # Reuse the FF dataset's precomputed maps for the LSTM path instead of recomputing them.
     stacked_sources = train_ds.stacked_sources if USE_LSTM else None
     vesselness_maps = train_ds.vesselness_maps if USE_LSTM else None
     unet_priors = train_ds.unet_priors if USE_LSTM else None
 
-    # ------------------------------------------------------------------
-    # Train
-    # ------------------------------------------------------------------
     model = ActorCriticNetwork(CONFIG).to(DEVICE)
 
-    trainer = ImitationTrainer(
-        model,
-        DEVICE,
-        CONFIG,
-        lr=LEARNING_RATE,
-        batch_size=BATCH_SIZE,
-        num_epochs=NUM_EPOCHS,
-        lstm_batch_size=LSTM_BATCH_SIZE,
-    )
+    trainer = ImitationTrainer(model, DEVICE, CONFIG, lr=LEARNING_RATE, batch_size=BATCH_SIZE, num_epochs=NUM_EPOCHS, lstm_batch_size=LSTM_BATCH_SIZE)
     trainer.train(
         train_ds=train_ds,
         val_ds=val_ds,

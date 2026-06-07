@@ -1,7 +1,4 @@
-"""scripts/run_rl_tracing.py
-=========================
-End-to-end inference: SeedDetector → FrontierTracer → F1 evaluation.
-"""
+"""End-to-end RL inference driver."""
 
 import csv
 import os
@@ -31,7 +28,6 @@ from config import (
     SEED_WEIGHTS_PATH,
     TOLERANCE,
     get_inference_config,
-    # get_seed_inference_config,
 )
 
 _inf = MODEL_CONFIG['inference']
@@ -41,47 +37,24 @@ MIN_COV_GAIN = _inf['min_cov_gain']
 DILATION_RADIUS = _inf['dilation_radius']
 N_RING_SEEDS = _inf['n_ring_seeds']
 RING_INSET_PX = _inf['ring_inset_px']
-from data.dataloader import (
-    TEST_DATASETS,
-    get_data,
-    get_test_data,
-)
-from environment.frontier_tracer import (
-    FrontierTracer,
-)
+from data.dataloader import TEST_DATASETS, get_data, get_test_data
+from environment.frontier_tracer import FrontierTracer
 from environment.seeding_utils import merge_seeds
-from environment.vessel_env import (
-    VesselTracingEnv,
-)
-from evaluation.metrics import (
-    CenterlineMetrics,
-    compute_gt_graph_metrics,
-)
+from environment.vessel_env import VesselTracingEnv
+from evaluation.metrics import CenterlineMetrics
 from evaluation.scoring import score_prediction
-from models.policy_network import (
-    ActorCriticNetwork,
-)
+from models.policy_network import ActorCriticNetwork
 from models.seed_detector import SeedDetector
 
 INFERENCE_CFG = get_inference_config()
-# SEED_INF_CFG = get_seed_inference_config()
 
 
-# # ==========================================
-# # METRICS
-# # ==========================================
 metrics_calc = CenterlineMetrics(tolerance_levels=[1, 2, 3])
 
 
-# ==========================================
-# DATA LOADING
-# ==========================================
 def _load_all_samples(dataset_name):
-    ds, _ = get_test_data(
-        dataset_name,
-        'rl_agent',
-        tolerance=TOLERANCE,
-    )
+    """Load a test dataset's rl_agent samples into an ``{id: numpy-dict}`` map."""
+    ds, _ = get_test_data(dataset_name, 'rl_agent', tolerance=TOLERANCE)
     samples = {}
     for i in range(len(ds)):
         s = ds[i]
@@ -97,23 +70,10 @@ def _load_all_samples(dataset_name):
     return samples
 
 
-# ==========================================
-# POST-PROCESSING (BETTI-0 ONLY)
-# ==========================================
+def postprocess_skeleton(traced: np.ndarray, dilation_radius: int = DILATION_RADIUS) -> np.ndarray:
+    """Bridge disconnected RL path segments (dilate then re-skeletonize); used only for Betti-0 reporting.
 
-
-def postprocess_skeleton(
-    traced: np.ndarray,
-    dilation_radius: int = DILATION_RADIUS,
-) -> np.ndarray:
-    """Merge disconnected RL path segments into a cleaner skeleton.
-
-    Steps:
-      1. Binary dilation — bridges small gaps between nearby path endpoints.
-      2. Re-skeletonize — thins the dilated mask back to 1px-wide centerlines.
-
-    This does NOT affect F1 / HD95 / IoU (computed on the raw traced map).
-    It is used only for Betti-0 post-processed reporting.
+    Does not affect F1/HD95/IoU, which are computed on the raw traced map.
     """
     binary = (traced > 0).astype(np.uint8)
     r = dilation_radius
@@ -123,12 +83,8 @@ def postprocess_skeleton(
     return thinned
 
 
-# ==========================================
-# GT-BASED SEED PICKING  (MODE='gt')
-# ==========================================
-
-
 def _pick_frontier_seed_gt(gt_centerline, covered, half):
+    """Pick the uncovered GT-centerline pixel farthest from the covered region (GT-mode oracle seeding)."""
     uncovered = (gt_centerline > 0) & (covered == 0)
     if not uncovered.any():
         return None
@@ -139,10 +95,7 @@ def _pick_frontier_seed_gt(gt_centerline, covered, half):
 
     if covered_bin.any():
         dist = cv2.distanceTransform(1 - covered_bin, cv2.DIST_L2, 5)
-        scores = dist[
-            uncovered_pts[:, 0],
-            uncovered_pts[:, 1],
-        ]
+        scores = dist[uncovered_pts[:, 0], uncovered_pts[:, 1]]
         best = uncovered_pts[np.argmax(scores)]
     else:
         centre = np.array([h // 2, w // 2])
@@ -154,12 +107,11 @@ def _pick_frontier_seed_gt(gt_centerline, covered, half):
     return (y, x)
 
 
-# ==========================================
-# GT MODE TRACING
-# ==========================================
-
-
 def trace_gt_mode(ppo_model, sample):
+    """Trace by repeatedly seeding from GT-centerline gaps (oracle seeding, MODE='gt').
+
+    Returns ``(combined_mask, paths)``.
+    """
     env = VesselTracingEnv(INFERENCE_CFG)
     env.set_data(
         image=sample['image'],
@@ -181,17 +133,8 @@ def trace_gt_mode(ppo_model, sample):
 
     ppo_model.eval()
     with torch.no_grad():
-        for trace_idx in tqdm(
-            range(MAX_TRACES),
-            desc=f'Img {sample["id"]} Tracing',
-            unit='trace',
-            leave=False,
-        ):
-            start = _pick_frontier_seed_gt(
-                sample['centerline'],
-                combined,
-                half,
-            )
+        for trace_idx in tqdm(range(MAX_TRACES), desc=f'Img {sample["id"]} Tracing', unit='trace', leave=False):
+            start = _pick_frontier_seed_gt(sample['centerline'], combined, half)
             if start is None:
                 tqdm.write(f'    Full GT coverage after {trace_idx} traces.')
                 break
@@ -205,13 +148,7 @@ def trace_gt_mode(ppo_model, sample):
                 obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(DEVICE)
                 logits, _, _ = ppo_model(obs_t)
                 action = logits.argmax(dim=-1).item()
-                (
-                    obs,
-                    _,
-                    terminated,
-                    truncated,
-                    _,
-                ) = env.step(action)
+                (obs, _, terminated, truncated, _) = env.step(action)
                 done = terminated or truncated
                 y, x = env.position
                 path.append((y, x))
@@ -230,25 +167,18 @@ def trace_gt_mode(ppo_model, sample):
     return combined, paths
 
 
-# ==========================================
-# E2E MODE TRACING
-# ==========================================
-
-
 def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
+    """Run the realistic pipeline: detect seeds → merge with ring/grid fallbacks → frontier-trace (MODE='e2e').
+
+    Returns ``(combined_mask, paths)``.
+    """
     img_t = torch.from_numpy(sample['image'].transpose(2, 0, 1)).unsqueeze(0).float().to(DEVICE)
 
     fov_t = torch.from_numpy(sample['fov_mask']).unsqueeze(0).unsqueeze(0).float().to(DEVICE)
 
-    batch_seeds, heatmap_out, vessel_prob_out = seed_model.detect_seeds(
-        img_t,
-        obs_half=OBS_SIZE // 2,
-        return_heatmap=True,
-        fov_mask=fov_t,
-    )
+    batch_seeds, heatmap_out, vessel_prob_out = seed_model.detect_seeds(img_t, obs_half=OBS_SIZE // 2, return_heatmap=True, fov_mask=fov_t)
     seeds = batch_seeds[0]
-    # vmap is the model's vessel-probability map; we use it to gate the
-    # grid fallback below so we don't seed the agent in pure background.
+    # Vessel-probability map gates the grid fallback so it can't seed pure background.
     vmap = vessel_prob_out[0, 0].cpu().numpy()
 
     tqdm.write(f'    Seed detector: {len(seeds)} seeds predicted')
@@ -267,13 +197,7 @@ def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
         obs_half=OBS_SIZE // 2,
     )
 
-    # Fallback: if seeding pipeline produced few points, add a grid.
-    # Threshold raised from 5 → MAX_TRACES // 4 because n_ring_seeds=0
-    # leaves the grid as the only rescue path for under-detection cases
-    # (e.g. pathology images the trained detector handles poorly).
-    # Each grid candidate is vessel-gated against vmap so seeds in pure
-    # background are skipped — addresses the off-vessel-seed concern that
-    # motivated turning ring seeds off in the first place.
+    # Vessel-gated grid fallback when seeding under-produces.
     GRID_FALLBACK_THRESHOLD = max(5, MAX_TRACES // 4)
     if len(merged) < GRID_FALLBACK_THRESHOLD:
         h, w = sample['image'].shape[:2]
@@ -285,13 +209,9 @@ def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
                 if fov[gy, gx] > 0 and vmap[gy, gx] > 0.3:
                     grid_seeds.append((gy, gx))
         merged = list(merged) + grid_seeds[: MAX_TRACES - len(merged)]
-        tqdm.write(
-            f'    WARNING: Seeding under-produced ({len(merged)} seeds), added {len(grid_seeds)} vessel-gated grid seeds'
-        )
+        tqdm.write(f'    WARNING: Seeding under-produced ({len(merged)} seeds), added {len(grid_seeds)} vessel-gated grid seeds')
 
-    tqdm.write(
-        f'    Detector seeds (capped): {min(len(seeds), MAX_TRACES - N_RING_SEEDS)}  Ring seeds added: {n_ring_added}  Total: {len(merged)}'
-    )
+    tqdm.write(f'    Detector seeds (capped): {min(len(seeds), MAX_TRACES - N_RING_SEEDS)}  Ring seeds added: {n_ring_added}  Total: {len(merged)}')
 
     env = VesselTracingEnv(INFERENCE_CFG)
     tracer = FrontierTracer(env, ppo_model, DEVICE, obs_size=OBS_SIZE)
@@ -300,17 +220,9 @@ def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
     return combined, paths
 
 
-# ==========================================
-# VISUALISATION
-# ==========================================
-
-
 def make_overlay(image_orig, gt_centerline, traced, paths):
-    """Creates a darkened grayscale background with colored traces over it."""
-    gray = cv2.cvtColor(
-        (image_orig * 255).astype(np.uint8),
-        cv2.COLOR_RGB2GRAY,
-    )
+    """Build a darkened-grayscale RGB overlay colouring GT, trace, true positives, and seed points."""
+    gray = cv2.cvtColor((image_orig * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
     dark_gray = (gray * 0.4).astype(np.uint8)
     overlay = cv2.cvtColor(dark_gray, cv2.COLOR_GRAY2RGB)
 
@@ -320,17 +232,12 @@ def make_overlay(image_orig, gt_centerline, traced, paths):
     for path in paths:
         if path:
             y, x = path[0]
-            cv2.circle(
-                overlay,
-                (x, y),
-                4,
-                (0, 255, 255),
-                -1,
-            )
+            cv2.circle(overlay, (x, y), 4, (0, 255, 255), -1)
     return overlay
 
 
 def visualize_sample(ppo_model, seed_model, sample, output_dir):
+    """Trace one image, score it via the shared scorer, save a 4-panel figure, and return its metrics."""
     img_id = sample['id']
     tqdm.write(f'\nProcessing Image {img_id} [Mode: {MODE}]')
 
@@ -339,10 +246,8 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir):
     else:
         traced, paths = trace_e2e_mode(ppo_model, seed_model, sample)
 
-    # Single shared scorer (evaluation/scoring.py) — the SAME code path every
-    # model is scored through (RL, frangi, greedy, unet) so the numbers are
-    # comparable. This is a verbatim relocation of the former inline block, so
-    # the recorded v12 metrics are unchanged.
+    # Shared scorer (evaluation/scoring.py): the single code path every model is scored
+    # through, so RL/frangi/greedy/unet numbers are comparable (matches recorded v12).
     metrics = score_prediction(
         traced,
         centerline=sample['centerline'],
@@ -372,14 +277,8 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir):
         f'EdgeCov@80={metrics["gt_edge_cov80_frac"]:.3f}'
     )
 
-    overlay = make_overlay(
-        sample['image_orig'],
-        sample['centerline'],
-        traced,
-        paths,
-    )
+    overlay = make_overlay(sample['image_orig'], sample['centerline'], traced, paths)
 
-    # 4-panel figure
     fig, axes = plt.subplots(1, 4, figsize=(20, 5))
 
     title_str = (
@@ -403,38 +302,20 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir):
     axes[1].axis('off')
 
     axes[2].imshow(traced, cmap='gray')
-    axes[2].set_title(
-        f'(c) Agent Traced ({n_traces_used} paths)',
-        fontsize=10,
-    )
+    axes[2].set_title(f'(c) Agent Traced ({n_traces_used} paths)', fontsize=10)
     axes[2].axis('off')
 
     axes[3].imshow(overlay)
-    axes[3].set_title(
-        '(d) Overlay (TP / GT-miss / FP / Seeds)',
-        fontsize=10,
-    )
+    axes[3].set_title('(d) Overlay (TP / GT-miss / FP / Seeds)', fontsize=10)
     axes[3].axis('off')
 
     legend = [
-        mpatches.Patch(
-            color='#00C800',
-            label='GT only (miss)',
-        ),
+        mpatches.Patch(color='#00C800', label='GT only (miss)'),
         mpatches.Patch(color='#FFDC00', label='True positive'),
-        mpatches.Patch(
-            color='#DC3232',
-            label='Traced only (FP)',
-        ),
+        mpatches.Patch(color='#DC3232', label='Traced only (FP)'),
         mpatches.Patch(color='#00FFFF', label='Seed point'),
     ]
-    axes[3].legend(
-        handles=legend,
-        loc='lower right',
-        fontsize=8,
-        framealpha=0.8,
-        ncol=2,
-    )
+    axes[3].legend(handles=legend, loc='lower right', fontsize=8, framealpha=0.8, ncol=2)
 
     plt.tight_layout()
     out_path = os.path.join(output_dir, f'trace_{img_id}_{MODE}.png')
@@ -445,45 +326,28 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir):
     return metrics
 
 
-# ==========================================
-# CSV HELPERS
-# ==========================================
-
-
 def init_csv(csv_path: str):
+    """Create the per-image metrics CSV with the CSV_COLUMNS header."""
     with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=CSV_COLUMNS,
-            extrasaction='ignore',
-        )
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction='ignore')
         writer.writeheader()
 
 
 def append_csv(csv_path: str, metrics: dict):
+    """Append one image's metrics row to the CSV."""
     row = {col: metrics.get(col, '') for col in CSV_COLUMNS}
     with open(csv_path, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writerow(row)
 
 
-# ==========================================
-# MAIN
-# ==========================================
 def main():
+    """Load the PPO policy (plus seed detector for e2e) and run tracing/eval on val and/or test sets."""
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--eval',
-        action='store_true',
-        help='Evaluate on val set',
-    )
-    parser.add_argument(
-        '--test',
-        action='store_true',
-        help='Test on external datasets',
-    )
+    parser.add_argument('--eval', action='store_true', help='Evaluate on val set')
+    parser.add_argument('--test', action='store_true', help='Test on external datasets')
     args = parser.parse_args()
 
     if not args.eval and not args.test:
@@ -491,66 +355,35 @@ def main():
 
     print(f'Device: {DEVICE}  |  Mode: {MODE}  |  Dilation radius: {DILATION_RADIUS}px')
 
-    # Load PPO model
     if not os.path.exists(PPO_WEIGHTS_PATH):
         print(f'ERROR: No trained weights found at {PPO_WEIGHTS_PATH}')
         print('Run scripts/train_ppo.py first to train the model.')
         raise SystemExit(1)
-    ppo_ckpt = torch.load(
-        PPO_WEIGHTS_PATH,
-        map_location=DEVICE,
-        weights_only=True,
-    )
+    ppo_ckpt = torch.load(PPO_WEIGHTS_PATH, map_location=DEVICE, weights_only=True)
     ppo_model = ActorCriticNetwork(INFERENCE_CFG).to(DEVICE)
     ppo_model.load_state_dict(ppo_ckpt['model_state_dict'])
     ppo_model.eval()
 
-    # Load seed detector
+    # Seed detector is only needed for the e2e pipeline.
     seed_model = None
     if MODE == 'e2e':
-        seed_ckpt = torch.load(
-            SEED_WEIGHTS_PATH,
-            map_location=DEVICE,
-            weights_only=True,
-        )
-        # seed_model = SeedDetector(SEED_INF_CFG).to(DEVICE)
+        seed_ckpt = torch.load(SEED_WEIGHTS_PATH, map_location=DEVICE, weights_only=True)
         seed_model = SeedDetector().to(DEVICE)
         seed_model.load_state_dict(seed_ckpt['model_state_dict'])
         seed_model.eval()
 
     if args.eval:
-        _run_on_datasets(
-            ppo_model,
-            seed_model,
-            ('val',),
-            label='val',
-        )
+        _run_on_datasets(ppo_model, seed_model, ('val',), label='val')
 
     if args.test:
-        _run_on_datasets(
-            ppo_model,
-            seed_model,
-            TEST_DATASETS,
-            label='test',
-        )
+        _run_on_datasets(ppo_model, seed_model, TEST_DATASETS, label='test')
 
 
-def _run_on_datasets(
-    ppo_model,
-    seed_model,
-    dataset_names,
-    label='test',
-):
-    """Run tracing + evaluation on a list of datasets."""
+def _run_on_datasets(ppo_model, seed_model, dataset_names, label='test'):
+    """Trace, score, and write per-image + summary CSVs for each dataset in ``dataset_names``."""
     for dataset_name in dataset_names:
-        # Load data
         if dataset_name == 'val':
-            ds, _ = get_data(
-                'rl_agent',
-                'val',
-                tolerance=TOLERANCE,
-                resize=(512, 512),
-            )
+            ds, _ = get_data('rl_agent', 'val', tolerance=TOLERANCE, resize=(512, 512))
             samples = {}
             for i in range(len(ds)):
                 s = ds[i]
@@ -575,22 +408,12 @@ def _run_on_datasets(
 
         all_metrics = []
 
-        for img_id in tqdm(
-            samples.keys(),
-            desc=f'RL Tracing — {dataset_name}',
-            unit='img',
-        ):
+        for img_id in tqdm(samples.keys(), desc=f'RL Tracing — {dataset_name}', unit='img'):
             sample = samples[img_id]
-            metrics = visualize_sample(
-                ppo_model,
-                seed_model,
-                sample,
-                output_dir,
-            )
+            metrics = visualize_sample(ppo_model, seed_model, sample, output_dir)
             append_csv(csv_path, metrics)
             all_metrics.append(metrics)
 
-        # Summary
         if all_metrics:
             print('\n' + '=' * 65)
             print(f'SUMMARY — {dataset_name}  ({len(all_metrics)} images, mode={MODE})')
@@ -612,10 +435,7 @@ def _run_on_datasets(
                 if any(k in m for m in all_metrics)
             ]
             summary_df = pd.DataFrame(summary_rows)
-            summary_csv = os.path.join(
-                output_dir,
-                f'metrics_summary_{MODE}.csv',
-            )
+            summary_csv = os.path.join(output_dir, f'metrics_summary_{MODE}.csv')
             summary_df.to_csv(summary_csv, index=False)
             print(f'Summary CSV → {summary_csv}')
 

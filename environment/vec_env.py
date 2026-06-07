@@ -1,10 +1,8 @@
 """Subprocess-based vectorized environment for parallel PPO rollouts.
 
-Each VesselTracingEnv runs in its own process, stepping in parallel.
-Communication via multiprocessing.Pipe — the standard SubprocVecEnv pattern.
-
-Workers load their own dataset copy to avoid serializing large arrays
-through the pipe on every episode reset — only the sample index is sent.
+Each VesselTracingEnv runs in its own process and steps in parallel, communicating over a
+multiprocessing.Pipe. Workers load their own dataset copy so only sample indices cross the
+pipe, not large arrays.
 """
 
 import multiprocessing as mp
@@ -14,11 +12,9 @@ import numpy as np
 
 
 def _worker(conn, config: dict, tolerance: float):
-    """Event loop running in a child process. Owns one VesselTracingEnv."""
+    """Child-process command loop owning one VesselTracingEnv and a local sample cache."""
     from data.dataloader import get_data
-    from environment.vessel_env import (
-        VesselTracingEnv,
-    )
+    from environment.vessel_env import VesselTracingEnv
 
     env = VesselTracingEnv(config)
 
@@ -26,18 +22,13 @@ def _worker(conn, config: dict, tolerance: float):
     _use_vesselness = _env_cfg.get('use_vesselness', False)
     _use_unet_prior = _env_cfg.get('use_unet_prior', False)
 
-    # Load own dataset copy for local sample access (avoids large IPC).
-    # Only the torch Dataset metadata is loaded here; images load on demand.
-    ds, _ = get_data(
-        'rl_agent',
-        'train',
-        tolerance=tolerance,
-        use_unet_prior=_use_unet_prior,
-    )
+    # Own dataset copy for local sample access; images load on demand.
+    ds, _ = get_data('rl_agent', 'train', tolerance=tolerance, use_unet_prior=_use_unet_prior)
     _sample_cache: Dict[int, dict] = {}
     _MAX_CACHE = 32  # cap per-worker memory (~160 MB at 5 MB/sample)
 
     def _get_sample(idx: int) -> dict:
+        """Load and LRU-cache the numpy arrays for dataset sample ``idx``."""
         if idx in _sample_cache:
             return _sample_cache[idx]
         s = ds[idx]
@@ -49,35 +40,27 @@ def _worker(conn, config: dict, tolerance: float):
         }
         if 'vessel_orientation' in s:
             sample['vessel_orientation'] = s['vessel_orientation'].numpy()
-        # Predicted priors (UNet-derived) replace GT geometry in the
-        # observation. ``dt_gradient`` is no longer emitted by the
-        # dataloader; ``pred_dt_gradient`` is the only gradient input now.
+        # UNet-derived predicted priors replace GT geometry in the observation;
+        # pred_dt_gradient is the only gradient input the dataloader emits now.
         if 'pred_centerline' in s:
             sample['pred_centerline'] = s['pred_centerline'].squeeze(0).numpy()
         if 'pred_distance_transform' in s:
             sample['pred_distance_transform'] = s['pred_distance_transform'].squeeze(0).numpy()
         if 'pred_dt_gradient' in s:
             sample['pred_dt_gradient'] = s['pred_dt_gradient'].numpy()
-        # Cache Frangi vesselness once per sample. Otherwise the lazy
-        # compute in env.set_data() runs on every episode reset (~0.5s),
-        # which dominates wallclock when use_vesselness=True.
+        # Cache Frangi vesselness per sample; otherwise env.set_data() recomputes it
+        # (~0.5s) on every reset and dominates wallclock when use_vesselness=True.
         if _use_vesselness:
             from skimage.filters import frangi
 
             img = sample['image']
             gray = img[:, :, 1] if img.ndim == 3 else img
-            sample['vesselness'] = frangi(
-                gray.astype(np.float64),
-                sigmas=np.linspace(1.0, 3.0, 5),
-                black_ridges=True,
-            ).astype(np.float32)
+            sample['vesselness'] = frangi(gray.astype(np.float64), sigmas=np.linspace(1.0, 3.0, 5), black_ridges=True).astype(np.float32)
         if _use_unet_prior:
             if 'unet_prior' in s:
                 sample['unet_prior'] = s['unet_prior'].squeeze(0).numpy()
             else:
-                from data.dataloader import (
-                    compute_unet_prior,
-                )
+                from data.dataloader import compute_unet_prior
 
                 up = compute_unet_prior(sample['image'])
                 if up is not None:
@@ -91,18 +74,15 @@ def _worker(conn, config: dict, tolerance: float):
         cmd, data = conn.recv()
 
         if cmd == 'step':
-            result = env.step(data)  # (obs, reward, terminated, truncated, info)
+            result = env.step(data)
             conn.send(result)
 
         elif cmd == 'set_sample':
-            # data is either an int (legacy) or (int, prior_coverage_or_None)
+            # data is an int (legacy) or (sample_idx, prior_coverage_or_None).
             if isinstance(data, tuple):
                 sample_idx, prior_coverage = data
             else:
-                sample_idx, prior_coverage = (
-                    data,
-                    None,
-                )
+                sample_idx, prior_coverage = (data, None)
             s = _get_sample(sample_idx)
             env.set_data(
                 image=s['image'],
@@ -121,12 +101,11 @@ def _worker(conn, config: dict, tolerance: float):
             conn.send(None)
 
         elif cmd == 'get_coverage':
-            # Return the covered_centerline mask from the current episode.
-            # Called after episode termination to accumulate multi-episode coverage.
+            # Current-episode covered_centerline, for multi-episode coverage accumulation.
             conn.send(env.covered_centerline.copy() if env.covered_centerline is not None else None)
 
         elif cmd == 'set_data':
-            # Fallback: receive full arrays (used for init if needed)
+            # Fallback path: receive full arrays directly.
             env.set_data(**data)
             conn.send(None)
 
@@ -148,9 +127,10 @@ def _worker(conn, config: dict, tolerance: float):
 
 
 class SubprocVecEnv:
-    """Run N VesselTracingEnv instances in separate processes."""
+    """Runs N VesselTracingEnv instances in separate processes, driven over pipes."""
 
     def __init__(self, config: dict, n_envs: int):
+        """Spawn ``n_envs`` worker processes, each owning one VesselTracingEnv."""
         self.n_envs = n_envs
         self.tolerance = config.get('environment', {}).get('tolerance', 2.0)
         ctx = mp.get_context('forkserver')
@@ -160,22 +140,14 @@ class SubprocVecEnv:
 
         for _ in range(n_envs):
             parent_conn, child_conn = ctx.Pipe()
-            p = ctx.Process(
-                target=_worker,
-                args=(
-                    child_conn,
-                    config,
-                    self.tolerance,
-                ),
-                daemon=True,
-            )
+            p = ctx.Process(target=_worker, args=(child_conn, config, self.tolerance), daemon=True)
             p.start()
-            child_conn.close()  # parent doesn't need the child end
+            child_conn.close()  # parent keeps only its own pipe end
             self.parent_conns.append(parent_conn)
             self.processes.append(p)
 
     def step(self, actions: List[int]):
-        """Step all envs in parallel. Returns (obs_list, rewards, terminateds, truncateds, infos)."""
+        """Step all envs in parallel; returns ``(obs_list, rewards, terminateds, truncateds, infos)``."""
         for conn, action in zip(self.parent_conns, actions):
             conn.send(('step', action))
 
@@ -185,64 +157,44 @@ class SubprocVecEnv:
         terminateds = [r[2] for r in results]
         truncateds = [r[3] for r in results]
         infos = [r[4] for r in results]
-        return (
-            obs_list,
-            rewards,
-            terminateds,
-            truncateds,
-            infos,
-        )
+        return (obs_list, rewards, terminateds, truncateds, infos)
 
-    def set_sample(
-        self,
-        idx: int,
-        sample_idx: int,
-        prior_coverage: Optional[np.ndarray] = None,
-    ):
-        """Tell a specific env to load a sample by dataset index.
+    def set_sample(self, idx: int, sample_idx: int, prior_coverage: Optional[np.ndarray] = None):
+        """Tell env ``idx`` to load dataset sample ``sample_idx``.
 
-        If ``prior_coverage`` is provided (a (H, W) bool/float32 mask of
-        centerline pixels already traced on this image by prior episodes),
-        it is forwarded to env.set_data() so the gated connectivity bonus
-        can fire during training — closing the train-eval gap where the
-        frontier_tracer provides multi-episode context but training does not.
+        ``prior_coverage`` (a (H, W) mask of centerline pixels traced by earlier episodes on
+        this image) is forwarded to set_data() so the gated connectivity bonus can fire in
+        training, matching the multi-episode context the frontier_tracer provides at eval.
         """
-        self.parent_conns[idx].send(
-            (
-                'set_sample',
-                (sample_idx, prior_coverage),
-            )
-        )
+        self.parent_conns[idx].send(('set_sample', (sample_idx, prior_coverage)))
         self.parent_conns[idx].recv()
 
     def get_coverage_mask(self, idx: int) -> Optional[np.ndarray]:
-        """Retrieve the covered_centerline mask from a worker after episode end.
+        """Return worker ``idx``'s covered_centerline mask (copy) after episode end, or None.
 
-        Returns a (H, W) float32 array (copy) or None if the env has not
-        been reset yet.  Used by PPOTrainer to accumulate multi-episode
-        coverage per image so that subsequent episodes on the same image
-        receive prior_coverage and can earn the gated connectivity bonus.
+        Used by PPOTrainer to accumulate per-image coverage so later episodes on the same
+        image receive prior_coverage.
         """
         self.parent_conns[idx].send(('get_coverage', None))
         return self.parent_conns[idx].recv()
 
     def set_data(self, idx: int, **kwargs):
-        """Set image/centerline/dt data on a specific env (full array transfer)."""
+        """Set image/centerline/dt data on env ``idx`` via full array transfer."""
         self.parent_conns[idx].send(('set_data', kwargs))
         self.parent_conns[idx].recv()
 
     def reset(self, idx: int, **kwargs) -> np.ndarray:
-        """Reset a specific env and return its initial observation."""
+        """Reset env ``idx`` and return its initial observation."""
         self.parent_conns[idx].send(('reset', kwargs))
         return self.parent_conns[idx].recv()
 
     def apply_overrides(self, idx: int, overrides: dict):
-        """Apply curriculum overrides to a specific env."""
+        """Apply curriculum overrides to env ``idx``."""
         self.parent_conns[idx].send(('apply_overrides', overrides))
         self.parent_conns[idx].recv()
 
     def close(self):
-        """Shut down all worker processes."""
+        """Shut down all worker processes, terminating any that don't exit in time."""
         for conn in self.parent_conns:
             try:
                 conn.send(('close', None))

@@ -1,4 +1,4 @@
-"""RL Environment for vessel tracing."""
+"""Gymnasium environment for retinal vessel tracing."""
 
 from dataclasses import dataclass
 from typing import Optional
@@ -13,6 +13,8 @@ from .reward import RewardCalculator, RewardState
 
 @dataclass
 class EnvConfig:
+    """Reference defaults for core env scalars; the live env reads ``config['environment']``."""
+
     observation_size: int = 65
     step_size: int = 1
     tolerance: float = 2.0
@@ -22,13 +24,18 @@ class EnvConfig:
 
 
 class VesselTracingEnv(gym.Env):
+    """Gym env where an agent walks one step at a time along a retinal vessel from a seed.
+
+    Each step picks one of 8 directions (optionally tangent-relative) or STOP. Observation
+    channels are derived entirely from UNet-predicted priors (no GT leakage); the GT
+    centerline/DT feed only reward and coverage. Call ``set_data`` before stepping.
+    """
+
     N_ACTIONS = 9  # 8 directional moves + STOP (index 8)
     STOP_ACTION = 8
 
-    # Standard 8-neighbour direction set (canonical "N"-relative frame).
-    # In tangent-relative mode (the default), step() rotates this grid so
-    # action 0 ("forward") points along the local vessel tangent rather
-    # than absolute image-up — see _rotate_into_tangent_frame.
+    # Canonical 8-neighbour directions ("N"-relative frame). In tangent-relative mode
+    # (default) step() rotates this grid so action 0 ("forward") follows the local tangent.
     DIRECTIONS = np.array(
         [
             [-1, 0],
@@ -42,15 +49,11 @@ class VesselTracingEnv(gym.Env):
         ]
     )
 
-    def __init__(
-        self,
-        config,
-        image=None,
-        centerline=None,
-        distance_transform=None,
-        vesselness=None,
-        fov_mask=None,
-    ):
+    def __init__(self, config, image=None, centerline=None, distance_transform=None, vesselness=None, fov_mask=None):
+        """Build action/observation spaces and reward/observation helpers, and zero episode state.
+
+        Image data is optional here — call ``set_data`` before ``reset``.
+        """
         super().__init__()
 
         self.config = config
@@ -59,41 +62,21 @@ class VesselTracingEnv(gym.Env):
         self.obs_size = env_config.get('observation_size', 65)
         self.step_size = env_config.get('step_size', 1)
         self.tolerance = env_config.get('tolerance', 2.0)
-        # Whether DIRECTIONS[action] is rotated by the local vessel tangent
-        # in _action_to_world_displacement. The imitation expert in
-        # training/imitation.py generates action indices in WORLD frame
-        # (direction_to_action(world_dy, world_dx)); if this flag is True
-        # the env rotates them, creating a frame mismatch between the
-        # imitation prior and PPO execution. Set False to make actions
-        # world-frame (action 0 = canonical N regardless of tangent) so
-        # imitation and env agree.
         self.tangent_relative_actions = bool(env_config.get('tangent_relative_actions', True))
         self.max_off_track = env_config.get('max_off_track_streak', 3)
         self.max_steps = env_config.get('max_steps_per_episode', 2000)
-        # v10 — which signal decides "on a vessel" (drives BOTH off-track
-        # termination AND the reward's off-vessel/near/progress gating, so the
-        # two never conflict). All leak-free except "gt".
-        #   "vesselness"     — soft UNet vessel-prob >= vesselness_tau (dense;
-        #                      spans gaps in the thresholded skeleton → lifts the
-        #                      recall/connectivity ceiling).
-        #   "predicted_ridge"— distance to the predicted centerline <= tolerance.
-        #   "gt"             — GT distance <= tolerance (NOT leak-free at inference).
         self._on_vessel_signal = env_config.get('on_vessel_signal', 'vesselness')
         self._vesselness_tau = float(env_config.get('vesselness_tau', 0.3))
-        # Soft off-track tolerance — when True the per-step off-track
-        # penalty ramps linearly with the streak instead of a flat penalty.
-        # Toggled dynamically per curriculum stage via apply_overrides.
         self.off_track_ramp = env_config.get('off_track_penalty_ramp', False)
 
-        # Precompute circular coverage template (reused every step)
+        # Circular tolerance-disk template, reused every coverage update.
         tol_i = int(self.tolerance)
         r = np.arange(-tol_i - 1, tol_i + 2)
         self._cov_template = (r[:, None] ** 2 + r[None, :] ** 2) <= self.tolerance**2
-        self._cov_half = tol_i + 1  # half-size of template
+        self._cov_half = tol_i + 1  # template half-size
 
-        # Momentum blending
+        # Momentum blend: 0.0 = pure discrete steps, higher = smoother direction.
         self.momentum = env_config.get('momentum', 0.0)
-        # 0.0 = no momentum (pure discrete), 0.3 = mild smoothing
 
         self.image = image
         self.centerline = centerline  # GT — reward path
@@ -102,22 +85,12 @@ class VesselTracingEnv(gym.Env):
         self.unet_prior = None  # (H, W) float32 in [0, 1], set in set_data()
         self.fov_mask = fov_mask
 
-        self.vessel_orientation = None  # precomputed (H,W,2), set in set_data()
-        # Predicted priors (UNet → skeleton → DT → DT-grad) — observation path.
-        # GT versions live on self.centerline / self.distance_transform; these
-        # parallel attributes feed ObservationBuilder so the agent never sees
-        # the GT skeleton during training or inference.
+        self.vessel_orientation = None  # (H, W, 2), set in set_data()
         self.pred_centerline = None
         self.pred_distance_transform = None
         self.pred_dt_gradient = None
-        # Unclipped distance to the PREDICTED centerline ridge. Drives off-track
-        # TERMINATION without GT (the env's pred_distance_transform is clipped
-        # at tolerance and so cannot distinguish on- vs far-off-track).
         self._offtrack_dt = None
 
-        # Topology-aware memory (P1b). Per-episode graph of visited junctions
-        # on the *predicted* skeleton, plus precomputed neighbour lists so the
-        # "branches-remaining" feature is O(1) per step.
         self.use_topology_memory = env_config.get('use_topology_memory', True)
         self._predicted_junction_pixels: list = []
         self._junction_neighbours: dict = {}
@@ -134,7 +107,7 @@ class VesselTracingEnv(gym.Env):
         self.reward_calculator = RewardCalculator(config)
         self.observation_builder = ObservationBuilder(config)
 
-        # Episode state
+        # Episode state.
         self.position = None
         self.visited_mask = None
         self.trajectory = None
@@ -143,51 +116,29 @@ class VesselTracingEnv(gym.Env):
         self.off_track_streak = 0
         self.on_track_streak = 0
         self.prev_direction = None
-        # World-frame unit displacement of the previous move. Disambiguates
-        # the structure-tensor tangent's sign at the next step so "forward"
-        # stays consistent across a trace.
         self._prev_world_vec: Optional[np.ndarray] = None
         self.covered_centerline = None
-        self._covered_weight_sum = 0.0  # thickness-weighted accumulator
+        self._covered_weight_sum = 0.0  # thickness-weighted coverage accumulator
         self.centerline_weight_map = None  # set in set_data()
         self.prior_coverage = None  # accumulated mask from earlier traces
-        # F3 — uncovered-DT shaping. Distance transform to the nearest GT
-        # centerline pixel that is NOT yet in covered_centerline. Refreshed
-        # every ``_uncov_dt_refresh`` steps (full-image DT is O(HW)
-        # but cheap; refreshing per-step would be wasteful). Used only when
-        # config['reward']['shaping_uses_uncovered'] is True.
+
         self._uncov_dt: Optional[np.ndarray] = None
         self._uncov_dt_refresh: int = int(env_config.get('uncov_dt_refresh_steps', 20))
         self._steps_since_uncov_refresh: int = 0
         self._shaping_uses_uncovered: bool = bool(config.get('reward', {}).get('shaping_uses_uncovered', False))
-        # H6 — tangent-aligned progress reward needs _uncov_dt too (the
-        # sign of forward_tangent is set by the uncov_dt gradient). So
-        # populate _uncov_dt whenever EITHER feature is on, not just F3.
+
         self._progress_weight: float = float(config.get('reward', {}).get('progress_weight', 0.0))
         self._needs_uncov_dt: bool = self._shaping_uses_uncovered or self._progress_weight != 0.0
-        # Stage B1 frontier mask: uncovered GT centerline pixels adjacent
-        # (8-conn) to the currently-covered centerline.  Recomputed after
-        # every coverage update so the next step's `is_on_frontier` query
-        # reflects the latest coverage frontier.
+
         self._frontier_mask = None
-        self._momentum_vec: Optional[np.ndarray] = None  # running direction
+        self._momentum_vec: Optional[np.ndarray] = None  # running normalised direction
 
     def _setup_observation_space(self):
-        from models.policy_network import (
-            _compute_in_channels,
-        )
+        """Define the Box observation space; channel count comes from the policy-net SSoT."""
+        from models.policy_network import _compute_in_channels
 
         n_channels = _compute_in_channels(self.config)
-        self.observation_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(
-                n_channels,
-                self.obs_size,
-                self.obs_size,
-            ),
-            dtype=np.float32,
-        )
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(n_channels, self.obs_size, self.obs_size), dtype=np.float32)
 
     def set_data(
         self,
@@ -204,43 +155,32 @@ class VesselTracingEnv(gym.Env):
         pred_centerline=None,
         pred_distance_transform=None,
         pred_dt_gradient=None,
-        # Accepted but ignored — kept so callers built against the
-        # transitional width-scaling API don't break. Tolerance is
-        # always the absolute value from config.
         vessel_width_px: Optional[float] = None,
         tolerance_px: Optional[float] = None,
     ):
+        """Load one image and its derived maps for the next episode(s).
+
+        Stores GT centerline/DT (reward path) and UNet-predicted priors (observation path),
+        lazily computing vesselness, the UNet prior, and predicted priors when not supplied,
+        then pre-stacks observation sources and the predicted-skeleton junction graph. Raises
+        if predicted priors are needed but the seed-detector checkpoint is missing.
+        ``vessel_width_px`` / ``tolerance_px`` are accepted but ignored (tolerance is absolute).
+        """
         self.image = image
-        # GT centerline / DT — used by reward + coverage paths only.
+        # GT centerline / DT — reward + coverage paths only.
         self.centerline = centerline
         self.distance_transform = distance_transform
-        # §2.1 reverted: thickness-weighted coverage caused a "stop-fast"
-        # collapse (1000-iter run: ep_len shrank 43→14, stop_frac→0.97,
-        # clDice 0.461→0.414, recall@2 0.589→0.460).  The reverse map is now
-        # uniform (weight=1.0 at every centerline pixel) so the reward path
-        # behaves identically to the pre-§2.1 baseline.  Helper retained but
-        # called with vessel_mask=None to enforce uniformity.
         self.centerline_weight_map = self._build_centerline_weight_map(centerline, vessel_mask=None)
-        # Lazily compute Frangi vesselness if it's enabled in config but the
-        # caller didn't provide it. The dataloader doesn't supply this field,
-        # so this keeps the env self-sufficient. One frangi() per sample load.
         env_cfg = self.config.get('environment', {})
         if vesselness is None and env_cfg.get('use_vesselness', False):
             from skimage.filters import frangi
 
             gray = image[:, :, 1] if image.ndim == 3 else image
-            vesselness = frangi(
-                gray.astype(np.float64),
-                sigmas=np.linspace(1.0, 3.0, 5),
-                black_ridges=True,
-            ).astype(np.float32)
+            vesselness = frangi(gray.astype(np.float64), sigmas=np.linspace(1.0, 3.0, 5), black_ridges=True).astype(np.float32)
         self.vesselness = vesselness
-        # Lazily compute UNet prior if enabled but not supplied. Called once
-        # per sample load — the predictor caches the model itself.
+        # Lazily compute the UNet prior once per sample (the predictor caches the model).
         if unet_prior is None and env_cfg.get('use_unet_prior', False):
-            from data.dataloader import (
-                compute_unet_prior,
-            )
+            from data.dataloader import compute_unet_prior
 
             unet_prior = compute_unet_prior(image)
         self.unet_prior = unet_prior
@@ -248,22 +188,10 @@ class VesselTracingEnv(gym.Env):
         self.fov_mask = fov_mask if fov_mask is not None else np.ones_like(centerline)
         self.height, self.width = image.shape[:2]
 
-        # Use precomputed if provided, else fall back to computing
-        self.vessel_orientation = (
-            vessel_orientation
-            if vessel_orientation is not None
-            else self.observation_builder.compute_vessel_orientation(image)
-        )
+        self.vessel_orientation = vessel_orientation if vessel_orientation is not None else self.observation_builder.compute_vessel_orientation(image)
 
-        # Predicted priors — single source of truth for the agent's
-        # observation channels. Lazy-compute via the frozen UNet when the
-        # dataloader didn't pre-supply them. Hard-fail if the UNet is
-        # unavailable; falling back to GT here would silently re-introduce
-        # the leakage this code path exists to prevent.
         if pred_centerline is None or pred_distance_transform is None or pred_dt_gradient is None:
-            from data.dataloader import (
-                compute_predicted_priors,
-            )
+            from data.dataloader import compute_predicted_priors
 
             bundle = compute_predicted_priors(image, self.tolerance)
             if bundle is None:
@@ -282,28 +210,23 @@ class VesselTracingEnv(gym.Env):
                 pred_distance_transform = bundle['distance_transform']
             if pred_dt_gradient is None:
                 pred_dt_gradient = bundle['dt_gradient']
-            # If unet_prior was requested but not supplied separately, reuse
-            # the probability map we just computed — no second UNet pass.
+            # Reuse the just-computed probability map for unet_prior — no second UNet pass.
             if self.unet_prior is None and env_cfg.get('use_unet_prior', False):
                 self.unet_prior = bundle['unet_prior']
 
         self.pred_centerline = pred_centerline
         self.pred_distance_transform = pred_distance_transform
         self.pred_dt_gradient = pred_dt_gradient
-        # Unclipped distance to the predicted ridge for leak-free off-track
-        # termination (see step()). Computed once per sample.
+        # Unclipped distance to the predicted ridge for leak-free off-track termination
+        # (step()); computed once per sample.
         if pred_centerline is not None:
-            from scipy.ndimage import (
-                distance_transform_edt,
-            )
+            from scipy.ndimage import distance_transform_edt
 
             self._offtrack_dt = distance_transform_edt(np.asarray(pred_centerline) <= 0).astype(np.float32)
         else:
             self._offtrack_dt = None
-        # ``self.dt_gradient`` retained as an alias for the predicted gradient
-        # so the legacy fallback path in ``_get_observation`` (used when
-        # ``prepare_stacked_sources`` was not called) stays consistent with
-        # the non-leaking pipeline.
+        # Alias for the predicted gradient so the legacy fallback in _get_observation stays
+        # consistent with the non-leaking pipeline.
         self.dt_gradient = pred_dt_gradient
 
         self.observation_builder.prepare_stacked_sources(
@@ -315,41 +238,24 @@ class VesselTracingEnv(gym.Env):
             vesselness=self.vesselness,
         )
 
-        # Precompute predicted-skeleton junction pixels + their skeleton
-        # 8-neighbours for the topology-memory channels. Done once per
-        # episode so per-step lookup stays O(1).
+        # Precompute predicted-skeleton junctions + their 8-neighbours once per sample so
+        # per-step topology-memory lookups stay O(1).
         if self.use_topology_memory:
             self._predicted_junction_pixels = self._extract_junction_pixels(pred_centerline)
-            self._junction_neighbours = {
-                (y, x): self._skeleton_neighbours(pred_centerline, y, x)
-                for (
-                    y,
-                    x,
-                ) in self._predicted_junction_pixels
-            }
+            self._junction_neighbours = {(y, x): self._skeleton_neighbours(pred_centerline, y, x) for (y, x) in self._predicted_junction_pixels}
         else:
             self._predicted_junction_pixels = []
             self._junction_neighbours = {}
 
-    def reset(
-        self,
-        seed=None,
-        start_position=None,
-        **kwargs,
-    ):
+    def reset(self, seed=None, start_position=None, **kwargs):
+        """Start a new episode at ``start_position`` (or a sampled seed) and return ``(obs, info)``."""
         super().reset(seed=seed)
 
         if self.image is None:
             raise ValueError('No image data set. Call set_data() first.')
 
-        self.visited_mask = np.zeros(
-            (self.height, self.width),
-            dtype=np.float32,
-        )
-        self.trajectory_mask = np.zeros(
-            (self.height, self.width),
-            dtype=np.float32,
-        )
+        self.visited_mask = np.zeros((self.height, self.width), dtype=np.float32)
+        self.trajectory_mask = np.zeros((self.height, self.width), dtype=np.float32)
         self.trajectory = []
         self.step_count = 0
         self.off_track_streak = 0
@@ -374,61 +280,38 @@ class VesselTracingEnv(gym.Env):
         self._update_frontier_mask()
         if self.use_topology_memory:
             self._maybe_register_junction()
-        # F3 / H6 — initialise uncovered-centerline DT. Used by F3 shaping
-        # (potential field) and H6 progress (tangent-sign disambiguation).
-        # Refreshed every _uncov_dt_refresh steps in step().
+        # Initialise uncovered-centerline DT for F3 shaping / H6 progress; refreshed
+        # every _uncov_dt_refresh steps in step().
         if self._needs_uncov_dt:
             self._refresh_uncov_dt()
         else:
             self._uncov_dt = None
         self._steps_since_uncov_refresh = 0
 
-        return (
-            self._get_observation(),
-            self._get_info(),
-        )
+        return (self._get_observation(), self._get_info())
 
     def _refresh_uncov_dt(self) -> None:
-        """Recompute distance-to-nearest-uncovered-centerline-pixel.
+        """Recompute distance to the nearest uncovered GT-centerline pixel.
 
-        Uncovered = GT centerline ∧ ¬covered_centerline. When everything is
-        covered, returns a large constant so the potential function stays
-        well-defined (shaping reward goes to ~0).
+        Uncovered = GT centerline ∧ ¬covered. When nothing is left, fills a large constant so
+        min(D, τ) = τ everywhere and the shaping term cancels.
         """
-        from scipy.ndimage import (
-            distance_transform_edt,
-        )
+        from scipy.ndimage import distance_transform_edt
 
         uncovered = (self.centerline > 0) & (self.covered_centerline == 0)
         if not uncovered.any():
-            # Nothing left to cover — set DT to a large constant so
-            # min(D, τ) = τ everywhere and the shaping term cancels out.
             big = float(max(self.height, self.width))
-            self._uncov_dt = np.full(
-                (self.height, self.width),
-                big,
-                dtype=np.float32,
-            )
+            self._uncov_dt = np.full((self.height, self.width), big, dtype=np.float32)
             return
-        # distance_transform_edt expects 1 = background, 0 = foreground;
-        # the result at each pixel is the distance to the nearest
-        # foreground (uncovered) pixel.
+        # distance_transform_edt measures distance to the nearest zero, so invert the mask.
         self._uncov_dt = distance_transform_edt(~uncovered).astype(np.float32)
 
     def _compute_progress_cos(self, prev_pos, new_pos) -> Optional[float]:
-        """Signed cosine between the agent's step vector and the local
-        forward-tangent at its new position.
+        """Return the signed cosine between the step vector and the toward-uncovered tangent.
 
-        forward_tangent = ``vessel_orientation[new_pos]`` (same field
-        ``_action_to_world_displacement`` uses for tangent-relative actions,
-        so "forward" here means the same thing action 0 means: world-frame
-        displacement when the agent takes the canonical-forward action).
-        We sign-flip the tangent if moving in its direction would
-        increase distance to uncovered work, so progress is positive iff
-        the agent committed to the toward-uncovered direction.
-
-        Returns ``None`` when uncov_dt / vessel_orientation isn't available
-        or the step vector is zero — callers treat None as no signal.
+        The structure-tensor tangent at ``new_pos`` is sign-flipped (by probing uncov_dt at
+        new_pos ± tangent) so positive means the agent committed toward uncovered work.
+        Returns None when uncov_dt / vessel_orientation is unavailable or the step is zero.
         """
         if self._uncov_dt is None or self.vessel_orientation is None:
             return None
@@ -443,12 +326,8 @@ class VesselTracingEnv(gym.Env):
         tx = float(tx)
         tmag = (ty * ty + tx * tx) ** 0.5
         if tmag < 1e-6:
-            return 0.0  # Degenerate tangent (e.g. low-contrast region)
-        # Sign-align by probing uncov_dt at new_pos ± (ty, tx). This is
-        # convention-agnostic w.r.t. how vessel_orientation labels its
-        # components, because we use the tangent the same way the action
-        # rotation does: as a displacement. Whichever sign of (ty, tx)
-        # lands on a smaller uncov_dt is the toward-uncovered direction.
+            return 0.0  # degenerate tangent (e.g. low-contrast region)
+        # Whichever sign of (ty, tx) lands on a smaller uncov_dt is toward-uncovered.
         h, w = self._uncov_dt.shape
         yp = max(0, min(h - 1, int(round(y + ty))))
         xp = max(0, min(w - 1, int(round(x + tx))))
@@ -458,34 +337,22 @@ class VesselTracingEnv(gym.Env):
             ty, tx = -ty, -tx
         return (dy * ty + dx * tx) / (step_mag * tmag)
 
-    def _sample_start_position(
-        self,
-    ) -> np.ndarray:
+    def _sample_start_position(self) -> np.ndarray:
+        """Pick an episode seed: ~50% GT endpoints, ~50% arbitrary centerline pixels.
+
+        The mix matches the inference seed distribution so mid-vessel/junction starts aren't
+        out-of-distribution. Falls back to an FOV pixel, then image centre, when no centerline.
+        """
         centerline_points = np.argwhere(self.centerline > 0)
         if len(centerline_points) == 0:
             fov_points = np.argwhere(self.fov_mask > 0)
             if len(fov_points) == 0:
-                return np.array(
-                    [
-                        self.height // 2,
-                        self.width // 2,
-                    ]
-                )
+                return np.array([self.height // 2, self.width // 2])
             idx = self.np_random.integers(len(fov_points))
             return fov_points[idx]
-        # Train/inference seed-distribution match.  Training previously
-        # ALWAYS started at a centerline endpoint, but the seed detector
-        # (frontier_tracer) seeds anywhere on the tree — interior segments
-        # and junctions included.  A policy that only ever saw endpoint
-        # starts treats a mid-vessel/junction seed as out-of-distribution
-        # and (post-collapse) just emits STOP → empty trace at a valid
-        # vessel pixel, exactly the observed failure.  Sample a mix:
-        # ~50% endpoint starts (clean leaf-to-root traces, good for the
-        # imitation-aligned behaviour) and ~50% arbitrary interior
-        # centerline pixels (matches inference seeds).
-        from data.centerline_extraction import (
-            CenterlineExtractor,
-        )
+        # ~50% endpoint starts (clean leaf-to-root traces), ~50% interior pixels (matches the
+        # seed detector, which seeds segments and junctions, not just endpoints).
+        from data.centerline_extraction import CenterlineExtractor
 
         extractor = CenterlineExtractor()
         endpoints = extractor._find_endpoints(self.centerline)
@@ -496,29 +363,22 @@ class VesselTracingEnv(gym.Env):
         return centerline_points[idx]
 
     def step(self, action: int):
+        """Apply one action and return ``(obs, reward, terminated, truncated, info)``.
+
+        Action 8 is STOP (scored by terminal F-β). Otherwise the agent moves one step_size
+        step; the episode also ends on out-of-bounds, an off-track streak, or max-steps. One
+        ``on_vessel`` decision (per ``on_vessel_signal``) drives both off-track termination
+        and the reward's on/off-track gating.
+        """
         self.step_count += 1
 
-        # ─── Explicit STOP action ─────────────────────────────────────────
+        # Explicit STOP action.
         if action == self.STOP_ACTION:
             f_beta = self._compute_fbeta()
             pos = np.array(self.position)
-            dist = float(
-                self.distance_transform[
-                    self.position[0],
-                    self.position[1],
-                ]
-            )
+            dist = float(self.distance_transform[self.position[0], self.position[1]])
             cov_ratio = self.covered_centerline.sum() / max(self.centerline.sum(), 1.0)
-            udist = (
-                float(
-                    self._uncov_dt[
-                        self.position[0],
-                        self.position[1],
-                    ]
-                )
-                if self._uncov_dt is not None
-                else None
-            )
+            udist = float(self._uncov_dt[self.position[0], self.position[1]]) if self._uncov_dt is not None else None
             state = RewardState(
                 is_terminal=True,
                 terminal_reason='stop',
@@ -540,27 +400,17 @@ class VesselTracingEnv(gym.Env):
             info['stopped'] = True
             info['episode_f1'] = float(f_beta)
             info['terminal_reason'] = 'stop'
-            return (
-                self._get_observation(),
-                reward,
-                True,
-                False,
-                info,
-            )
+            return (self._get_observation(), reward, True, False, info)
 
-        # ─── Movement ────────────────────────────────────────────────────────
+        # Movement.
         prev_pos = np.array(self.position)
         prev_distance = float(self.distance_transform[self.position[0], self.position[1]])
-        # F3 — snapshot uncovered-DT at PREV position with the current
-        # _uncov_dt; refresh after coverage update so within-step shaping
-        # uses a single frozen potential field (Ng & Russell consistency).
+        # Snapshot uncovered-DT at the prev position before the coverage update, so the whole
+        # step shapes against one frozen potential field (Ng & Russell consistency).
         prev_uncov_dist = float(self._uncov_dt[prev_pos[0], prev_pos[1]]) if self._uncov_dt is not None else None
 
-        # Tangent-relative action: rotate the canonical 8-dir grid so action
-        # 0 ("forward") points along the local vessel tangent, with sign
-        # disambiguated by the previous move. The resulting world-frame
-        # displacement is then applied as a normal step (with optional
-        # momentum blending).
+        # Resolve the action to a world-frame displacement (rotated into the tangent frame
+        # when tangent_relative_actions is on), then apply with optional momentum blending.
         raw_direction = self._action_to_world_displacement(action)
 
         if self.momentum > 0 and self._momentum_vec is not None:
@@ -574,16 +424,13 @@ class VesselTracingEnv(gym.Env):
             norm = np.linalg.norm(raw_direction)
             self._momentum_vec = raw_direction / (norm + 1e-8) if norm > 0 else None
 
-        # Cache the world-frame movement direction for the *next* step's
-        # tangent sign alignment.
+        # Cache the world-frame move direction for the next step's tangent sign alignment.
         rn = float(np.linalg.norm(raw_direction))
         if rn > 0:
             self._prev_world_vec = raw_direction / rn
 
-        # ─── Out of bounds ───────────────────────────────────────────────────
-        # v11 REVERTED: crediting on-vessel boundary exits with their F-β made
-        # OOB a cheap episode-ender and the policy bailed to the FOV edge
-        # (term_oob_frac 0.28→0.43, recall ↓). Back to the flat-penalty form.
+        # Out of bounds: flat penalty (crediting on-vessel boundary exits made OOB a cheap
+        # episode-ender; v11 experiment reverted).
         if not self._is_valid_position(new_position):
             state = RewardState(
                 is_terminal=True,
@@ -603,15 +450,9 @@ class VesselTracingEnv(gym.Env):
             info = self._get_info()
             info.update(bd)
             info['terminal_reason'] = 'oob'
-            return (
-                self._get_observation(),
-                reward,
-                True,
-                False,
-                info,
-            )
+            return (self._get_observation(), reward, True, False, info)
 
-        # ─── Apply move ──────────────────────────────────────────────────────
+        # Apply the move.
         self.position = new_position
 
         is_revisit = self.visited_mask[self.position[0], self.position[1]] > 0
@@ -622,43 +463,23 @@ class VesselTracingEnv(gym.Env):
             self._maybe_register_junction()
 
         gt_distance = float(self.distance_transform[self.position[0], self.position[1]])
-        # Predicted-ridge distance (unclipped) — leak-free; used for centring
-        # (r_near / shaping) and the predicted_ridge on-vessel signal.
-        pred_ridge_dist = (
-            float(
-                self._offtrack_dt[
-                    self.position[0],
-                    self.position[1],
-                ]
-            )
-            if self._offtrack_dt is not None
-            else gt_distance
-        )
-        reward_prev_distance = (
-            float(self._offtrack_dt[prev_pos[0], prev_pos[1]]) if self._offtrack_dt is not None else prev_distance
-        )
+        # Unclipped predicted-ridge distance (leak-free) for centring and the
+        # predicted_ridge on-vessel signal.
+        pred_ridge_dist = float(self._offtrack_dt[self.position[0], self.position[1]]) if self._offtrack_dt is not None else gt_distance
+        reward_prev_distance = float(self._offtrack_dt[prev_pos[0], prev_pos[1]]) if self._offtrack_dt is not None else prev_distance
         # Soft UNet vesselness at the current pixel (dense vessel evidence).
-        vness = (
-            float(
-                self.unet_prior[
-                    self.position[0],
-                    self.position[1],
-                ]
-            )
-            if self.unet_prior is not None
-            else None
-        )
+        vness = float(self.unet_prior[self.position[0], self.position[1]]) if self.unet_prior is not None else None
 
-        # ONE "on a vessel?" decision drives BOTH termination and reward gating
-        # so they never conflict (the v9 failure). All leak-free except "gt".
+        # ONE on-vessel decision drives BOTH termination and reward gating so they can't
+        # conflict (the v9 failure). All signals leak-free except "gt".
         if self._on_vessel_signal == 'vesselness' and vness is not None:
             on_vessel = vness >= self._vesselness_tau
         elif self._on_vessel_signal == 'gt':
             on_vessel = gt_distance <= self.tolerance
-        else:  # "predicted_ridge" (also the vesselness fallback if unet_prior absent)
+        else:  # "predicted_ridge" (also the vesselness fallback when unet_prior is absent)
             on_vessel = pred_ridge_dist <= self.tolerance
 
-        # Reward geometry: gate on `on_vessel`, centre on the predicted ridge.
+        # Gate reward on on_vessel, centre it on the predicted ridge.
         is_on_track = on_vessel
         reward_distance = pred_ridge_dist
 
@@ -677,16 +498,12 @@ class VesselTracingEnv(gym.Env):
         total_gt = max(float(self.centerline.sum()), 1.0)
         prev_coverage_sum = self.covered_centerline.sum()
         prev_coverage_ratio = prev_coverage_sum / total_gt
-        # Track thickness-weighted accumulator for the reward signal; the
-        # raw count (covered_centerline.sum()) is still used for the coverage
-        # ratio reported in info / used by curriculum success criterion.
+        # Reward uses the thickness-weighted accumulator delta; the binary count drives the
+        # coverage ratio reported in info / used by the curriculum success criterion.
         prev_weighted_sum = self._covered_weight_sum
-        # Stage B1: query frontier BEFORE coverage update — at this point
-        # `_frontier_mask` reflects last step's frontier and we want to know
-        # if the agent's NEW position lands on it.
-        is_on_frontier = bool(
-            self._frontier_mask is not None and self._frontier_mask[self.position[0], self.position[1]]
-        )
+        # Stage B1: query the frontier BEFORE the coverage update — _frontier_mask still
+        # reflects last step, and we want to know if the NEW position lands on it.
+        is_on_frontier = bool(self._frontier_mask is not None and self._frontier_mask[self.position[0], self.position[1]])
         self._update_coverage()
         self._update_frontier_mask()
         new_coverage = self._covered_weight_sum - prev_weighted_sum
@@ -694,8 +511,7 @@ class VesselTracingEnv(gym.Env):
 
         junction_val = self._junction_val_at(self.position)
 
-        # Double off-track limit at junction pixels so the agent can try a
-        # branch direction without immediate termination.
+        # Allow a longer off-track streak at junctions so the agent can probe a branch.
         effective_off_track = self.max_off_track * 2 if junction_val >= 0.8 else self.max_off_track
         terminated = self.off_track_streak >= effective_off_track
         truncated = self.step_count >= self.max_steps
@@ -706,24 +522,12 @@ class VesselTracingEnv(gym.Env):
             terminal_reason = 'off_track' if terminated else 'max_steps'
             f_beta = self._compute_fbeta()
 
-        # F3 — read NEW-position uncovered-DT against the same _uncov_dt
-        # used for prev_uncov_dist. Refresh happens AFTER reward is built so
-        # the within-step potential is consistent (Ng & Russell invariance).
-        new_uncov_dist = (
-            float(
-                self._uncov_dt[
-                    self.position[0],
-                    self.position[1],
-                ]
-            )
-            if self._uncov_dt is not None
-            else None
-        )
+        # New-position uncovered-DT against the same _uncov_dt as prev (refresh happens after
+        # the reward is built, for within-step potential consistency).
+        new_uncov_dist = float(self._uncov_dt[self.position[0], self.position[1]]) if self._uncov_dt is not None else None
 
-        # H6 — tangent-aligned progress signal. cos(step, forward_tangent)
-        # where forward_tangent points toward uncovered work. Closes the
-        # annulus-loiter exploit because perpendicular / reversing motion
-        # earn 0 / negative even when the agent stays on-track.
+        # H6 tangent-aligned progress; perpendicular/reversing motion earns 0/negative even
+        # on-track, closing the annulus-loiter exploit.
         progress_cos = self._compute_progress_cos(prev_pos, self.position)
 
         state = RewardState(
@@ -746,9 +550,8 @@ class VesselTracingEnv(gym.Env):
         )
 
         reward, bd = self.reward_calculator.compute(state)
-        # F3 — refresh _uncov_dt periodically so it stays in sync with
-        # coverage growth. Done AFTER reward computation so this step's
-        # shaping used a consistent potential field.
+        # Refresh _uncov_dt periodically to track coverage growth — after reward so this
+        # step used a consistent potential field.
         if self._needs_uncov_dt and self._uncov_dt is not None:
             self._steps_since_uncov_refresh += 1
             if self._steps_since_uncov_refresh >= self._uncov_dt_refresh:
@@ -760,95 +563,58 @@ class VesselTracingEnv(gym.Env):
         info.update(bd)
         if terminated or truncated:
             info['episode_f1'] = float(f_beta)
-            info['terminal_reason'] = terminal_reason  # "off_track" or "max_steps"
+            info['terminal_reason'] = terminal_reason
 
-        return (
-            self._get_observation(),
-            reward,
-            terminated,
-            truncated,
-            info,
-        )
+        return (self._get_observation(), reward, terminated, truncated, info)
 
     def _action_to_world_displacement(self, action: int) -> np.ndarray:
-        """Translate a discrete action into a world-frame displacement vector
-        (scaled by ``self.step_size``).
+        """Translate a discrete action into a world-frame displacement scaled by ``step_size``.
 
-        When ``tangent_relative_actions`` is True (default), the canonical
-        direction ``DIRECTIONS[action]`` is rotated so that action 0 points
-        along the local vessel tangent. When False, the action is executed
-        in pure world frame (action 0 = canonical N regardless of vessel
-        orientation) — matches the imitation expert's frame.
+        With ``tangent_relative_actions`` (default), ``DIRECTIONS[action]`` is rotated so
+        action 0 points along the local vessel tangent; otherwise it executes in pure world
+        frame (action 0 = canonical N), matching the imitation expert's frame.
         """
         base = self.DIRECTIONS[action].astype(np.float64) * self.step_size
         if not self.tangent_relative_actions:
             return base
-        ty, tx = self._tangent_aligned_at(
-            int(self.position[0]),
-            int(self.position[1]),
-            reference=self._prev_world_vec,
-        )
-        # Rotation matrix R with R @ (-1, 0) = (ty, tx) sends DIRECTIONS[action]
-        # from the canonical frame to the tangent frame.
+        ty, tx = self._tangent_aligned_at(int(self.position[0]), int(self.position[1]), reference=self._prev_world_vec)
+        # Rotation R with R @ (-1, 0) = (ty, tx) maps the canonical frame to the tangent frame.
         dy, dx = float(base[0]), float(base[1])
         new_dy = -ty * dy + tx * dx
         new_dx = -tx * dy - ty * dx
         return np.array([new_dy, new_dx], dtype=np.float64)
 
-    def _tangent_aligned_at(
-        self,
-        y: int,
-        x: int,
-        reference: Optional[np.ndarray] = None,
-    ) -> tuple:
-        """Return the local vessel tangent at (y, x), sign-aligned to a
-        reference direction (typically the agent's previous move).
+    def _tangent_aligned_at(self, y: int, x: int, reference: Optional[np.ndarray] = None) -> tuple:
+        """Return the local vessel tangent at (y, x), sign-aligned to ``reference``.
 
-        The structure-tensor tangent encodes an undirected line orientation
-        — its sign is arbitrary. The first step uses a default reference
-        ("image up") so the agent has a stable forward at episode start;
-        subsequent steps use the cached world-frame movement direction.
+        The structure-tensor tangent is an undirected orientation (arbitrary sign); the first
+        step aligns to image-up, later steps to the cached previous move. Falls back to the
+        reference axis on a degenerate (zero-magnitude) tangent.
         """
         ty, tx = self.vessel_orientation[y, x]
         ty = float(ty)
         tx = float(tx)
         if reference is None:
-            ref_y, ref_x = (
-                -1.0,
-                0.0,
-            )  # canonical "N" / image-up
+            ref_y, ref_x = (-1.0, 0.0)  # canonical "N" / image-up
         else:
-            ref_y, ref_x = (
-                float(reference[0]),
-                float(reference[1]),
-            )
+            ref_y, ref_x = (float(reference[0]), float(reference[1]))
         if ty * ref_y + tx * ref_x < 0.0:
             ty, tx = -ty, -tx
-        # Degenerate tangent (zero magnitude) — fall back to the reference
-        # itself so the agent still has a usable forward axis.
         mag = (ty * ty + tx * tx) ** 0.5
         if mag < 1e-6:
             return -1.0, 0.0
         return ty / mag, tx / mag
 
-    # ─── Topology memory (P1b) ──────────────────────────────────────────────
-
     @staticmethod
-    def _extract_junction_pixels(
-        skeleton: np.ndarray,
-    ) -> list:
-        """Skeleton pixels with >= 3 8-neighbours on the skeleton."""
-        from data.centerline_extraction import (
-            CenterlineExtractor,
-        )
+    def _extract_junction_pixels(skeleton: np.ndarray) -> list:
+        """Return skeleton pixels with >= 3 skeleton 8-neighbours (junctions)."""
+        from data.centerline_extraction import CenterlineExtractor
 
         return CenterlineExtractor()._find_junctions(skeleton)
 
     @staticmethod
     def _skeleton_neighbours(skeleton: np.ndarray, y: int, x: int) -> list:
-        """8-neighbour skeleton pixels of (y, x) — used as candidate branch
-        entry points when scoring "branches remaining at this junction".
-        """
+        """Return the skeleton 8-neighbours of (y, x) (candidate branch entries at a junction)."""
         H, W = skeleton.shape
         out = []
         for dy in (-1, 0, 1):
@@ -861,53 +627,34 @@ class VesselTracingEnv(gym.Env):
         return out
 
     def _maybe_register_junction(self, radius: int = 3) -> None:
-        """If the agent has landed within ``radius`` of a predicted-skeleton
-        junction, append that junction to the visited list (deduped).
-        """
+        """Record the nearest predicted-skeleton junction within ``radius`` as most-recently visited."""
         if not self._predicted_junction_pixels:
             return
-        y, x = (
-            int(self.position[0]),
-            int(self.position[1]),
-        )
-        # Scan junctions in radius (cheap: typically ~50 junctions per image).
-        for (
-            jy,
-            jx,
-        ) in self._predicted_junction_pixels:
+        y, x = (int(self.position[0]), int(self.position[1]))
+        for jy, jx in self._predicted_junction_pixels:
             if abs(jy - y) <= radius and abs(jx - x) <= radius:
                 key = (jy, jx)
                 if key not in self._visited_junctions:
                     self._visited_junctions.append(key)
-                # Always promote to "most recent" so the topology channels
-                # reflect the junction the agent is currently working on.
+                # Promote to most-recent so topology channels track the active junction.
                 elif self._visited_junctions[-1] != key:
                     self._visited_junctions.remove(key)
                     self._visited_junctions.append(key)
                 break
 
     def _topology_features(self) -> tuple:
-        """Return ``(normalised_distance, branches_remaining)`` scalars.
+        """Return ``(normalised_distance, branches_remaining)`` topology-memory scalars.
 
-        ``normalised_distance``  : Euclidean distance from the current
-            position to the most recently visited junction, divided by
-            ``obs_size`` and clipped to [0, 1]. 1.0 if no junction visited.
-        ``branches_remaining``   : count of the last junction's 8-skeleton
-            neighbours that the agent has not yet stepped on, divided by 8
-            so the channel sits in [0, 1]. 0.0 if no junction visited.
+        ``normalised_distance``: distance to the most recent junction / obs_size, clipped to
+        [0, 1] (1.0 if none visited). ``branches_remaining``: that junction's unvisited
+        skeleton-neighbour count / 8 (0.0 if none visited).
         """
         if not self.use_topology_memory or not self._visited_junctions:
             return 1.0, 0.0
         ly, lx = self._visited_junctions[-1]
-        py, px = (
-            float(self.position[0]),
-            float(self.position[1]),
-        )
+        py, px = (float(self.position[0]), float(self.position[1]))
         dist = ((py - ly) ** 2 + (px - lx) ** 2) ** 0.5
-        normalised = min(
-            1.0,
-            dist / max(float(self.obs_size), 1.0),
-        )
+        normalised = min(1.0, dist / max(float(self.obs_size), 1.0))
         nbrs = self._junction_neighbours.get((ly, lx), [])
         if not nbrs:
             return normalised, 0.0
@@ -915,74 +662,44 @@ class VesselTracingEnv(gym.Env):
         return normalised, unvisited / 8.0
 
     def _compute_fbeta(self) -> float:
-        """Marginal F-β contribution of the *current* episode.
+        """Return the current episode's MARGINAL F-β contribution.
 
-        Returns ``f_beta(prior ∪ current) − f_beta(prior_alone)`` when prior
-        coverage is present; otherwise plain ``f_beta(current)``.
-
-        Why marginal, not cumulative
-        ----------------------------
-        An earlier version of this method returned cumulative F-β on the
-        union, with the rationale that a single trace covers <1% of the
-        retinal tree so single-episode F-β is too small to provide a
-        learning gradient. That rationale is right, but the implementation
-        had a perverse-incentive bug: a STOP-immediately episode kept the
-        cumulative high (it had been built up by previous episodes) and
-        therefore got POSITIVE terminal reward despite contributing
-        nothing — STOP-fast-and-free-ride became optimal. With the GT-DT
-        signal removed (P0), per-step coverage gains shrank, the
-        free-ride premium dominated, and the policy collapsed to STOP at
-        step ~17 with 0.3% coverage.
-
-        Marginal F-β fixes this: an episode that adds no coverage earns
-        zero terminal reward (so the early_stop_penalty bites unopposed);
-        an episode that legitimately extends the cumulative trace earns
-        the delta. The agent still has gradient toward longer traces —
-        more new coverage = bigger delta — while the free-ride loophole
-        is closed.
+        ``f_beta(prior ∪ current) − f_beta(prior)`` when prior coverage exists, else plain
+        ``f_beta(current)``. Marginal (not cumulative) so a STOP-immediately episode that adds
+        nothing earns zero terminal reward — closing the cumulative "free-ride" loophole that
+        previously let STOP-fast become optimal after the GT-DT signal was removed.
         """
         if self.prior_coverage is not None:
-            cumulative = np.where(
-                (self.covered_centerline > 0) | (self.prior_coverage > 0),
-                1.0,
-                0.0,
-            ).astype(np.float32)
+            cumulative = np.where((self.covered_centerline > 0) | (self.prior_coverage > 0), 1.0, 0.0).astype(np.float32)
             return self._fbeta_on(cumulative) - self._fbeta_on(self.prior_coverage)
         return self._fbeta_on(self.covered_centerline)
 
     def _fbeta_on(self, covered_mask: np.ndarray) -> float:
-        """β-weighted F-score between ``covered_mask`` and ``self.centerline``.
+        """Return the tolerance-aware β-weighted F-score between ``covered_mask`` and the GT centerline.
 
-        Tolerance-aware (matches ``compute_centerline_f1``); β² is read from
-        ``config['reward']['terminal_recall_beta_sq']`` (default 4 → recall
-        weighted 4× over precision). Returns 0.0 when ``covered_mask`` is
-        empty so callers can use it as a baseline for marginal computations.
+        β² (``config['reward']['terminal_recall_beta_sq']``, default 4) weights recall over
+        precision. Returns 0.0 for an empty mask so it can baseline marginal computations.
         """
         if covered_mask is None or not np.any(covered_mask):
             return 0.0
-        from data.centerline_extraction import (
-            compute_centerline_f1,
-        )
+        from data.centerline_extraction import compute_centerline_f1
 
         rc = self.config.get('reward', {})
         beta_sq = float(rc.get('terminal_recall_beta_sq', 4.0))
-        metrics = compute_centerline_f1(
-            covered_mask,
-            self.centerline,
-            tolerance=self.tolerance,
-        )
+        metrics = compute_centerline_f1(covered_mask, self.centerline, tolerance=self.tolerance)
         recall = metrics['recall']
         precision = metrics['precision']
         denom = beta_sq * precision + recall
         return (1.0 + beta_sq) * precision * recall / denom if denom > 0 else 0.0
 
     def _junction_val_at(self, position) -> float:
-        """Return junction-map value at the given position (0.0 if not built)."""
+        """Return the junction-map value at ``position`` (0.0 if the map isn't built)."""
         if self.observation_builder.junction_map is not None:
             return float(self.observation_builder.junction_map[position[0], position[1]])
         return 0.0
 
     def _is_valid_position(self, position):
+        """Return True if ``position`` is inside the FOV and leaves a full observation-window margin."""
         y, x = position
         half = self.obs_size // 2
         if y < half or y >= self.height - half:
@@ -994,17 +711,11 @@ class VesselTracingEnv(gym.Env):
         return True
 
     def _build_centerline_weight_map(self, centerline, vessel_mask):
-        """Build per-pixel thickness weights for centerline pixels.
+        """Build per-pixel thickness weights for centerline pixels (thin vessels weighted up).
 
-        For each centerline pixel p:
-          inward_radius(p) = distance_transform_edt(vessel_mask)[p]
-          local_width(p)   = 2 * max(inward_radius(p), 1.0)
-          weight(p)        = clip(1.0 / sqrt(local_width(p) / W_REF), 0.7, 1.6)
-                             where W_REF = median local_width across centerline
-                             pixels.  Mean weight ≈ 1.0 → preserves total reward
-                             scale.  Off-centerline pixels get weight 0.
-
-        Falls back to uniform weight=1.0 if vessel_mask is unavailable.
+        Each centerline pixel's weight is clip(1/sqrt(local_width / median_width), 0.7, 1.6),
+        renormalised to mean 1.0 so total reward scale is preserved; off-centerline pixels get
+        0. Falls back to uniform weight 1.0 when ``vessel_mask`` is unavailable.
         """
         H, W = centerline.shape
         weight_map = np.zeros((H, W), dtype=np.float32)
@@ -1015,9 +726,7 @@ class VesselTracingEnv(gym.Env):
             weight_map[cl_mask] = 1.0
             return weight_map
 
-        from scipy.ndimage import (
-            distance_transform_edt,
-        )
+        from scipy.ndimage import distance_transform_edt
 
         vbin = (vessel_mask > 0).astype(np.uint8)
         inward = distance_transform_edt(vbin).astype(np.float32)
@@ -1029,8 +738,7 @@ class VesselTracingEnv(gym.Env):
             w_ref = 1.0
         raw_weight = 1.0 / np.sqrt(local_width / w_ref)
         raw_weight = np.clip(raw_weight, 0.7, 1.6)
-        # Re-normalise so mean = 1.0 across centerline pixels (preserves
-        # total episode-reward scale even after clipping)
+        # Renormalise to mean 1.0 so clipping doesn't change total episode-reward scale.
         mean_w = float(raw_weight.mean())
         if mean_w > 0:
             raw_weight /= mean_w
@@ -1038,10 +746,14 @@ class VesselTracingEnv(gym.Env):
         return weight_map
 
     def _update_coverage(self):
+        """Mark GT centerline pixels within the tolerance disk of the position as covered.
+
+        Updates both the binary ``covered_centerline`` (coverage ratio / F-β) and the
+        thickness-weighted accumulator the reward's coverage term reads.
+        """
         y, x = self.position
         h = self._cov_half
 
-        # Image-space bounds
         y_min = max(0, y - h)
         y_max = min(self.height, y + h + 1)
         x_min = max(0, x - h)
@@ -1051,7 +763,7 @@ class VesselTracingEnv(gym.Env):
         if not patch.any():
             return
 
-        # Slice the precomputed template to match boundary clipping
+        # Slice the disk template to the same boundary clipping as the image patch.
         ty_min = y_min - (y - h)
         ty_max = ty_min + (y_max - y_min)
         tx_min = x_min - (x - h)
@@ -1061,38 +773,20 @@ class VesselTracingEnv(gym.Env):
         prev_patch = self.covered_centerline[y_min:y_max, x_min:x_max]
         newly_covered = within & (patch > 0) & (prev_patch == 0)
 
-        # Update binary covered_centerline (used for F_β and coverage ratio)
         self.covered_centerline[y_min:y_max, x_min:x_max] = np.where(within & (patch > 0), 1.0, prev_patch)
 
-        # Update weighted accumulator: each newly-covered centerline pixel
-        # contributes its thickness weight. The reward uses the delta of this
-        # accumulator (not the binary count) so thin-vessel coverage gets
-        # ~1.6× the per-pixel reward of thick-trunk coverage.
+        # Each newly-covered pixel adds its thickness weight; the reward reads this
+        # accumulator's delta so thin-vessel coverage earns ~1.6× thick-trunk coverage.
         if newly_covered.any():
             weight_patch = self.centerline_weight_map[y_min:y_max, x_min:x_max]
             self._covered_weight_sum += float(weight_patch[newly_covered].sum())
 
     def _update_frontier_mask(self):
-        """Recompute the Stage B1 frontier mask from current visit history.
+        """Recompute the Stage B1 frontier: unvisited GT centerline pixels one step from a visited pixel.
 
-        frontier = dilate(visited_mask, step_size, 8-conn) ∧ centerline ∧ ¬visited_mask
-
-        i.e. unvisited GT centerline pixels REACHABLE IN ONE STEP from a pixel
-        the agent has already stepped on.  Defined w.r.t. the actual visit
-        history rather than the inflated ``covered_centerline`` (tolerance
-        disk), so the agent can actually land on frontier pixels — under
-        tolerance=2 coverage with step_size=1 the agent's position is
-        always inside its own coverage disk, so a coverage-based frontier
-        never fires.  ``visited_mask`` (rather than ``trajectory_mask``)
-        is used because it includes the start position set in reset().
-
-        The dilation radius MUST match ``step_size``: each step moves the
-        agent up to ``step_size`` px per axis (DIRECTIONS · step_size), so a
-        fixed 1-px band made ``is_on_frontier`` literally unsatisfiable at
-        step_size=2 — the agent always lands ≥2 px from its last visited pixel,
-        outside a 1-px band, so r_frontier was identically 0 for the whole v10
-        run.  Dilating by ``step_size`` puts the band exactly where the agent
-        can land next.
+        ``dilate(visited_mask, step_size) ∧ centerline ∧ ¬visited_mask``. Defined on the
+        visit history (not the tolerance-disk coverage, inside which the agent always sits)
+        and dilated by ``step_size`` so the band is exactly where the agent can land next.
         """
         from scipy.ndimage import binary_dilation
 
@@ -1100,23 +794,19 @@ class VesselTracingEnv(gym.Env):
         if not vis_bool.any():
             self._frontier_mask = np.zeros_like(self.centerline, dtype=bool)
             return
-        dilated = binary_dilation(
-            vis_bool,
-            structure=np.ones((3, 3), dtype=bool),
-            iterations=max(1, int(round(self.step_size))),
-        )
+        dilated = binary_dilation(vis_bool, structure=np.ones((3, 3), dtype=bool), iterations=max(1, int(round(self.step_size))))
         self._frontier_mask = dilated & (self.centerline > 0) & (~vis_bool)
 
     def _get_observation(self):
+        """Build the current observation from predicted priors + agent state."""
         return self.observation_builder.build(
             image=self.image,
             visited_mask=self.visited_mask,
             vesselness=self.vesselness,
             position=self.position,
             prev_direction=self.prev_direction,
-            # Observation fallback path uses PREDICTED priors — GT skeleton
-            # / DT stay on self.centerline / self.distance_transform for
-            # the reward path only.
+            # Observation uses PREDICTED priors; GT skeleton/DT stay on self.centerline /
+            # self.distance_transform for the reward path only.
             distance_transform=self.pred_distance_transform,
             centerline=self.pred_centerline,
             vessel_orientation=self.vessel_orientation,
@@ -1128,6 +818,7 @@ class VesselTracingEnv(gym.Env):
         )
 
     def _get_info(self):
+        """Assemble the per-step info dict (position, coverage ratio, precision, …)."""
         total = self.centerline.sum()
         covered = self.covered_centerline.sum()
         info = {
@@ -1139,7 +830,7 @@ class VesselTracingEnv(gym.Env):
             'covered_pixels': int(covered),
             'total_centerline_pixels': int(total),
         }
-        # Precision: fraction of unique visited positions that were on-track
+        # Precision: fraction of unique visited positions that were on-track.
         if self._total_visited > 0:
             info['precision'] = self._total_visited_on_track / self._total_visited
         else:
@@ -1147,30 +838,22 @@ class VesselTracingEnv(gym.Env):
         return info
 
     def render(self):
+        """Return an RGB debug image: GT centerline (red), covered (green), trajectory (blue), agent (yellow)."""
         vis = (self.image.copy() * 255).astype(np.uint8)
         vis[self.centerline > 0] = [0, 0, 255]
-        vis[self.covered_centerline > 0] = [
-            0,
-            255,
-            0,
-        ]
+        vis[self.covered_centerline > 0] = [0, 255, 0]
         for y, x in self.trajectory:
-            vis[
-                max(0, y - 1) : min(self.height, y + 2),
-                max(0, x - 1) : min(self.width, x + 2),
-            ] = [255, 0, 0]
+            vis[max(0, y - 1) : min(self.height, y + 2), max(0, x - 1) : min(self.width, x + 2)] = [255, 0, 0]
         y, x = self.position
-        vis[
-            max(0, y - 2) : min(self.height, y + 3),
-            max(0, x - 2) : min(self.width, x + 3),
-        ] = [255, 255, 0]
+        vis[max(0, y - 2) : min(self.height, y + 3), max(0, x - 2) : min(self.width, x + 3)] = [255, 255, 0]
         return vis
 
 
 class VectorizedVesselEnv:
-    """Vectorized environment for parallel training."""
+    """In-process vectorized wrapper running several VesselTracingEnv instances for training."""
 
     def __init__(self, config, num_envs=8, dataset=None):
+        """Create ``num_envs`` in-process VesselTracingEnv instances over ``dataset``."""
         self.config = config
         self.num_envs = num_envs
         self.dataset = dataset
@@ -1178,7 +861,7 @@ class VectorizedVesselEnv:
         self.current_samples = [None] * num_envs
 
     def _apply_sample(self, env, sample):
-        """Unpack a dataset sample and call env.set_data()."""
+        """Unpack a dataset sample and call ``env.set_data()``."""
         env.set_data(
             image=sample['image'].permute(1, 2, 0).numpy(),
             centerline=sample['centerline'].squeeze().numpy(),
@@ -1188,55 +871,34 @@ class VectorizedVesselEnv:
             vessel_orientation=(sample['vessel_orientation'].numpy() if 'vessel_orientation' in sample else None),
             unet_prior=(sample['unet_prior'].squeeze(0).numpy() if 'unet_prior' in sample else None),
             pred_centerline=(sample['pred_centerline'].squeeze().numpy() if 'pred_centerline' in sample else None),
-            pred_distance_transform=(
-                sample['pred_distance_transform'].squeeze().numpy() if 'pred_distance_transform' in sample else None
-            ),
+            pred_distance_transform=(sample['pred_distance_transform'].squeeze().numpy() if 'pred_distance_transform' in sample else None),
             pred_dt_gradient=(sample['pred_dt_gradient'].numpy() if 'pred_dt_gradient' in sample else None),
         )
 
     def reset(self):
+        """Load a random sample into every env, reset them, and return stacked obs + infos."""
         observations, infos = [], []
         for i, env in enumerate(self.envs):
             sample = self._get_random_sample()
             self.current_samples[i] = sample
             self._apply_sample(env, sample)
-            # env.set_data(
-            #     image=sample["image"].permute(1, 2, 0).numpy(),
-            #     centerline=sample["centerline"].squeeze().numpy(),
-            #     distance_transform=sample["distance_transform"].squeeze().numpy(),
-            #     fov_mask=sample["fov_mask"].squeeze().numpy(),
-            # )
             obs, info = env.reset()
             observations.append(obs)
             infos.append(info)
         return np.stack(observations), infos
 
     def step(self, actions):
-        (
-            observations,
-            rewards,
-            terminateds,
-            truncateds,
-            infos,
-        ) = [], [], [], [], []
+        """Step every env, auto-resetting finished ones with a fresh random sample.
+
+        A finished env's final observation is exposed under ``info['terminal_observation']``.
+        """
+        (observations, rewards, terminateds, truncateds, infos) = [], [], [], [], []
         for i, (env, action) in enumerate(zip(self.envs, actions)):
-            (
-                obs,
-                reward,
-                terminated,
-                truncated,
-                info,
-            ) = env.step(action)
+            (obs, reward, terminated, truncated, info) = env.step(action)
             if terminated or truncated:
                 sample = self._get_random_sample()
                 self.current_samples[i] = sample
                 self._apply_sample(env, sample)
-                # env.set_data(
-                #     image=sample["image"].permute(1, 2, 0).numpy(),
-                #     centerline=sample["centerline"].squeeze().numpy(),
-                #     distance_transform=sample["distance_transform"].squeeze().numpy(),
-                #     fov_mask=sample["fov_mask"].squeeze().numpy(),
-                # )
                 obs, _ = env.reset()
                 info['terminal_observation'] = obs
             observations.append(obs)
@@ -1244,14 +906,9 @@ class VectorizedVesselEnv:
             terminateds.append(terminated)
             truncateds.append(truncated)
             infos.append(info)
-        return (
-            np.stack(observations),
-            np.array(rewards),
-            np.array(terminateds),
-            np.array(truncateds),
-            infos,
-        )
+        return (np.stack(observations), np.array(rewards), np.array(terminateds), np.array(truncateds), infos)
 
     def _get_random_sample(self):
+        """Draw a uniformly random sample from the dataset."""
         idx = np.random.randint(len(self.dataset))
         return self.dataset[idx]

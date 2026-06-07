@@ -1,16 +1,6 @@
-# environment/frontier_tracer.py
-"""Branch Coverage Manager for Retinal Vessel Tracing.
-Implements the Frontier-Based Coverage (Algorithm 2) to trace the full
-connected vascular tree.
-"""
+"""Frontier-based coverage tracer (Algorithm 2) that traces the full connected vascular tree."""
 
-from typing import (
-    Any,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-)
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -19,41 +9,24 @@ from scipy.ndimage import convolve
 from tqdm import tqdm
 
 
-def _stamp_polyline(
-    mask: np.ndarray,
-    coords: np.ndarray,
-    value: float = 1.0,
-    max_gap: Optional[float] = None,
-) -> None:
-    """Stamp a CONNECTED polyline into ``mask`` (lines between consecutive
-    points), so step_size>1 traces are continuous instead of dotted.
+def _stamp_polyline(mask: np.ndarray, coords: np.ndarray, value: float = 1.0, max_gap: Optional[float] = None) -> None:
+    """Stamp a connected polyline into ``mask`` so step_size>1 traces stay 8-connected.
 
-    With step_size=2 the agent's path points are 2px apart; stamping them as
-    isolated pixels left a dotted skeleton that shattered into thousands of
-    8-disconnected components (observed betti_0_error_raw≈4447). Densifying
-    each segment to its Chebyshev length+1 samples yields 8-connected pixels.
-
-    ``max_gap``: if two consecutive points are farther apart than this
-    (Chebyshev), the connecting line is NOT drawn — only the vertices are
-    stamped. Guards against painting a straight stroke across a jump (e.g.
-    two neighbours that snapped to different ridges at a junction).
+    Densifies each segment to Chebyshev-length samples instead of leaving dotted vertices.
+    ``max_gap``: consecutive points farther apart than this (Chebyshev) are not joined —
+    only the vertices are stamped — so no stroke is painted across a jump (e.g. neighbours
+    that snapped to different ridges at a junction).
     """
     coords = np.asarray(coords)
     if len(coords) == 0:
         return
     iy = coords[:, 0].astype(np.intp)
     ix = coords[:, 1].astype(np.intp)
-    mask[iy, ix] = value  # always stamp the vertices
+    mask[iy, ix] = value
     for j in range(len(coords) - 1):
-        y0, x0 = (
-            float(coords[j, 0]),
-            float(coords[j, 1]),
-        )
-        y1, x1 = (
-            float(coords[j + 1, 0]),
-            float(coords[j + 1, 1]),
-        )
-        n = int(max(abs(y1 - y0), abs(x1 - x0)))  # Chebyshev steps
+        y0, x0 = (float(coords[j, 0]), float(coords[j, 1]))
+        y1, x1 = (float(coords[j + 1, 0]), float(coords[j + 1, 1]))
+        n = int(max(abs(y1 - y0), abs(x1 - x0)))  # Chebyshev distance in pixels
         if n <= 1:
             continue  # already 8-connected; vertices suffice
         if max_gap is not None and n > max_gap:
@@ -66,71 +39,43 @@ def _stamp_polyline(
 class FrontierTracer:
     """Single source of truth for Frontier-Based Coverage (Algorithm 2)."""
 
-    def __init__(
-        self,
-        env,
-        policy_model,
-        device,
-        obs_size: int = 65,
-        snap_to_centerline=None,
-        snap_radius=None,
-        vessel_gate=None,
-    ):
+    def __init__(self, env, policy_model, device, obs_size: int = 65, snap_to_centerline=None, snap_radius=None, vessel_gate=None):
+        """Wire up the env + policy and read inference snap/gate settings (config defaults, overridable per arg)."""
         self.env = env
         self.model = policy_model
         self.device = device
         self.obs_size = obs_size
         self.half = obs_size // 2
 
-        # Inference-time centerline snap (no retrain): pull traced points onto
-        # the predicted-centerline ridge to fix the ~2-3px off-centre drift.
-        # vessel_gate: DROP traced points farther than snap_radius from any
-        # predicted-centerline ridge pixel (and break the polyline there), so
-        # the policy's straight-line strokes across non-vessel background are
-        # not stamped as false positives. Read defaults from config; explicit
-        # args override for A/B tests.
+        # Inference-time snap/gate (no retrain): snap pulls traced points onto the
+        # predicted-centerline ridge (fixes ~2-3px drift); gate drops points farther than
+        # snap_radius from any ridge pixel so straight strokes across background aren't
+        # stamped as false positives. Config defaults; explicit args override for A/B.
         from config import MODEL_CONFIG
 
         _inf = MODEL_CONFIG.get('inference', {})
-        self.snap_to_centerline = (
-            _inf.get('snap_to_centerline', True) if snap_to_centerline is None else bool(snap_to_centerline)
-        )
+        self.snap_to_centerline = _inf.get('snap_to_centerline', True) if snap_to_centerline is None else bool(snap_to_centerline)
         self.vessel_gate = _inf.get('vessel_gate', True) if vessel_gate is None else bool(vessel_gate)
         self.snap_radius = float(_inf.get('snap_radius_px', 3.5) if snap_radius is None else snap_radius)
-        # GT-ablation certification: feed the env garbage GT to prove the
-        # prediction does not depend on ground truth (see _setup_env).
+        # corrupt_gt: feed the env garbage GT to certify prediction leak-freedom (_setup_env).
         self._corrupt_gt = bool(_inf.get('corrupt_gt', False))
-        # Max connector length when stamping (breaks straight jumps); set per
-        # image in _setup_env once env.step_size is known.
+        # Max stamp connector length; set per image in _setup_env once step_size is known.
         self._stamp_max_gap = None
         # Nearest-ridge index map, precomputed per image in _setup_env.
         self._snap_iy = self._snap_ix = self._snap_dist = None
 
-        # Preallocated inference buffer — filled in-place each step, never reallocated
+        # Preallocated inference buffer, filled in place each step.
         n_channels = env.observation_space.shape[0]
-        self._obs_buf = torch.zeros(
-            1,
-            n_channels,
-            obs_size,
-            obs_size,
-            dtype=torch.float32,
-            device=device,
-        )
+        self._obs_buf = torch.zeros(1, n_channels, obs_size, obs_size, dtype=torch.float32, device=device)
 
     def _extract_endpoint_seeds(
-        self,
-        on_vessel_mask: np.ndarray,
-        existing_frontier: List[Tuple[int, int]],
-        min_distance: int = 8,
+        self, on_vessel_mask: np.ndarray, existing_frontier: List[Tuple[int, int]], min_distance: int = 8
     ) -> List[Tuple[int, int]]:
-        """Find dangling tips of the on-vessel skeleton.
+        """Return dangling tips of the on-vessel skeleton as seeds, farthest-from-covered first.
 
-        IMPORTANT: accepts `on_vessel_mask` — the on-vessel-only pixels from
-        sub_paths — NOT the full combined_mask which includes bridge segments.
-        Using bridge tips as seeds would extend false connections further.
-
-        Returns endpoints sorted farthest-from-covered first, suppressing
-        near-duplicates from the existing frontier.
+        ``on_vessel_mask`` must be the on-vessel-only pixels (not the combined mask with
+        bridges) — bridge tips would seed further false connections. Near-duplicates of
+        ``existing_frontier`` are suppressed.
         """
         if not on_vessel_mask.any():
             return []
@@ -139,10 +84,7 @@ class FrontierTracer:
         margin = self.half + 5
         skel = (on_vessel_mask > 0).astype(np.uint8)
 
-        kernel = np.array(
-            [[1, 1, 1], [1, 0, 1], [1, 1, 1]],
-            dtype=np.uint8,
-        )
+        kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
         neighbour_count = convolve(skel, kernel, mode='constant', cval=0)
         endpoint_mask = (skel > 0) & (neighbour_count == 1)
         endpoints = np.argwhere(endpoint_mask)
@@ -152,7 +94,7 @@ class FrontierTracer:
 
         frontier_set = set((int(s[0]), int(s[1])) for s in existing_frontier)
 
-        # Distance transform from covered pixels for re-ranking
+        # Distance from covered pixels, used to rank seeds farthest-first.
         covered_bin = (on_vessel_mask > 0).astype(np.uint8)
         dist_from_covered = cv2.distanceTransform(1 - covered_bin, cv2.DIST_L2, 5)
 
@@ -167,23 +109,15 @@ class FrontierTracer:
             if not too_close:
                 new_seeds.append((ey, ex))
 
-        new_seeds.sort(
-            key=lambda s: dist_from_covered[s[0], s[1]],
-            reverse=True,
-        )
+        new_seeds.sort(key=lambda s: dist_from_covered[s[0], s[1]], reverse=True)
         return new_seeds
 
-    def _execute_single_trace(
-        self,
-        start_pos: Tuple[int, int],
-        combined_mask: np.ndarray,
-    ) -> Tuple[
-        List[Tuple[int, int]],
-        List[Tuple[int, int]],
-    ]:
-        """Executes a single continuous trace until the agent stops or terminates."""
-        # Expose accumulated coverage from all previous traces so the agent can
-        # observe what has already been traced via the prior_coverage channel.
+    def _execute_single_trace(self, start_pos: Tuple[int, int], combined_mask: np.ndarray) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+        """Run one continuous greedy (argmax) trace until the agent stops or terminates.
+
+        Exposes accumulated coverage via ``env.prior_coverage`` so the policy can observe
+        what earlier traces covered. Returns ``(path, alternate_branches)``.
+        """
         self.env.prior_coverage = combined_mask
         obs, _ = self.env.reset(start_position=start_pos)
         path = [start_pos]
@@ -197,13 +131,7 @@ class FrontierTracer:
                 logits, _, _ = self.model(self._obs_buf)
                 action = logits.argmax(dim=-1).item()
 
-                (
-                    obs,
-                    _,
-                    terminated,
-                    truncated,
-                    _,
-                ) = self.env.step(action)
+                (obs, _, terminated, truncated, _) = self.env.step(action)
                 done = terminated or truncated
 
                 y, x = self.env.position
@@ -213,71 +141,39 @@ class FrontierTracer:
         return path, alternate_branches
 
     def trace_from_seeds(
-        self,
-        sample: Dict[str, Any],
-        initial_seeds: List[Tuple[int, int]],
-        min_coverage_gain: float = 0.0005,
-        max_low_gain_traces: int = 5,
+        self, sample: Dict[str, Any], initial_seeds: List[Tuple[int, int]], min_coverage_gain: float = 0.0005, max_low_gain_traces: int = 5
     ) -> Tuple[np.ndarray, List[List[Tuple[int, int]]]]:
-        """End-to-end inference: stack-based frontier with dynamic endpoint growth.
+        """End-to-end inference: stack-based frontier traversal with dynamic endpoint growth.
 
-        Improvements:
-        - Fix B (skip covered starts): skips seeds whose start pixel is covered.
-        - Fix A (endpoint growth): after each trace, extracts endpoints from the
-          ON-VESSEL skeleton only (sub_paths, not the full path including bridges).
-          This prevents bridge tips from seeding further false connections.
-        - Early stopping: halts after consecutive low-gain traces.
+        Skips covered starts, grows the frontier from on-vessel endpoints after each trace,
+        reseeds isolated gaps, and early-stops after consecutive low-gain traces. Returns
+        ``(combined_mask, all_paths)``.
         """
         self._setup_env(sample)
         h, w = sample['image'].shape[:2]
         combined_mask = np.zeros((h, w), dtype=np.float32)
         all_paths = []
-        # Leak-free coverage normaliser for the early-stop gain threshold:
-        # predicted centerline pixel count, not GT (≈ same magnitude, but keeps
-        # ground truth out of the stopping decision).
+        # Leak-free gain normaliser: predicted-centerline pixel count, not GT.
         _pred_cl = self.env.pred_centerline
-        cov_norm = (
-            float(max(np.asarray(_pred_cl).sum(), 1))
-            if _pred_cl is not None
-            else float(max(sample['centerline'].sum(), 1))
-        )
+        cov_norm = float(max(np.asarray(_pred_cl).sum(), 1)) if _pred_cl is not None else float(max(sample['centerline'].sum(), 1))
         low_gain_streak = 0
         traces_run = 0
 
         frontier = list(initial_seeds)
 
-        # Scale early-stop patience to the seed budget.  `max_low_gain_traces`
-        # is a fixed constant (5); on a small-FOV image the detector
-        # legitimately returns proportionally fewer seeds, and a few hard
-        # (e.g. dark, low-contrast) regions can fail several traces in a row
-        # while dozens of valid, well-placed seeds elsewhere are still
-        # unused.  A fixed patience of 5 then abandons the whole image at
-        # ~19% coverage (observed: 536_N).  Growing patience with the number
-        # of seeds we were handed lets the tracer actually work through its
-        # budget; it stays bounded because `frontier` only shrinks except
-        # for the (self-limiting) gap reseeder, so this cannot run away.
-        patience = max(
-            max_low_gain_traces,
-            int(round(0.4 * len(initial_seeds))),
-        )
+        # Scale early-stop patience to the seed budget so a few hard regions don't abandon
+        # an image while many valid seeds remain unused. Bounded: the frontier only shrinks
+        # except for the self-limiting gap reseeder.
+        patience = max(max_low_gain_traces, int(round(0.4 * len(initial_seeds))))
 
-        # Livelock guards. The gap reseeder resets the low-gain streak, so if
-        # traces stop adding coverage (e.g. the vessel gate drops their points
-        # on a hard image) the streak can never reach `patience` and the loop
-        # spins forever (observed: im0324 ran >5h). Bound the reseed rounds AND
-        # require coverage to grow between reseeds, plus an absolute cap on
-        # total traces as a backstop.
+        # Livelock guards: the gap reseeder resets the low-gain streak, so cap reseed
+        # rounds, require coverage to grow between reseeds, and cap total traces.
         max_gap_reseeds = 5
         gap_reseeds_done = 0
         cov_at_last_reseed = -1.0
         hard_trace_cap = max(200, 10 * len(initial_seeds))
 
-        pbar = tqdm(
-            total=len(frontier),
-            desc='Tracing Seeds',
-            unit='seed',
-            leave=False,
-        )
+        pbar = tqdm(total=len(frontier), desc='Tracing Seeds', unit='seed', leave=False)
 
         while frontier:
             if traces_run >= hard_trace_cap:
@@ -286,49 +182,26 @@ class FrontierTracer:
             start_pos = frontier.pop()
             pbar.update(1)
 
-            # Skip seeds whose start pixel is already covered
-            sy, sx = (
-                int(start_pos[0]),
-                int(start_pos[1]),
-            )
+            sy, sx = (int(start_pos[0]), int(start_pos[1]))
             if combined_mask[sy, sx] > 0:
                 continue
 
             covered_before = combined_mask.sum()
-            # Trace on a COPY so the real combined_mask is only updated by the
-            # snapped, on-vessel sub-paths below. The raw per-step stamps inside
-            # _execute_single_trace are ~2-3px off-centre and would otherwise
-            # persist as false positives even after snapping.
-            path, alternate_branches = self._execute_single_trace(
-                start_pos,
-                combined_mask.copy(),
-            )
+            # Trace on a COPY: combined_mask is updated only by the snapped on-vessel
+            # sub-paths below; raw per-step stamps are ~2-3px off-centre.
+            path, alternate_branches = self._execute_single_trace(start_pos, combined_mask.copy())
             traces_run += 1
 
-            # On-vessel filtering is LEAK-FREE: _snap_and_gate splits the path
-            # into segments along the PREDICTED centerline ridge (dropping
-            # points with no predicted vessel nearby) and snaps them onto it.
-            # This replaces the old _split_trace_at_bridges, which used the
-            # ground-truth distance transform to decide on-vessel — an
-            # inference-time GT leak. Bridges never entered combined_mask (we
-            # traced on a copy), so nothing to clear.
+            # Leak-free on-vessel filtering: _snap_and_gate segments the path along the
+            # PREDICTED ridge and snaps onto it (no GT distance transform involved).
             on_vessel_mask = np.zeros((h, w), dtype=np.float32)
             for seg in self._snap_and_gate(np.array(path, dtype=np.intp)):
                 if len(seg) < 3:
-                    continue  # drop tiny fragments (matches old >=3-point rule)
+                    continue  # drop tiny fragments
                 all_paths.append([tuple(int(v) for v in p) for p in seg])
-                _stamp_polyline(
-                    combined_mask,
-                    seg,
-                    max_gap=self._stamp_max_gap,
-                )
-                _stamp_polyline(
-                    on_vessel_mask,
-                    seg,
-                    max_gap=self._stamp_max_gap,
-                )
+                _stamp_polyline(combined_mask, seg, max_gap=self._stamp_max_gap)
+                _stamp_polyline(on_vessel_mask, seg, max_gap=self._stamp_max_gap)
 
-            # Coverage gain tracking for early stopping
             gain = (combined_mask.sum() - covered_before) / cov_norm
 
             if gain < min_coverage_gain:
@@ -340,40 +213,24 @@ class FrontierTracer:
                 tqdm.write(f'    Early stop: {patience} consecutive low-gain traces (gain < {min_coverage_gain:.4f})')
                 break
 
-            # Fix A: extract endpoints from the ON-VESSEL mask only.
-            # Using the full path (including bridges) would seed the agent
-            # at bridge tips, causing further false connections downstream.
+            # Grow the frontier from ON-VESSEL endpoints only; bridge tips would seed
+            # further false connections downstream.
             new_endpoints = self._extract_endpoint_seeds(on_vessel_mask, frontier)
             if new_endpoints:
                 frontier.extend(new_endpoints)
                 pbar.total += len(new_endpoints)
 
-            # Gap reseeder: when the frontier is nearly empty and no new
-            # endpoints were found, inject seeds at uncovered vessel regions
-            # that are far (>40px) from any covered pixel.  This prevents
-            # starvation when disconnected subtrees were never reached by any
-            # trace endpoint.
-            # Only reseed while we have rounds left AND coverage actually grew
-            # since the last reseed. Without the coverage check, a reseed round
-            # whose traces add nothing (e.g. gated out) keeps re-firing and
-            # resetting the streak → livelock (im0324). When coverage stalls we
-            # stop reseeding and let the low-gain early-stop fire.
+            # Gap reseeder: when the frontier is nearly dry and no new endpoints appeared,
+            # inject seeds at uncovered vessel regions far from coverage. Gated on round
+            # cap + coverage growth so a no-gain reseed round can't livelock the loop.
             cur_cov = float(combined_mask.sum())
-            if (
-                not new_endpoints
-                and len(frontier) < 3
-                and gap_reseeds_done < max_gap_reseeds
-                and cur_cov > cov_at_last_reseed
-            ):
+            if not new_endpoints and len(frontier) < 3 and gap_reseeds_done < max_gap_reseeds and cur_cov > cov_at_last_reseed:
                 gap_seeds = self._gap_reseeder(combined_mask, sample)
                 if gap_seeds:
                     frontier.extend(gap_seeds)
                     pbar.total += len(gap_seeds)
-                    # A fresh batch of seeds in far, uncovered regions deserves
-                    # a fresh chance, so reset the low-gain streak (observed on
-                    # 536_N: 40 seeds injected at 0.19 coverage were else
-                    # early-stopped before being tried). Bounded by the round
-                    # cap + coverage-grew gate above so it cannot loop forever.
+                    # Fresh far seeds deserve a fresh chance, so reset the low-gain streak
+                    # (bounded by the round cap + coverage-grew gate above).
                     low_gain_streak = 0
                     gap_reseeds_done += 1
                     cov_at_last_reseed = cur_cov
@@ -384,13 +241,7 @@ class FrontierTracer:
                     )
 
             for branch_pos in alternate_branches:
-                if (
-                    combined_mask[
-                        branch_pos[0],
-                        branch_pos[1],
-                    ]
-                    == 0
-                ):
+                if combined_mask[branch_pos[0], branch_pos[1]] == 0:
                     frontier.append(branch_pos)
                     pbar.total += 1
 
@@ -400,28 +251,21 @@ class FrontierTracer:
         return combined_mask, all_paths
 
     def trace_with_gt_gaps(
-        self,
-        sample: Dict[str, Any],
-        max_traces: int = 50,
-        min_coverage_gain: float = 0.005,
+        self, sample: Dict[str, Any], max_traces: int = 50, min_coverage_gain: float = 0.005
     ) -> Tuple[np.ndarray, List[List[Tuple[int, int]]]]:
-        """Evaluation method: Iteratively forces the agent into ground-truth gaps."""
+        """Evaluation tracer that repeatedly seeds the agent into uncovered GT-centerline gaps.
+
+        Uses GT only to pick seeds and split bridges (the GT-gap eval path, not the
+        leak-free inference path). Returns ``(combined_mask, all_paths)``.
+        """
         self._setup_env(sample)
         h, w = sample['image'].shape[:2]
         combined_mask = np.zeros((h, w), dtype=np.float32)
         all_paths = []
         gt_total = float(max(sample['centerline'].sum(), 1))
 
-        # Added tqdm to the GT evaluation loop
-        for trace_idx in tqdm(
-            range(max_traces),
-            desc='GT Gap Tracing',
-            unit='trace',
-        ):
-            start_pos = self._pick_frontier_seed_from_gt(
-                sample['centerline'],
-                combined_mask,
-            )
+        for trace_idx in tqdm(range(max_traces), desc='GT Gap Tracing', unit='trace'):
+            start_pos = self._pick_frontier_seed_from_gt(sample['centerline'], combined_mask)
 
             if start_pos is None:
                 tqdm.write(f'    Full coverage after {trace_idx} traces.')
@@ -430,29 +274,20 @@ class FrontierTracer:
             covered_before = combined_mask.sum()
             path, _ = self._execute_single_trace(start_pos, combined_mask.copy())
 
-            # Split trace at off-vessel bridges
             dt = self.env.distance_transform
             tol = self.env.tolerance
             sub_paths = self._split_trace_at_bridges(path, dt, tol)
 
-            # Stamp on-vessel segments only, snapped to the predicted centerline
-            # ridge and connected into continuous lines. Bridges never entered
-            # combined_mask (traced on a copy), so no off-vessel clearing needed.
+            # Stamp on-vessel segments only, snapped to the predicted ridge and connected.
             for sp in sub_paths:
                 all_paths.append(sp)
                 for seg in self._snap_and_gate(np.array(sp, dtype=np.intp)):
-                    _stamp_polyline(
-                        combined_mask,
-                        seg,
-                        max_gap=self._stamp_max_gap,
-                    )
+                    _stamp_polyline(combined_mask, seg, max_gap=self._stamp_max_gap)
 
             gain = (combined_mask.sum() - covered_before) / gt_total
             coverage_pct = combined_mask.sum() / gt_total
 
-            tqdm.write(
-                f'    Trace {trace_idx + 1:3d} from {start_pos} -> {len(path)} steps  gain={gain:.3f}  coverage={coverage_pct:.3f}'
-            )
+            tqdm.write(f'    Trace {trace_idx + 1:3d} from {start_pos} -> {len(path)} steps  gain={gain:.3f}  coverage={coverage_pct:.3f}')
 
             if trace_idx >= 3 and gain < min_coverage_gain:
                 tqdm.write(f'    Early stop: gain {gain:.4f} < {min_coverage_gain}')
@@ -461,28 +296,16 @@ class FrontierTracer:
         return combined_mask, all_paths
 
     def _gap_reseeder(
-        self,
-        combined_mask: np.ndarray,
-        sample: Dict[str, Any],
-        n_gap_seeds: int = 40,
-        gap_threshold: int = 25,
+        self, combined_mask: np.ndarray, sample: Dict[str, Any], n_gap_seeds: int = 40, gap_threshold: int = 25
     ) -> List[Tuple[int, int]]:
-        """Find vessel pixels far from covered regions → new frontier seeds.
+        """Return frontier seeds at uncovered vessel pixels far (> ``gap_threshold``) from coverage.
 
-        Prevents starvation when the frontier runs dry while large uncovered
-        vessel segments remain (e.g. disconnected subtrees or peripheral
-        branches that no trace endpoint reached).
-
-        LEAK-FREE: uses the PREDICTED centerline (UNet) as the vessel proxy,
-        not GT — otherwise the reseeder would use ground truth to discover the
-        regions the tracer missed (an inference-time leak). gap_threshold
-        controls the minimum distance from any covered pixel before a vessel
-        point is considered a gap.  Seeds are spaced at least gap_threshold//2
+        Prevents starvation when large uncovered segments remain after the frontier dries
+        (disconnected subtrees, unreached peripheral branches). Leak-free: uses the
+        PREDICTED centerline as the vessel proxy, not GT. Seeds are spaced ~gap_threshold//4
         apart.
         """
-        from scipy.ndimage import (
-            distance_transform_edt,
-        )
+        from scipy.ndimage import distance_transform_edt
 
         centerline = self.env.pred_centerline
         if centerline is None:
@@ -498,11 +321,7 @@ class FrontierTracer:
         if combined_mask.any():
             dist_from_covered = distance_transform_edt(combined_mask == 0).astype(np.float32)
         else:
-            dist_from_covered = np.full(
-                (h, w),
-                float(max(h, w)),
-                dtype=np.float32,
-            )
+            dist_from_covered = np.full((h, w), float(max(h, w)), dtype=np.float32)
 
         gap_mask = vessel_uncovered & (dist_from_covered > gap_threshold)
         gap_pts = np.argwhere(gap_mask)
@@ -512,37 +331,31 @@ class FrontierTracer:
         valid = [(int(y), int(x)) for y, x in gap_pts if margin <= y < h - margin and margin <= x < w - margin]
         if not valid:
             return []
-        valid.sort(
-            key=lambda yx: dist_from_covered[yx[0], yx[1]],
-            reverse=True,
-        )
+        valid.sort(key=lambda yx: dist_from_covered[yx[0], yx[1]], reverse=True)
 
+        # Greedy spacing: reject a candidate whose ±min_half box is already occupied.
         min_half = max(4, gap_threshold // 4)
         selected: List[Tuple[int, int]] = []
         occupied = np.zeros((h, w), dtype=bool)
         for y, x in valid:
             if len(selected) >= n_gap_seeds:
                 break
-            if occupied[
-                max(0, y - min_half) : y + min_half + 1,
-                max(0, x - min_half) : x + min_half + 1,
-            ].any():
+            if occupied[max(0, y - min_half) : y + min_half + 1, max(0, x - min_half) : x + min_half + 1].any():
                 continue
             selected.append((y, x))
-            occupied[
-                max(0, y - min_half) : y + min_half + 1,
-                max(0, x - min_half) : x + min_half + 1,
-            ] = True
+            occupied[max(0, y - min_half) : y + min_half + 1, max(0, x - min_half) : x + min_half + 1] = True
 
         return selected
 
     def _setup_env(self, sample: Dict[str, Any]):
-        # GT-ablation: pass GARBAGE ground truth to the env (zeroed centerline,
-        # large-constant distance transform) to certify leak-freedom. The
-        # predicted inputs below and the GT used for metric scoring (which lives
-        # on `sample` and is read directly by run_rl_tracing, not via the env)
-        # are untouched. If metrics are unchanged vs the normal run, the
-        # prediction provably does not depend on GT.
+        """Load a sample into the env and precompute the predicted-ridge snap/gate index map.
+
+        Honours the ``corrupt_gt`` certification flag (feeds garbage GT to prove leak
+        freedom) and builds the nearest-ridge distance/index maps used by ``_snap_and_gate``.
+        """
+        # corrupt_gt certification: pass zeroed centerline + huge DT so any GT dependence
+        # in the prediction shows up as changed metrics. Scoring GT lives on `sample`
+        # (read directly by run_rl_tracing), so it stays untouched.
         gt_centerline = sample['centerline']
         gt_dt = sample['distance_transform']
         if self._corrupt_gt:
@@ -559,41 +372,26 @@ class FrontierTracer:
             pred_distance_transform=sample.get('pred_distance_transform'),
             pred_dt_gradient=sample.get('pred_dt_gradient'),
         )
-        # Precompute the nearest predicted-centerline-ridge index map for
-        # inference snapping AND vessel gating (set_data populates
-        # env.pred_centerline — a binary skeleton — even when the sample didn't
-        # supply one). Max connector length scales with snap radius + stride.
+        # Nearest predicted-ridge index map for snapping + gating (set_data populates a
+        # binary env.pred_centerline even if the sample didn't supply one). Connector
+        # length scales with snap radius + stride.
         self._stamp_max_gap = 2.0 * self.snap_radius + float(getattr(self.env, 'step_size', 1))
         self._snap_iy = self._snap_ix = self._snap_dist = None
         if (self.snap_to_centerline or self.vessel_gate) and self.env.pred_centerline is not None:
             ridge = np.asarray(self.env.pred_centerline) > 0
             if ridge.any():
-                from scipy.ndimage import (
-                    distance_transform_edt,
-                )
+                from scipy.ndimage import distance_transform_edt
 
-                dist, (iy, ix) = distance_transform_edt(
-                    ~ridge,
-                    return_indices=True,
-                )
-                (
-                    self._snap_dist,
-                    self._snap_iy,
-                    self._snap_ix,
-                ) = dist, iy, ix
+                dist, (iy, ix) = distance_transform_edt(~ridge, return_indices=True)
+                (self._snap_dist, self._snap_iy, self._snap_ix) = dist, iy, ix
 
     def _snap_and_gate(self, coords: np.ndarray) -> List[np.ndarray]:
-        """Return the trace as a list of CONTIGUOUS sub-segments after optional
-        snapping and vessel gating against the predicted-centerline ridge.
+        """Split the trace into contiguous sub-segments after optional ridge snapping and gating.
 
-        - snap: points within ``snap_radius`` of a ridge pixel are moved onto
-          the nearest one (fixes the ~2-3px off-centre drift).
-        - gate: points farther than ``snap_radius`` from any ridge pixel are
-          DROPPED — they cross background the perception model sees no vessel
-          in — and the segment is broken there, so no straight stroke is
-          painted across the gap (the false-positive web).
-
-        When the ridge map is unavailable, returns the input unchanged.
+        snap: points within ``snap_radius`` of a ridge pixel move onto the nearest one.
+        gate: points farther than ``snap_radius`` are dropped and the segment broken there,
+        so no straight stroke is painted across background. Returns the input unchanged
+        when no ridge map is available.
         """
         if self._snap_dist is None or len(coords) == 0:
             return [coords]
@@ -603,7 +401,7 @@ class FrontierTracer:
         if self.snap_to_centerline and near.any():
             snapped[near, 0] = self._snap_iy[ys[near], xs[near]]
             snapped[near, 1] = self._snap_ix[ys[near], xs[near]]
-        # If not gating, keep every point as a single segment (snapped or not).
+        # Not gating: keep every point as one segment.
         if not self.vessel_gate:
             return [snapped]
         # Gate: split into runs of consecutive kept (near-ridge) points.
@@ -619,11 +417,12 @@ class FrontierTracer:
             segments.append(snapped[start:])
         return segments
 
-    def _pick_frontier_seed_from_gt(
-        self,
-        gt_centerline: np.ndarray,
-        covered: np.ndarray,
-    ) -> Optional[Tuple[int, int]]:
+    def _pick_frontier_seed_from_gt(self, gt_centerline: np.ndarray, covered: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Pick the uncovered GT-centerline pixel farthest from the covered region as the next seed.
+
+        Returns the clamped ``(y, x)``, or None when the GT centerline is fully covered.
+        Used only by the GT-gap evaluation path (``trace_with_gt_gaps``).
+        """
         uncovered = (gt_centerline > 0) & (covered == 0)
         if not uncovered.any():
             return None
@@ -634,42 +433,23 @@ class FrontierTracer:
         covered_bin = (covered > 0).astype(np.uint8)
         if covered_bin.any():
             dist = cv2.distanceTransform(1 - covered_bin, cv2.DIST_L2, 5)
-            scores = dist[
-                uncovered_pts[:, 0],
-                uncovered_pts[:, 1],
-            ]
+            scores = dist[uncovered_pts[:, 0], uncovered_pts[:, 1]]
             best = uncovered_pts[np.argmax(scores)]
         else:
+            # No coverage yet: seed nearest the image centre.
             centre = np.array([h // 2, w // 2])
             dists = np.linalg.norm(uncovered_pts - centre, axis=1)
             best = uncovered_pts[np.argmin(dists)]
 
-        y = int(
-            np.clip(
-                best[0],
-                self.half,
-                h - self.half - 1,
-            )
-        )
-        x = int(
-            np.clip(
-                best[1],
-                self.half,
-                w - self.half - 1,
-            )
-        )
+        y = int(np.clip(best[0], self.half, h - self.half - 1))
+        x = int(np.clip(best[1], self.half, w - self.half - 1))
         return (y, x)
 
-    def _split_trace_at_bridges(
-        self,
-        path: List[Tuple[int, int]],
-        distance_transform: np.ndarray,
-        tolerance: float,
-    ) -> List[List[Tuple[int, int]]]:
-        """Split a single trace into sub-traces wherever it went off-vessel.
+    def _split_trace_at_bridges(self, path: List[Tuple[int, int]], distance_transform: np.ndarray, tolerance: float) -> List[List[Tuple[int, int]]]:
+        """Split a trace into sub-traces wherever it went off-vessel, dropping bridge segments.
 
-        Removes bridge segments that cross non-vessel regions.
-        Only keeps sub-traces with >= 3 on-vessel points.
+        On-vessel is decided by ``distance_transform <= tolerance``; only sub-traces with
+        >= 3 on-vessel points are kept.
         """
         if len(path) < 3:
             return [path]
@@ -677,7 +457,7 @@ class FrontierTracer:
         coords = np.array(path, dtype=np.intp)
         on_vessel = distance_transform[coords[:, 0], coords[:, 1]] <= tolerance
 
-        # Find boundaries where on_vessel changes
+        # Split at on/off-vessel transitions, keeping on-vessel runs only.
         changes = np.diff(on_vessel.astype(np.int8))
         split_indices = np.where(changes != 0)[0] + 1
         chunks = np.split(np.arange(len(path)), split_indices)

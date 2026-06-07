@@ -1,67 +1,29 @@
-# greedy_tracer_baseline.py
-"""==================
-Greedy Tracer Baseline for Vessel Extraction
-
-Workflow:
-  1. Preprocessing & Multi-scale Frangi filtering.
-  2. Gaussian smoothing to stabilize steepest-ascent.
-  3. FOV erosion (3 iterations) to eliminate boundary halo artifacts.
-  4. Greedy steepest-ascent tracing from local maxima seeds.
-  5. Post-trace object removal for noise cleanup.
-  6. SKAN Pruning : Graph-based removal of spurious tips.
-==================
-"""
+"""Greedy steepest-ascent tracer baseline over a Frangi vesselness map, with skan pruning."""
 
 from typing import List, Optional, Tuple
 
 import numpy as np
-from scipy.ndimage import (
-    binary_erosion,
-    gaussian_filter,
-)
+from scipy.ndimage import binary_erosion, gaussian_filter
 from skan import Skeleton as SkanSkeleton
 from skan import summarize
 from skimage import filters
-from skimage.morphology import (
-    remove_small_objects,
-    skeletonize,
-)
-
-# ==========================================
-# TRAJECTORY-RECORDING GREEDY TRACER
-# ==========================================
+from skimage.morphology import remove_small_objects, skeletonize
 
 
 class GreedyTracer:
-    """Steepest-ascent greedy tracer on a soft probability/vesselness map.
+    """Traces vessels by steepest ascent from local-maxima seeds on a soft vesselness map.
 
-    Returns both the binary skeleton AND full trajectory data so the
-    evaluation script can render per-trace visualizations.
-
-    NOTE: This class only handles tracing. Post-processing like
-    remove_small_objects lives in GreedyTracerBaseline.extract_centerline().
-
-    Args:
-        seed_thresh : minimum vesselness to start a new trace
-        step_thresh : minimum vesselness to continue stepping
-        min_length  : discard traces shorter than this (pixels)
-        thin_output : apply skeletonize to the final binary output
-
+    Returns both the binary skeleton and the per-trace trajectories for visualization.
+    Post-processing (small-object removal) lives in GreedyTracerBaseline.
     """
 
-    def __init__(
-        self,
-        seed_thresh: float = 0.15,
-        step_thresh: float = 0.08,
-        min_length: int = 10,
-        thin_output: bool = True,
-    ):
+    def __init__(self, seed_thresh: float = 0.15, step_thresh: float = 0.08, min_length: int = 10, thin_output: bool = True):
+        """Store seed/step vesselness thresholds, the minimum trace length, and the thinning flag."""
         self.seed_thresh = seed_thresh
         self.step_thresh = step_thresh
         self.min_length = min_length
         self.thin_output = thin_output
 
-        # 8-connected neighbour offsets
         self._offsets = [
             (-1, -1),
             (-1, 0),
@@ -74,33 +36,19 @@ class GreedyTracer:
         ]
 
     def _local_maxima(self, prob: np.ndarray) -> np.ndarray:
-        """Boolean mask of strict 8-neighbour local maxima."""
-        padded = np.pad(
-            prob,
-            1,
-            mode='constant',
-            constant_values=0,
-        )
+        """Return a boolean mask of pixels >= all 8 neighbours."""
+        padded = np.pad(prob, 1, mode='constant', constant_values=0)
         lm = np.ones_like(prob, dtype=bool)
         for dy in range(-1, 2):
             for dx in range(-1, 2):
                 if dy == 0 and dx == 0:
                     continue
-                shifted = padded[
-                    1 + dy : 1 + dy + prob.shape[0],
-                    1 + dx : 1 + dx + prob.shape[1],
-                ]
+                shifted = padded[1 + dy : 1 + dy + prob.shape[0], 1 + dx : 1 + dx + prob.shape[1]]
                 lm &= prob >= shifted
         return lm
 
-    def _trace_from(
-        self,
-        prob: np.ndarray,
-        visited: np.ndarray,
-        start_r: int,
-        start_c: int,
-    ) -> List[Tuple[int, int]]:
-        """Greedy steepest-ascent from a seed. Returns ordered (r, c) path."""
+    def _trace_from(self, prob: np.ndarray, visited: np.ndarray, start_r: int, start_c: int) -> List[Tuple[int, int]]:
+        """Walk steepest-ascent from a seed (stopping below ``step_thresh``); returns the ordered (r, c) path."""
         H, W = prob.shape
         path = [(start_r, start_c)]
         visited[start_r, start_c] = True
@@ -123,20 +71,16 @@ class GreedyTracer:
 
         return path
 
-    def trace(
-        self,
-        prob_map: np.ndarray,
-        fov_mask: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, List[List[Tuple[int, int]]]]:
-        """Args:
-            prob_map  : (H, W) float32 vesselness/probability map
-            fov_mask  : (H, W) uint8 — trace only inside FOV
+    def trace(self, prob_map: np.ndarray, fov_mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, List[List[Tuple[int, int]]]]:
+        """Trace all seeds strongest-first and return the pruned skeleton plus trajectories.
+
+        Args:
+            prob_map: (H, W) float32 vesselness/probability map.
+            fov_mask: (H, W) uint8 — restricts tracing to the FOV.
 
         Returns:
-            skeleton  : (H, W) uint8 binary centerline {0, 255}
-            traces    : list of paths, each path = ordered list of (r, c) tuples
-                        sorted by visit order (trace 0 = first/strongest drawn)
-
+            ``(skeleton uint8 {0,255}, traces)`` where traces is a list of ordered (r, c) paths
+            in visit order (trace 0 = strongest).
         """
         prob = prob_map.copy().astype(np.float32)
         if fov_mask is not None:
@@ -146,14 +90,14 @@ class GreedyTracer:
         skeleton = np.zeros((H, W), dtype=np.uint8)
         visited = np.zeros((H, W), dtype=bool)
 
-        # Seeds: above threshold AND local maxima
+        # Seeds: above seed_thresh and a strict local maximum.
         candidates = (prob >= self.seed_thresh) & self._local_maxima(prob)
         seed_coords = np.argwhere(candidates)
 
         if len(seed_coords) == 0:
             return skeleton, []
 
-        # Sort by descending vesselness (strongest ridges traced first)
+        # Trace strongest ridges first.
         seed_probs = prob[seed_coords[:, 0], seed_coords[:, 1]]
         order = np.argsort(-seed_probs)
         seed_coords = seed_coords[order]
@@ -172,12 +116,11 @@ class GreedyTracer:
         if self.thin_output and skeleton.any():
             skeleton_bool = skeletonize(skeleton > 0)
 
-            # --- SKAN Pruning Step ---
+            # Prune short tip-to-junction (type 1) branches, then re-skeletonize for clean junctions.
             try:
                 skel = SkanSkeleton(skeleton_bool)
                 stats = summarize(skel, separator='_')
 
-                # Find short Type 1 (tip-to-junction) branches
                 short_tips = stats[(stats['branch-type'] == 1) & (stats['branch-distance'] < self.min_length)]
 
                 pruned = skeleton_bool.copy()
@@ -186,38 +129,17 @@ class GreedyTracer:
                     for r, c in coords.astype(int):
                         pruned[r, c] = False
 
-                # Re-skeletonize to ensure perfect 1-pixel junctions
                 skeleton_bool = skeletonize(pruned)
             except Exception:
-                pass  # Fallback if graph is too small
+                pass  # graph too small to summarize — keep the unpruned skeleton
 
             skeleton = (skeleton_bool * 255).astype(np.uint8)
 
         return skeleton, traces
 
 
-# ==========================================
-# GREEDY TRACER BASELINE
-# ==========================================
-
-
 class GreedyTracerBaseline:
-    """Full pipeline: image → preprocessing → vesselness → greedy tracing → skeleton.
-
-    Args:
-        sigma_min    : smallest Frangi scale (thin capillaries)
-        sigma_max    : largest  Frangi scale (wide vessels)
-        num_scales   : number of scales between min and max
-        gauss_sigma  : Gaussian smoothing applied to vesselness before tracing
-                       suppresses noisy local maxima in background texture
-        seed_thresh  : minimum vesselness to start a trace
-        step_thresh  : minimum vesselness to continue stepping
-        min_length   : discard traces shorter than this (pixels)
-        thin_output  : apply skeletonize to the final binary output
-        min_obj_size : remove isolated skeleton blobs smaller than this after
-                       tracing — set to 0 to disable
-
-    """
+    """End-to-end greedy baseline: preprocessed image → Frangi vesselness → greedy trace → skeleton."""
 
     def __init__(
         self,
@@ -231,87 +153,59 @@ class GreedyTracerBaseline:
         thin_output: bool = True,
         min_obj_size: int = 0,
     ):
+        """Store Frangi/smoothing parameters and build the underlying GreedyTracer.
+
+        ``min_obj_size`` removes isolated skeleton blobs after tracing (0 disables).
+        """
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.num_scales = num_scales
         self.gauss_sigma = gauss_sigma
         self.min_obj_size = min_obj_size
 
-        self.tracer = GreedyTracer(
-            seed_thresh=seed_thresh,
-            step_thresh=step_thresh,
-            min_length=min_length,
-            thin_output=thin_output,
-        )
+        self.tracer = GreedyTracer(seed_thresh=seed_thresh, step_thresh=step_thresh, min_length=min_length, thin_output=thin_output)
 
-    def _compute_vesselness(
-        self,
-        preprocessed: np.ndarray,
-        mask: np.ndarray,
-    ) -> np.ndarray:
-        """Multi-scale Frangi filter → normalize → Gaussian smooth → FOV mask.
+    def _compute_vesselness(self, preprocessed: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Multi-scale Frangi → normalize → Gaussian smooth → eroded-FOV mask.
 
-        Gaussian smoothing suppresses noisy local maxima in background texture
-        while preserving the strong ridges of real vessel centerlines.
+        Smoothing suppresses noisy background maxima; the FOV is eroded 3× to drop the Frangi
+        edge-halo artifact at the boundary.
         """
-        sigmas = np.linspace(
-            self.sigma_min,
-            self.sigma_max,
-            self.num_scales,
-        )
-        vesselness = filters.frangi(
-            preprocessed.astype(np.float64),
-            sigmas=sigmas,
-            black_ridges=True,
-        )
+        sigmas = np.linspace(self.sigma_min, self.sigma_max, self.num_scales)
+        vesselness = filters.frangi(preprocessed.astype(np.float64), sigmas=sigmas, black_ridges=True)
 
-        # Normalize to [0, 1]
-        vmin, vmax = (
-            vesselness.min(),
-            vesselness.max(),
-        )
+        vmin, vmax = (vesselness.min(), vesselness.max())
         vesselness = (vesselness - vmin) / (vmax - vmin + 1e-8)
 
-        # Smooth to suppress noisy local maxima in background
         if self.gauss_sigma > 0:
             vesselness = gaussian_filter(vesselness, sigma=self.gauss_sigma)
 
-        # Erode the mask to kill the Frangi edge halo artifacts
+        # Erode the FOV so the Frangi boundary halo is excluded.
         safe_mask = binary_erosion(mask > 0, iterations=3)
 
-        # Zero outside the NEW, slightly smaller FOV
         vesselness *= safe_mask.astype(np.float32)
 
         return vesselness.astype(np.float32)
 
-    # Change extract_centerline signature:
     def extract_centerline(
-        self,
-        preprocessed: np.ndarray,
-        fov_mask: Optional[np.ndarray] = None,
-        return_vesselness: bool = False,
+        self, preprocessed: np.ndarray, fov_mask: Optional[np.ndarray] = None, return_vesselness: bool = False
     ) -> Tuple[np.ndarray, Optional[np.ndarray], List]:
-        """Args:
-        preprocessed      : (H, W) float32 CLAHE-enhanced [0, 1]
-        fov_mask          : (H, W) uint8 FOV mask {0, 255}
+        """Run the full pipeline on one image and return the traced skeleton.
+
+        Args:
+            preprocessed: (H, W) float32 CLAHE-enhanced grayscale in [0, 1].
+            fov_mask: (H, W) uint8 FOV mask {0, 255}; full image if None.
+            return_vesselness: when False the returned vesselness map is None.
+
+        Returns:
+            ``(skeleton, vesselness or None, traces)``.
         """
-        mask = (
-            fov_mask
-            if fov_mask is not None
-            else np.ones(
-                preprocessed.shape[:2],
-                dtype=np.uint8,
-            )
-            * 255
-        )
+        mask = fov_mask if fov_mask is not None else np.ones(preprocessed.shape[:2], dtype=np.uint8) * 255
         vesselness = self._compute_vesselness(preprocessed, mask)
         skeleton, traces = self.tracer.trace(vesselness, fov_mask=mask)
 
         if skeleton.any() and self.min_obj_size > 0:
-            skeleton_bool = remove_small_objects(
-                skeleton > 0,
-                min_size=self.min_obj_size,
-            )
+            skeleton_bool = remove_small_objects(skeleton > 0, min_size=self.min_obj_size)
             skeleton = (skeleton_bool * 255).astype(np.uint8)
 
         if return_vesselness:

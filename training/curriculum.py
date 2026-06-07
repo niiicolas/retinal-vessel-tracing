@@ -1,28 +1,19 @@
-# training/curriculum.py
-"""Curriculum learning for progressive training difficulty."""
+"""Curriculum learning: progressively raises sample difficulty as the agent's success rate grows."""
 
 import logging
 from collections import deque
 from dataclasses import dataclass, fields
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-)
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 from scipy import ndimage
 
-from data.centerline_extraction import (
-    CenterlineExtractor,
-)
+from data.centerline_extraction import CenterlineExtractor
 
 
 @dataclass
 class CurriculumStage:
-    """A stage in the curriculum."""
+    """Config for one curriculum stage: difficulty target, advancement gates, and env/entropy overrides."""
 
     name: str
     difficulty: float
@@ -39,43 +30,26 @@ class CurriculumStage:
     off_track_penalty_ramp: bool = False
 
 
-# Convolution kernel used to count 8-connected neighbours on a binary
-# skeleton. Pre-computed once at import time so compute_sample_difficulty
-# does not rebuild it per call.
-_NEIGHBOUR_KERNEL = np.array(
-    [[1, 1, 1], [1, 0, 1], [1, 1, 1]],
-    dtype=np.int32,
-)
+# 8-neighbour count kernel, built once so compute_sample_difficulty doesn't rebuild it per call.
+_NEIGHBOUR_KERNEL = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.int32)
 
 
 class CurriculumManager:
-    """Manages curriculum learning for vessel tracing.
+    """Drives stage progression and the per-sample difficulty filter for vessel-tracing training.
 
-    Progressively increases difficulty from easy cases (large, well-defined
-    vessels) to hard cases (thin capillaries, pathologies, poor contrast).
-
-    Three coupled difficulty notions are unified here:
-      * ``stage.difficulty``  — discrete per-stage target.
-      * warmup progress       — fractional ramp from start→end difficulty.
-      * ``current_difficulty`` — the value sampled against by data filtering;
-        always ``max(stage.difficulty, warmup_progress)`` so it can never
-        regress below the active stage's floor.
+    Unifies the per-stage difficulty target with an intra-stage warmup ramp into a single
+    ``current_difficulty`` that never regresses below the active stage's floor.
     """
 
     def __init__(self, config: Dict[str, Any]):
+        """Build stages from config and initialise stage/difficulty/success-tracking state."""
         curriculum_config = config.get('curriculum', {})
         self._cfg = curriculum_config
 
         self.start_difficulty = float(curriculum_config.get('start_difficulty', 0.2))
 
-        # Warmup is counted in episodes (CurriculumManager.step is invoked
-        # once per finished episode by PPOTrainer).
-        self.warmup_episodes = int(
-            max(
-                1,
-                curriculum_config.get('warmup_episodes', 5_000),
-            )
-        )
+        # Warmup is counted in episodes; step() is called once per finished episode.
+        self.warmup_episodes = int(max(1, curriculum_config.get('warmup_episodes', 5_000)))
         if self.warmup_episodes > 100_000:
             logging.warning(
                 'CurriculumManager: warmup_episodes=%d is very large; the linear difficulty ramp is unlikely to complete during training.',
@@ -83,13 +57,9 @@ class CurriculumManager:
             )
 
         self.total_episodes = 0
-        # Episodes observed since entering the current stage. Drives the
-        # intra-stage difficulty ramp (see _compute_effective_difficulty).
+        # Episodes since entering the current stage; drives the intra-stage ramp.
         self._episodes_in_stage: int = 0
 
-        # ------------------------------------------------------------------
-        # Build CurriculumStage objects from the config dicts
-        # ------------------------------------------------------------------
         self.stages: List[CurriculumStage] = self._build_stages(curriculum_config.get('stages', None))
         self._validate_stages()
 
@@ -98,47 +68,30 @@ class CurriculumManager:
         self._recent_successes: deque = deque(maxlen=self._window_size)
         self._warn_oversized_min_episodes()
 
-        # Stage transitions are gated to AT MOST ONE per outer PPO
-        # iteration. Inside one rollout the trainer may push thousands of
-        # episodes through ``step()`` with the same ``stage_iter`` value;
-        # without this guard a clear-and-refill of the success deque can
-        # cascade advance→advance→advance in a single iteration (observed
-        # on iter 1: easy → medium → full). Tracks the last ``stage_iter``
-        # at which a transition fired.
+        # Cap transitions to one per outer PPO iteration: a single rollout pushes thousands of
+        # episodes through step() with one stage_iter, which could otherwise cascade advances.
         self._last_transition_iter: int = -1
 
-        # Optional regression knobs. Disabled by default — a stage cannot
-        # be un-advanced unless the user opts in, since regression has
-        # historically been a footgun (oscillation between stages).
+        # Optional regression (off by default — historically a footgun causing stage oscillation).
         self.enable_regression: bool = bool(curriculum_config.get('enable_regression', False))
-        # Regress when rolling success rate falls below this fraction of
-        # the *previous* stage's min_success_rate. Conservative default.
+        # Regress when success drops below this fraction of the previous stage's min_success_rate.
         self.regression_ratio: float = float(curriculum_config.get('regression_ratio', 0.5))
-        # Minimum iterations in the current stage before regression can
-        # fire. Mirrors min_iterations for advancement to avoid flapping.
+        # Minimum iterations in-stage before regression may fire (anti-flapping).
         self.regression_grace_iters: int = int(curriculum_config.get('regression_grace_iters', 50))
 
-        # Difficulty starts at the floor of the first stage so filtering
-        # is sensible from step 0 — otherwise filter_samples returns a
-        # near-empty set if start_difficulty < stage[0].difficulty.
+        # Seed difficulty at the first stage's floor so filtering is sensible from step 0.
         self.current_difficulty = self._compute_effective_difficulty()
 
-    # ==================================================================
-    # Construction helpers
-    # ==================================================================
-
     @staticmethod
-    def _build_stages(
-        stage_dicts: Optional[List[Dict[str, Any]]],
-    ) -> List[CurriculumStage]:
+    def _build_stages(stage_dicts: Optional[List[Dict[str, Any]]]) -> List[CurriculumStage]:
+        """Build CurriculumStage objects from config dicts, dropping unknown keys and validating required ones.
+
+        Returns a single default stage when no stages are configured.
+        """
         if not stage_dicts:
             return [
                 CurriculumStage(
-                    name='default',
-                    difficulty=1.0,
-                    min_success_rate=0.3,
-                    min_episodes=100,
-                    description='Single default stage (no stages configured)',
+                    name='default', difficulty=1.0, min_success_rate=0.3, min_episodes=100, description='Single default stage (no stages configured)'
                 )
             ]
 
@@ -165,20 +118,14 @@ class CurriculumManager:
         return stages
 
     def _validate_stages(self) -> None:
-        """Sanity-check stage definitions; warn on non-monotonic difficulty."""
+        """Warn on out-of-range fields and non-monotonic (decreasing) stage difficulty."""
         for i, st in enumerate(self.stages):
             if not (0.0 <= st.difficulty <= 1.0):
                 logging.warning(
-                    'CurriculumManager: stage %r has difficulty=%.3f outside [0, 1]; the difficulty filter will behave oddly.',
-                    st.name,
-                    st.difficulty,
+                    'CurriculumManager: stage %r has difficulty=%.3f outside [0, 1]; the difficulty filter will behave oddly.', st.name, st.difficulty
                 )
             if not (0.0 <= st.min_success_rate <= 1.0):
-                logging.warning(
-                    'CurriculumManager: stage %r has min_success_rate=%.3f outside [0, 1].',
-                    st.name,
-                    st.min_success_rate,
-                )
+                logging.warning('CurriculumManager: stage %r has min_success_rate=%.3f outside [0, 1].', st.name, st.min_success_rate)
         for i in range(1, len(self.stages)):
             if self.stages[i].difficulty < self.stages[i - 1].difficulty:
                 logging.warning(
@@ -191,9 +138,8 @@ class CurriculumManager:
                     self.stages[i - 1].difficulty,
                 )
 
-    def _warn_oversized_min_episodes(
-        self,
-    ) -> None:
+    def _warn_oversized_min_episodes(self) -> None:
+        """Warn when a stage's ``min_episodes`` exceeds the rolling window (advancement is capped at the window)."""
         for st in self.stages:
             if st.min_episodes > self._window_size:
                 logging.warning(
@@ -206,29 +152,20 @@ class CurriculumManager:
                     self._window_size,
                 )
 
-    # ==================================================================
-    # Public API
-    # ==================================================================
-
     def get_difficulty(self) -> float:
-        """Current effective difficulty in ``[0, 1]``."""
+        """Return the current effective difficulty in [0, 1]."""
         return self.current_difficulty
 
-    def get_current_stage(
-        self,
-    ) -> CurriculumStage:
+    def get_current_stage(self) -> CurriculumStage:
+        """Return the currently active CurriculumStage."""
         return self.stages[self.current_stage_idx]
 
-    def step(
-        self,
-        success: bool = False,
-        stage_iter: int = 0,
-    ) -> None:
-        """Update curriculum state after one episode.
+    def step(self, success: bool = False, stage_iter: int = 0) -> None:
+        """Update curriculum state after one episode, then check for a stage transition.
 
         Args:
-            success: Whether the episode was successful.
-            stage_iter: PPO iterations spent in the current stage.
+            success: whether the episode counted as a success.
+            stage_iter: PPO iterations spent in the current stage (transition gate).
         """
         self.total_episodes += 1
         self._episodes_in_stage += 1
@@ -237,10 +174,7 @@ class CurriculumManager:
         self._check_stage_transitions(stage_iter)
 
     def is_episode_successful(self, info: Dict[str, Any]) -> bool:
-        """Decide whether an episode counts as a success.
-
-        See module docstring for the (unchanged) criteria.
-        """
+        """Return whether an episode counts as a success under difficulty-scaled length/precision/F1 thresholds."""
         stage = self.get_current_stage()
 
         base = self._cfg.get('success_min_steps_base', 20)
@@ -250,25 +184,16 @@ class CurriculumManager:
         ep_len = info.get('step_count', 0)
         precision = info.get('precision', 0.0)
 
+        # F1 gate applies only when the episode reported a terminal F1.
         ep_f1 = info.get('episode_f1', None)
         if ep_f1 is not None:
-            min_f1 = (
-                self._cfg.get('success_min_f1_base', 0.10)
-                + self._cfg.get('success_min_f1_scale', 0.15) * stage.difficulty
-            )
+            min_f1 = self._cfg.get('success_min_f1_base', 0.10) + self._cfg.get('success_min_f1_scale', 0.15) * stage.difficulty
             return float(ep_f1) >= min_f1 and ep_len >= min_length and precision >= min_precision
 
         return ep_len >= min_length and precision >= min_precision
 
-    def get_stage_overrides(
-        self,
-    ) -> Dict[str, Any]:
-        """Return config overrides for the current stage.
-
-        Includes the entropy annealing fields so downstream consumers can
-        rely on a single source-of-truth instead of reading the stage
-        object directly via ``getattr``.
-        """
+    def get_stage_overrides(self) -> Dict[str, Any]:
+        """Return the current stage's reward/environment/training config overrides (incl. entropy annealing)."""
         stage = self.get_current_stage()
         return {
             'reward': {'smoothness_weight': stage.smoothness_weight},
@@ -284,15 +209,10 @@ class CurriculumManager:
             },
         }
 
-    def filter_samples(
-        self,
-        samples: List[Dict],
-        difficulty_fn: Callable[[Dict], float],
-    ) -> List[Dict]:
-        """Filter samples to those at or below the current difficulty.
+    def filter_samples(self, samples: List[Dict], difficulty_fn: Callable[[Dict], float]) -> List[Dict]:
+        """Return samples at or below the current difficulty, falling back to the 10 easiest if too few pass.
 
-        Falls back to the 10 *easiest* samples (not the first 10 in input
-        order) when the threshold filter is too aggressive.
+        ``difficulty_fn`` maps a sample to its difficulty score.
         """
         difficulty = self.get_difficulty()
         scored = [(difficulty_fn(s), s) for s in samples]
@@ -304,15 +224,10 @@ class CurriculumManager:
 
         return filtered
 
-    def compute_sample_difficulty(
-        self,
-        centerline: np.ndarray,
-        vessel_mask: np.ndarray,
-    ) -> float:
-        """Compute difficulty score for a sample in ``[0, 1]``.
+    def compute_sample_difficulty(self, centerline: np.ndarray, vessel_mask: np.ndarray) -> float:
+        """Score a sample's difficulty in [0, 1] from vessel thinness, junction density, and sparsity.
 
-        Empty-centerline samples are treated as maximally difficult and
-        short-circuit before partial scores can be returned.
+        Empty-centerline / empty-vessel samples short-circuit to maximal difficulty (1.0).
         """
         centerline_pixels = float(centerline.sum())
         vessel_pixels = float(vessel_mask.sum())
@@ -320,25 +235,18 @@ class CurriculumManager:
         if centerline_pixels <= 0 or vessel_pixels <= 0:
             return 1.0
 
-        # --- average vessel width (thinner → harder) ---
+        # Thinner average vessel width → harder.
         avg_width = vessel_pixels / centerline_pixels
         width_difficulty = 1.0 - min(avg_width / 10.0, 1.0)
 
-        # --- junction density (more → harder) ---
-        # Counted inline rather than via CenterlineExtractor._find_junctions
-        # so we don't reach into private API and don't construct an
-        # extractor on every call.
+        # Junction density (degree>2 skeleton pixels per 1000 centerline px) → harder.
         binary_skel = (centerline > 0).astype(np.int32)
-        neighbour_counts = ndimage.convolve(
-            binary_skel,
-            _NEIGHBOUR_KERNEL,
-            mode='constant',
-        )
+        neighbour_counts = ndimage.convolve(binary_skel, _NEIGHBOUR_KERNEL, mode='constant')
         num_junctions = int(np.count_nonzero((binary_skel > 0) & (neighbour_counts > 2)))
         junction_density = num_junctions / centerline_pixels * 1000.0
         junction_difficulty = min(junction_density / 10.0, 1.0)
 
-        # --- vessel pixel density (sparser → harder) ---
+        # Sparser vessel coverage → harder.
         total_pixels = float(centerline.shape[0] * centerline.shape[1])
         vessel_density = vessel_pixels / total_pixels
         density_difficulty = 1.0 - min(vessel_density * 20.0, 1.0)
@@ -349,17 +257,13 @@ class CurriculumManager:
 
     @property
     def recent_success_rate(self) -> float:
-        """Rolling success rate over the current window. 0.0 if empty."""
+        """Rolling success rate over the current window (0.0 when empty)."""
         if not self._recent_successes:
             return 0.0
         return sum(self._recent_successes) / len(self._recent_successes)
 
-    # ==================================================================
-    # Checkpointing
-    # ==================================================================
-
     def state_dict(self) -> Dict[str, Any]:
-        """Serialise mutable state for checkpointing."""
+        """Serialise mutable curriculum state for checkpointing."""
         return {
             'version': 1,
             'current_stage_idx': self.current_stage_idx,
@@ -371,7 +275,7 @@ class CurriculumManager:
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
-        """Restore from a checkpoint produced by :meth:`state_dict`."""
+        """Restore curriculum state from a :meth:`state_dict` checkpoint, recomputing difficulty from config."""
         if not isinstance(state, dict):
             raise TypeError(f'CurriculumManager.load_state_dict expects a dict, got {type(state).__name__}')
 
@@ -382,39 +286,17 @@ class CurriculumManager:
         self._episodes_in_stage = int(state.get('episodes_in_stage', 0))
 
         recent = state.get('recent_successes', [])
-        self._recent_successes = deque(
-            (int(bool(x)) for x in recent),
-            maxlen=self._window_size,
-        )
+        self._recent_successes = deque((int(bool(x)) for x in recent), maxlen=self._window_size)
         self._last_transition_iter = int(state.get('last_transition_iter', -1))
 
-        # Recompute difficulty rather than trusting the saved value so a
-        # config change (e.g. tighter warmup) takes effect on resume.
+        # Recompute (don't trust saved value) so config changes take effect on resume.
         self.current_difficulty = self._compute_effective_difficulty()
 
-    # ==================================================================
-    # Internal helpers
-    # ==================================================================
+    def _compute_effective_difficulty(self) -> float:
+        """Return the stage-driven difficulty: a linear prev→target ramp over the in-stage warmup, then pinned to target.
 
-    def _compute_effective_difficulty(
-        self,
-    ) -> float:
-        """The difficulty used by ``filter_samples`` and downstream code.
-
-        Strictly stage-driven, with an intra-stage linear ramp:
-
-          * ``target`` = current stage's ``difficulty``.
-          * ``prev``   = previous stage's ``difficulty`` (or
-            ``start_difficulty`` for stage 0).
-          * Over the first ``warmup_episodes`` episodes spent inside the
-            current stage, difficulty linearly interpolates ``prev → target``.
-          * Afterwards difficulty is pinned to ``target`` until the next
-            stage advancement.
-
-        This couples the sample-filter threshold to the active stage so
-        bug #2 (unsynchronised difficulty notions) cannot reappear: a
-        global warmup can no longer race ahead of stage advancement and
-        open the dataset filter while we are nominally still in ``easy``.
+        Coupling the filter threshold to the active stage prevents a global warmup from racing
+        ahead of stage advancement.
         """
         target = self.get_current_stage().difficulty
         if self.current_stage_idx == 0:
@@ -428,15 +310,7 @@ class CurriculumManager:
         return float(prev + progress * (target - prev))
 
     def _check_stage_transitions(self, stage_iter: int) -> None:
-        """Advance — or, if enabled, regress — based on rolling success.
-
-        Hard cap of one transition per ``stage_iter`` value: once a stage
-        changes, no further check fires until the trainer ticks
-        ``stage_iter`` (i.e. starts a new outer PPO iteration). This
-        prevents the chained-advance pathology where a single rollout's
-        thousands of episodes refill the success deque after a clear()
-        and immediately satisfy the next stage's gates.
-        """
+        """Try one advance (or, if enabled, one regress) per ``stage_iter``, gated to avoid chained transitions."""
         if stage_iter <= self._last_transition_iter:
             return
         if self._maybe_advance(stage_iter):
@@ -446,6 +320,7 @@ class CurriculumManager:
             self._last_transition_iter = stage_iter
 
     def _maybe_advance(self, stage_iter: int) -> bool:
+        """Advance to the next stage when min-iterations, window-fill, and success-rate gates all pass; return True if it did."""
         if self.current_stage_idx >= len(self.stages) - 1:
             return False
 
@@ -454,10 +329,7 @@ class CurriculumManager:
         if stage_iter < current_stage.min_iterations:
             return False
 
-        min_obs = min(
-            current_stage.min_episodes,
-            self._window_size,
-        )
+        min_obs = min(current_stage.min_episodes, self._window_size)
         if len(self._recent_successes) < min_obs:
             return False
 
@@ -468,22 +340,11 @@ class CurriculumManager:
         self._recent_successes.clear()
         self._episodes_in_stage = 0
         self.current_difficulty = self._compute_effective_difficulty()
-        logging.info(
-            'Advancing to curriculum stage: %s',
-            self.stages[self.current_stage_idx].name,
-        )
+        logging.info('Advancing to curriculum stage: %s', self.stages[self.current_stage_idx].name)
         return True
 
     def _maybe_regress(self, stage_iter: int) -> bool:
-        """Optionally step back one stage on sustained underperformance.
-
-        Guarded by:
-          * ``enable_regression`` (default False).
-          * ``regression_grace_iters`` — minimum time in the stage.
-          * Window must be full (same observation gate as advancement).
-          * Rolling success rate must be below
-            ``regression_ratio * previous_stage.min_success_rate``.
-        """
+        """Step back one stage on sustained underperformance (grace period, full window, sub-threshold rate); return True if it did."""
         if self.current_stage_idx == 0:
             return False
         if stage_iter < self.regression_grace_iters:

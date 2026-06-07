@@ -1,15 +1,7 @@
-"""run_cnn.py
-=========================
-Centerline UNet CNN Baseline — dataset-agnostic.
+"""Centerline UNet CNN baseline: train/val/test driver, dataset-agnostic.
 
-Three-way split:
-  train → gradient updates
-  val   → checkpoint selection
-  test  → final metric reporting (never seen during training)
-
-For datasets with an official test directory (e.g. DRIVE), the test
-split is loaded from there automatically.  For single-folder datasets
-(e.g. STARE), a ratio-based 3-way split is used.
+Trains on the combined train split, selects checkpoints on val, and reports final metrics on
+held-out test sets via the shared scorer so numbers are comparable to the RL agent.
 """
 
 import os
@@ -20,46 +12,24 @@ from pathlib import Path
 import albumentations as A
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import (
-    CosineAnnealingLR,
-)
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data.dataloader import (
-    OUTPUT_DIR as _OUTPUT_BASE,
-)
-from data.dataloader import (
-    TEST_DATASETS,
-    WEIGHTS_DIR,
-    get_data,
-    get_test_data,
-)
+from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
+from data.dataloader import TEST_DATASETS, WEIGHTS_DIR, get_data, get_test_data
 from evaluation.metrics import CenterlineMetrics
-from evaluation.scoring import (
-    score_prediction,
-    write_eval_csvs,
-)
-from models.unet import (
-    CenterlineLoss,
-    CenterlinePredictor,
-    CenterlineUNet,
-)
+from evaluation.scoring import score_prediction, write_eval_csvs
+from models.unet import CenterlineLoss, CenterlinePredictor, CenterlineUNet
 from config import TOLERANCE
-from data.centerline_extraction import (
-    CenterlineExtractor,
-)
+from data.centerline_extraction import CenterlineExtractor
 
 _extractor = CenterlineExtractor()
 
-# ==========================================
-# CONFIG
-# ==========================================
 SAVE_PATH = str(WEIGHTS_DIR / 'centerline_unet.pt')
 OUTPUT_DIR = str(_OUTPUT_BASE / 'unet')
 
@@ -70,96 +40,32 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 MODEL_CFG = dict(in_channels=1, base_ch=16)
 RESIZE = (512, 512)
 
-# Standardised metric columns — shared across all baseline scripts
-METRIC_COLS = [
-    'iou',
-    'clDice',
-    'betti_0_error',
-    'hd95',
-    'f1@1px',
-    'precision@1px',
-    'recall@1px',
-    'f1@2px',
-    'precision@2px',
-    'recall@2px',
-    'f1@3px',
-    'precision@3px',
-    'recall@3px',
-]
 
-
-# ==========================================
-# AUGMENTATION
-# ==========================================
 def get_train_transforms():
+    """Return the Albumentations training pipeline (flips/rotations/photometric/elastic), keeping masks aligned."""
     return A.Compose(
         [
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
-            A.RandomBrightnessContrast(
-                brightness_limit=0.2,
-                contrast_limit=0.2,
-                p=0.3,
-            ),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
             A.OneOf(
-                [
-                    A.ElasticTransform(alpha=1, sigma=50, p=1.0),
-                    A.GridDistortion(p=1.0),
-                ],
+                [A.ElasticTransform(alpha=1, sigma=50, p=1.0), A.GridDistortion(p=1.0)],
                 p=0.2,
             ),
             A.GaussianBlur(blur_limit=(3, 5), p=0.1),
         ],
-        additional_targets={
-            'fov': 'mask',
-            'thick_gt': 'mask',
-        },
+        additional_targets={'fov': 'mask', 'thick_gt': 'mask'},
     )
 
 
 def get_val_transforms():
+    """Return None — no augmentation at validation/test time."""
     return None
 
 
-# def _spatial_normalize():
-#     return [
-#         A.LongestMaxSize(max_size=584),
-#         A.PadIfNeeded(min_height=584, min_width=584, border_mode=0),
-#     ]
-
-# def get_train_transforms():
-#     return A.Compose([
-#         *_spatial_normalize(),
-#         A.HorizontalFlip(p=0.5),
-#         A.VerticalFlip(p=0.5),
-#         A.RandomRotate90(p=0.5),
-#         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
-#         A.OneOf([
-#             A.ElasticTransform(alpha=1, sigma=50, p=1.0),
-#             A.GridDistortion(p=1.0),
-#         ], p=0.2),
-#         A.GaussianBlur(blur_limit=(3, 5), p=0.1),
-#     ], additional_targets={'fov': 'mask', 'thick_gt': 'mask'})
-
-# def get_val_transforms():
-#     return A.Compose(
-#         _spatial_normalize(),
-#         additional_targets={'fov': 'mask', 'thick_gt': 'mask'},
-#     )
-
-
-# ==========================================
-# TRAINING HELPERS
-# ==========================================
-def run_epoch(
-    model,
-    loader,
-    criterion,
-    optimizer=None,
-    device='cpu',
-    desc='',
-):
+def run_epoch(model, loader, criterion, optimizer=None, device='cpu', desc=''):
+    """Run one epoch and return its mean loss; trains when ``optimizer`` is given, else evaluates."""
     model.train() if optimizer else model.eval()
     total_loss = 0
     with torch.set_grad_enabled(optimizer is not None):
@@ -179,27 +85,11 @@ def run_epoch(
 
 
 def plot_loss_curves(train_losses, val_losses, save_path):
+    """Plot train vs val loss over epochs and save the figure to ``save_path``."""
     plt.figure(figsize=(10, 6))
-    plt.plot(
-        range(1, len(train_losses) + 1),
-        train_losses,
-        label='Train Loss',
-        color='#1f77b4',
-        lw=2,
-    )
-    plt.plot(
-        range(1, len(val_losses) + 1),
-        val_losses,
-        label='Val Loss',
-        color='#ff7f0e',
-        lw=2,
-        linestyle='--',
-    )
-    plt.title(
-        'CNN Training Progression',
-        fontsize=14,
-        fontweight='bold',
-    )
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss', color='#1f77b4', lw=2)
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Val Loss', color='#ff7f0e', lw=2, linestyle='--')
+    plt.title('CNN Training Progression', fontsize=14, fontweight='bold')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.grid(True, alpha=0.3)
@@ -209,16 +99,9 @@ def plot_loss_curves(train_losses, val_losses, save_path):
     plt.close()
 
 
-# ==========================================
-# EVALUATION
-# ==========================================
 @torch.no_grad()
-def evaluate_and_visualize(
-    checkpoint_path,
-    test_dataset,
-    split_label='Test',
-    output_dir=None,
-):
+def evaluate_and_visualize(checkpoint_path, test_dataset, split_label='Test', output_dir=None):
+    """Predict on a dataset, score via the shared scorer, and write per-image panels, a mosaic, and CSVs."""
     if output_dir is None:
         output_dir = str(_OUTPUT_BASE / 'unet')
     print(f'\nEvaluating on {split_label} set ({len(test_dataset)} images)')
@@ -245,48 +128,22 @@ def evaluate_and_visualize(
 
         prob_map, pred_skel = predictor.predict(img_np, fov_mask=mask_np)
 
-        # Same GT + SHARED scorer as the RL agent → directly comparable to v12.
-        dt = _extractor.compute_distance_transform(
-            (gt_skel > 0).astype(np.float32),
-            TOLERANCE,
-        )
-        res = score_prediction(
-            pred_skel,
-            centerline=gt_skel,
-            vessel_mask=vessel_mask,
-            fov_mask=mask_np,
-            distance_transform=dt,
-            tolerance=TOLERANCE,
-        )
+        # Same GT + shared scorer as the RL agent → directly comparable to v12.
+        dt = _extractor.compute_distance_transform((gt_skel > 0).astype(np.float32), TOLERANCE)
+        res = score_prediction(pred_skel, centerline=gt_skel, vessel_mask=vessel_mask, fov_mask=mask_np, distance_transform=dt, tolerance=TOLERANCE)
         res['image_id'] = image_id
         all_metrics.append(res)
 
         gt_vis = (gt_skel > 0).astype(np.uint8) * 255
         pred_vis = (pred_skel > 0).astype(np.uint8) * 255
-        mosaic_data.append(
-            dict(
-                image_id=image_id,
-                gt_skeleton=gt_vis,
-                pred_skeleton=pred_vis,
-                metrics=res,
-            )
-        )
+        mosaic_data.append(dict(image_id=image_id, gt_skeleton=gt_vis, pred_skeleton=pred_vis, metrics=res))
 
-        # Per-image panel
-        fig, axes = plt.subplots(
-            1,
-            4,
-            figsize=(24, 7),
-            facecolor='white',
-        )
+        fig, axes = plt.subplots(1, 4, figsize=(24, 7), facecolor='white')
         axes[0].imshow(img_np, cmap='gray')
         axes[0].set_title(f'Preprocessed ({image_id})')
         axes[1].imshow(prob_map * (mask_np > 0), cmap='gray')
         axes[1].set_title('Probability Map')
-        axes[2].imshow(
-            np.concatenate([gt_vis, pred_vis], axis=1),
-            cmap='gray',
-        )
+        axes[2].imshow(np.concatenate([gt_vis, pred_vis], axis=1), cmap='gray')
         axes[2].set_title('GT | Pred')
         overlay = np.zeros((*img_np.shape[:2], 3), dtype=np.uint8)
         overlay[..., 1] = gt_vis
@@ -296,25 +153,14 @@ def evaluate_and_visualize(
         for ax in axes:
             ax.axis('off')
         plt.tight_layout()
-        plt.savefig(
-            os.path.join(
-                panels_dir,
-                f'{image_id}_panel.png',
-            ),
-            dpi=150,
-        )
+        plt.savefig(os.path.join(panels_dir, f'{image_id}_panel.png'), dpi=150)
         plt.close()
 
-    # Mosaic
     if mosaic_data:
         n = len(mosaic_data)
         n_cols = min(n, 4)
         n_rows = int(np.ceil(n / n_cols))
-        fig, axes = plt.subplots(
-            n_rows,
-            n_cols,
-            figsize=(n_cols * 5, n_rows * 5),
-        )
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 5))
         axes = np.array(axes).reshape(-1)
         for i, d in enumerate(mosaic_data):
             h, w = d['gt_skeleton'].shape
@@ -323,50 +169,27 @@ def evaluate_and_visualize(
             ov[..., 0] = d['pred_skeleton']
             axes[i].imshow(ov)
             axes[i].set_title(
-                f'{d["image_id"]}\nF1@2px: {d["metrics"].get("f1@2px", 0):.3f} | IoU: {d["metrics"].get("iou", 0):.3f}',
-                fontweight='bold',
+                f'{d["image_id"]}\nF1@2px: {d["metrics"].get("f1@2px", 0):.3f} | IoU: {d["metrics"].get("iou", 0):.3f}', fontweight='bold'
             )
             axes[i].axis('off')
         for j in range(i + 1, len(axes)):
             axes[j].axis('off')
         plt.tight_layout()
-        plt.savefig(
-            os.path.join(
-                output_dir,
-                f'mosaic_{split_label.lower()}.png',
-            ),
-            dpi=200,
-        )
+        plt.savefig(os.path.join(output_dir, f'mosaic_{split_label.lower()}.png'), dpi=200)
         plt.close()
 
-    # Summary — written in the RL eval format via the shared writer.
     write_eval_csvs(output_dir, all_metrics)
     f1 = np.mean([m['f1@2px'] for m in all_metrics]) if all_metrics else float('nan')
     print(f'\n[unet/{split_label}] {len(all_metrics)} imgs  f1@2px={f1:.4f}  → {output_dir}')
 
 
-# ==========================================
-# MAIN
-# ==========================================
 if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--train',
-        action='store_true',
-        help='Train the model',
-    )
-    parser.add_argument(
-        '--eval',
-        action='store_true',
-        help='Evaluate on val set',
-    )
-    parser.add_argument(
-        '--test',
-        action='store_true',
-        help='Test on external datasets',
-    )
+    parser.add_argument('--train', action='store_true', help='Train the model')
+    parser.add_argument('--eval', action='store_true', help='Evaluate on val set')
+    parser.add_argument('--test', action='store_true', help='Test on external datasets')
     args = parser.parse_args()
 
     if not args.train and not args.eval and not args.test:
@@ -375,19 +198,8 @@ if __name__ == '__main__':
     OUTPUT_DIR = str(_OUTPUT_BASE / 'unet')
 
     if args.train:
-        train_ds, train_loader = get_data(
-            'unet',
-            'train',
-            batch_size=BATCH_SIZE,
-            resize=RESIZE,
-            transform=get_train_transforms(),
-        )
-        val_ds, val_loader = get_data(
-            'unet',
-            'val',
-            batch_size=1,
-            resize=RESIZE,
-        )
+        train_ds, train_loader = get_data('unet', 'train', batch_size=BATCH_SIZE, resize=RESIZE, transform=get_train_transforms())
+        val_ds, val_loader = get_data('unet', 'val', batch_size=1, resize=RESIZE)
         print(f'[Combined]  train={len(train_ds)}  val={len(val_ds)}')
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -401,89 +213,37 @@ if __name__ == '__main__':
 
         print(f'--- Training ({EPOCHS} epochs) ---')
         for epoch in range(1, EPOCHS + 1):
-            t_loss = run_epoch(
-                model,
-                train_loader,
-                criterion,
-                optimizer,
-                DEVICE,
-                'Train',
-            )
-            v_loss = run_epoch(
-                model,
-                val_loader,
-                criterion,
-                None,
-                DEVICE,
-                'Val',
-            )
+            t_loss = run_epoch(model, train_loader, criterion, optimizer, DEVICE, 'Train')
+            v_loss = run_epoch(model, val_loader, criterion, None, DEVICE, 'Val')
             train_hist.append(t_loss)
             val_hist.append(v_loss)
             scheduler.step()
 
+            # Checkpoint on best validation loss.
             if v_loss < best_val_loss:
                 best_val_loss = v_loss
-                os.makedirs(
-                    os.path.dirname(SAVE_PATH),
-                    exist_ok=True,
-                )
-                torch.save(
-                    {
-                        'model_state': model.state_dict(),
-                        'model_cfg': MODEL_CFG,
-                    },
-                    SAVE_PATH,
-                )
+                os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+                torch.save({'model_state': model.state_dict(), 'model_cfg': MODEL_CFG}, SAVE_PATH)
 
             if epoch % 10 == 0 or epoch == 1:
                 print(f'  Epoch {epoch:>3}/{EPOCHS}  train={t_loss:.4f}  val={v_loss:.4f}')
 
-        plot_loss_curves(
-            train_hist,
-            val_hist,
-            os.path.join(
-                OUTPUT_DIR,
-                'training_val_curves.png',
-            ),
-        )
+        plot_loss_curves(train_hist, val_hist, os.path.join(OUTPUT_DIR, 'training_val_curves.png'))
         print(f'Best val loss: {best_val_loss:.4f}')
 
     if args.eval and os.path.exists(SAVE_PATH):
-        val_ds, _ = get_data(
-            'unet',
-            'val',
-            batch_size=1,
-            resize=RESIZE,
-        )
+        val_ds, _ = get_data('unet', 'val', batch_size=1, resize=RESIZE)
         val_output_dir = str(_OUTPUT_BASE / 'unet' / 'RL_tracing_e2e' / 'val')
         os.makedirs(val_output_dir, exist_ok=True)
-        evaluate_and_visualize(
-            SAVE_PATH,
-            val_ds,
-            split_label='Val',
-            output_dir=val_output_dir,
-        )
+        evaluate_and_visualize(SAVE_PATH, val_ds, split_label='Val', output_dir=val_output_dir)
 
     if args.test and os.path.exists(SAVE_PATH):
         for ext_name in TEST_DATASETS:
             try:
-                ext_ds, _ = get_test_data(
-                    ext_name,
-                    'unet',
-                    batch_size=1,
-                    resize=RESIZE,
-                )
-            except (
-                KeyError,
-                FileNotFoundError,
-            ) as exc:
+                ext_ds, _ = get_test_data(ext_name, 'unet', batch_size=1, resize=RESIZE)
+            except (KeyError, FileNotFoundError) as exc:
                 print(f'Skipping external test set {ext_name}: {exc}')
                 continue
             ext_output_dir = str(_OUTPUT_BASE / 'unet' / 'RL_tracing_e2e' / ext_name)
             os.makedirs(ext_output_dir, exist_ok=True)
-            evaluate_and_visualize(
-                SAVE_PATH,
-                ext_ds,
-                split_label=ext_name,
-                output_dir=ext_output_dir,
-            )
+            evaluate_and_visualize(SAVE_PATH, ext_ds, split_label=ext_name, output_dir=ext_output_dir)
