@@ -280,8 +280,6 @@ class VesselTracingEnv(gym.Env):
         self._update_frontier_mask()
         if self.use_topology_memory:
             self._maybe_register_junction()
-        # Initialise uncovered-centerline DT for F3 shaping / H6 progress; refreshed
-        # every _uncov_dt_refresh steps in step().
         if self._needs_uncov_dt:
             self._refresh_uncov_dt()
         else:
@@ -429,8 +427,6 @@ class VesselTracingEnv(gym.Env):
         if rn > 0:
             self._prev_world_vec = raw_direction / rn
 
-        # Out of bounds: flat penalty (crediting on-vessel boundary exits made OOB a cheap
-        # episode-ender; v11 experiment reverted).
         if not self._is_valid_position(new_position):
             state = RewardState(
                 is_terminal=True,
@@ -470,8 +466,6 @@ class VesselTracingEnv(gym.Env):
         # Soft UNet vesselness at the current pixel (dense vessel evidence).
         vness = float(self.unet_prior[self.position[0], self.position[1]]) if self.unet_prior is not None else None
 
-        # ONE on-vessel decision drives BOTH termination and reward gating so they can't
-        # conflict (the v9 failure). All signals leak-free except "gt".
         if self._on_vessel_signal == 'vesselness' and vness is not None:
             on_vessel = vness >= self._vesselness_tau
         elif self._on_vessel_signal == 'gt':
@@ -498,17 +492,13 @@ class VesselTracingEnv(gym.Env):
         total_gt = max(float(self.centerline.sum()), 1.0)
         prev_coverage_sum = self.covered_centerline.sum()
         prev_coverage_ratio = prev_coverage_sum / total_gt
-        # Reward uses the thickness-weighted accumulator delta; the binary count drives the
-        # coverage ratio reported in info / used by the curriculum success criterion.
         prev_weighted_sum = self._covered_weight_sum
-        # Stage B1: query the frontier BEFORE the coverage update — _frontier_mask still
-        # reflects last step, and we want to know if the NEW position lands on it.
+
         is_on_frontier = bool(self._frontier_mask is not None and self._frontier_mask[self.position[0], self.position[1]])
         self._update_coverage()
         self._update_frontier_mask()
         new_coverage = self._covered_weight_sum - prev_weighted_sum
         current_coverage_ratio = self.covered_centerline.sum() / total_gt
-
         junction_val = self._junction_val_at(self.position)
 
         # Allow a longer off-track streak at junctions so the agent can probe a branch.
@@ -522,12 +512,8 @@ class VesselTracingEnv(gym.Env):
             terminal_reason = 'off_track' if terminated else 'max_steps'
             f_beta = self._compute_fbeta()
 
-        # New-position uncovered-DT against the same _uncov_dt as prev (refresh happens after
-        # the reward is built, for within-step potential consistency).
         new_uncov_dist = float(self._uncov_dt[self.position[0], self.position[1]]) if self._uncov_dt is not None else None
 
-        # H6 tangent-aligned progress; perpendicular/reversing motion earns 0/negative even
-        # on-track, closing the annulus-loiter exploit.
         progress_cos = self._compute_progress_cos(prev_pos, self.position)
 
         state = RewardState(

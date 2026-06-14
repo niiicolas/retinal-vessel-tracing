@@ -25,7 +25,7 @@ def _worker(conn, config: dict, tolerance: float):
     # Own dataset copy for local sample access; images load on demand.
     ds, _ = get_data('rl_agent', 'train', tolerance=tolerance, use_unet_prior=_use_unet_prior)
     _sample_cache: Dict[int, dict] = {}
-    _MAX_CACHE = 32  # cap per-worker memory (~160 MB at 5 MB/sample)
+    _MAX_CACHE = 32
 
     def _get_sample(idx: int) -> dict:
         """Load and LRU-cache the numpy arrays for dataset sample ``idx``."""
