@@ -251,6 +251,26 @@ def _list_collate(batch: list) -> list:
     return batch
 
 
+# Max samples kept in each per-sample geometry cache; caps per-worker RAM so a long
+# RL run can't grow them to all-samples × ~16 MB and OOM.
+_MEM_CACHE_MAX = 64
+
+
+class _LRUDict(dict):
+    """Dict that evicts its oldest entry once it exceeds ``maxsize`` (FIFO by insertion)."""
+
+    def __init__(self, maxsize: int = _MEM_CACHE_MAX):
+        super().__init__()
+        self._maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        if key in self:
+            super().__delitem__(key)
+        elif len(self) >= self._maxsize:
+            super().__delitem__(next(iter(self)))
+        super().__setitem__(key, value)
+
+
 class RetinalFundusDataset(Dataset):
     """PyTorch Dataset for one retinal fundus dataset, formatted per the chosen target.
 
@@ -317,16 +337,16 @@ class RetinalFundusDataset(Dataset):
                 f"'{self.cfg.image_glob}' with vessels in '{self.cfg.vessel_dir}/'."
             )
 
-        # In-memory + on-disk caches; only enabled at native resolution (resize=None).
-        self._cl_mem: Dict[str, Tuple[np.ndarray, float]] = {}
+        # LRU-bounded in-memory caches; on-disk cache only at native resolution.
+        self._cl_mem: Dict[str, Tuple[np.ndarray, float]] = _LRUDict()
         self._cache_dir: Optional[Path] = None
         if cache_centerlines and self.resize is None:
             self._cache_dir = self.root / 'centerlines_cache'
             self._cache_dir.mkdir(exist_ok=True)
 
-        self._vo_mem: Dict[str, np.ndarray] = {}
-        self._up_mem: Dict[str, np.ndarray] = {}
-        self._pp_mem: Dict[str, Dict[str, np.ndarray]] = {}
+        self._vo_mem: Dict[str, np.ndarray] = _LRUDict()
+        self._up_mem: Dict[str, np.ndarray] = _LRUDict()
+        self._pp_mem: Dict[str, Dict[str, np.ndarray]] = _LRUDict()
 
         logger.info('%s  %d samples  target=%s  split=%s', canon, len(self.samples), target, split)
 
