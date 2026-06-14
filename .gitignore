@@ -1,25 +1,21 @@
 # Python
-
 **pycache**/
 *.py[cod]
 *$py.class
 
 # Virtual environments
-
 venv/
 .venv/
 env/
 ENV/
 
 # Build artifacts
-
 build/
 dist/
 *.egg-info/
 .eggs/
 
 # Testing
-
 .pytest_cache/
 .coverage
 .coverage.*
@@ -28,60 +24,45 @@ htmlcov/
 .nox/
 
 # Type checking
-
 .mypy_cache/
 .pyre/
 .pytype/
 
 # Linting
-
 .ruff_cache/
 
 # Jupyter
-
 .ipynb_checkpoints/
 
 # IDEs
-
 .vscode/
 .idea/
 
 # macOS
-
 .DS_Store
 
 # Logs
-
 logs/
 *.log
 
 # Slurm
-
 slurm*
 slurm-*.out
 slurm-*.err
 
 # Project outputs
-
 results/
 weights/
 outputs/
 artifacts/
 checkpoints/
 
-# Data (uncomment if desired)
-
-# data/
+# Data
+data/
 
 # Environment variables
-
 .env
 .env.*
 
 # Local configuration
-
 *.local
-
-# Generated folder trees
-
-folder_structure.txt
