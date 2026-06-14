@@ -348,10 +348,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--eval', action='store_true', help='Evaluate on val set')
     parser.add_argument('--test', action='store_true', help='Test on external datasets')
+    parser.add_argument(
+        '--corrupt-gt', action='store_true',
+        help='Leak-free certification: feed the tracer garbage GT; the metrics must '
+             'match the normal run byte-for-byte (replaces RVT_INFERENCE_CORRUPT_GT).',
+    )
     args = parser.parse_args()
 
     if not args.eval and not args.test:
         args.eval = args.test = True
+
+    # Cert toggle. FrontierTracer reads corrupt_gt live from config.MODEL_CONFIG
+    # at trace time, so flipping it here (one shared dict) is all that's needed.
+    if args.corrupt_gt:
+        MODEL_CONFIG['inference']['corrupt_gt'] = True
 
     print(f'Device: {DEVICE}  |  Mode: {MODE}  |  Dilation radius: {DILATION_RADIUS}px')
 

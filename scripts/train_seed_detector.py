@@ -15,10 +15,33 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-from config import DEVICE, SEED_WEIGHTS_PATH as SAVE_PATH, TOLERANCE, SEED_CONFIG
+from config import DEVICE, SEED_WEIGHTS_PATH as SAVE_PATH, TOLERANCE
 from data.dataloader import get_data
 from models.seed_detector import SeedDetector, frangi_vesselness
 from training.seed_detector_trainer import SeedDetectorTrainer
+
+# Seed-detector config (moved out of config.py — this script is its only consumer).
+SEED_CONFIG = {
+    'seed_detector': {
+        'base_ch': 24,
+        'dropout': 0.10,
+        'use_frangi_input': True,
+        'confidence_threshold': 0.35,
+        'vessel_gate_threshold': 0.25,
+        'top_k_seeds': 80,
+        'mc_samples': 0,  # >0 enables MC-dropout at inference
+        'suppress_optic_disc': True,
+        'snap_radius': 2,
+    },
+    'training': {
+        'sigma': 1.5,
+        'num_epochs': 200,
+        'warmup_epochs': 5,
+        'batch_size': 4,
+        'lr': 1e-3,
+        'num_workers': 2,
+    },
+}
 
 
 def load_samples(split: str, use_frangi: bool = True) -> List[Dict[str, Any]]:
