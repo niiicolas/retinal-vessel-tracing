@@ -5,11 +5,6 @@ fundus photographs by *tracing* them, rather than segmenting pixels and
 post-processing. A PPO policy learns to walk along vessels, producing connected
 skeletons by construction.
 
-> **Final certified model (v12):** centerline **F1@2px = 0.670** on the
-> validation split, **0.666** on held-out DRIVE and **0.618** on held-out
-> DRHAGIS — all certified leak-free (see [Leak-free certification](#leak-free-certification)).
-> Full experiment record in [`ABLATIONS.md`](ABLATIONS.md).
-
 ---
 
 ## Overview
@@ -92,8 +87,6 @@ evaluation/
   scoring.py               Shared scorer so RL & baselines are metric-comparable
 weights/<run>/             Checkpoints + logs, namespaced per run (RVT_RUN_NAME)
 results/<run>/             Per-image metrics, summaries, visualisations
-ABLATIONS.md               Full experiment / ablation record (read for any number)
-*.sh                       SLURM batch scripts (train_v12.sh is the final recipe)
 ```
 
 ---
@@ -140,63 +133,49 @@ imbalance. Train/val is a deterministic split of the sorted samples.
 
 ## Usage
 
-All hyperparameters live in [`config.py`](config.py) (`MODEL_CONFIG`). **The repo
-defaults reproduce the final v12 model** — no environment variables or flags are
-needed. (`RVT_RUN_NAME` only namespaces `weights/<run>/` and `results/<run>/` so
-parallel jobs don't clobber each other.)
+All hyperparameters live in [`config.py`](config.py) (`MODEL_CONFIG`).
 
 Run scripts as modules from the repo root with the venv active.
 
-### 1. Train the seed detector (perception)
+### 1. Train the seed detector
 
 ```bash
 python -m scripts.train_seed_detector
 ```
 
-Trains the multi-task Attention U-Net. Its **centerline-prob head is reused as
-the RL centerline prior**, so the same checkpoint (`weights/<run>/seed_detector.pt`)
+Trains the multi-task Attention U-Net. Its centerline-prob head is reused as
+the RL centerline prior, so the same checkpoint (`weights/<run>/seed_detector.pt`)
 serves both seeding and the observation prior. This must exist before PPO.
 
 ### 2. Train the policy (imitation → PPO)
 
 ```bash
 python -m scripts.train_imitation   # behaviour-cloning warm start
-python -m scripts.train_ppo         # PPO, 600 iterations, curriculum
+python -m scripts.train_ppo         # PPO, curriculum
 ```
 
 ### 3. Evaluate / test the traced skeletons
 
 ```bash
 python -m scripts.run_rl_tracing --eval            # validation split
-python -m scripts.run_rl_tracing --test            # held-out DRIVE + DRHAGIS
-python -m scripts.run_rl_tracing --eval --corrupt-gt   # leak-free certification
+python -m scripts.run_rl_tracing --test            # held-out datasets
 ```
 
 Outputs land in `results/<run>/RL_tracing_e2e/<split>/` (per-image
 `metrics_e2e.csv`, a summary, and trajectory visualisations).
 
-### End-to-end on the cluster
-
-[`train_v12.sh`](train_v12.sh) runs the whole recipe as one SLURM job —
-imitation → PPO 600 → eval → GT-ablation certification — and prints a
-PASS/FAIL certification verdict:
-
-```bash
-sbatch train_v12.sh
-```
-
 ---
 
 ## Baselines
 
-All baselines run at the RL agent's settings and are scored through the **shared
-scorer** ([`evaluation/scoring.py`](evaluation/scoring.py)), so their numbers are
+All baselines run at the RL agent's settings and are scored through the shared
+scorer ([`evaluation/scoring.py`](evaluation/scoring.py)), so their numbers are
 directly comparable to the RL agent:
 
 ```bash
 python -m scripts.run_frangi        --eval   # Frangi vesselness + centerline
-python -m scripts.run_greedytracer  --eval   # greedy steepest-ascent tracer
-python -m scripts.run_cnn           --eval   # centerline U-Net (segment + thin)
+python -m scripts.run_greedytracer  --eval   # greedy tracer
+python -m scripts.run_cnn           --eval   # centerline U-Net
 ```
 
 ---
@@ -215,24 +194,9 @@ Reported per image and aggregated (see [`config.py`](config.py) `METRIC_COLS` an
 
 ---
 
-## Leak-free certification
-
-Earlier high scores were inflated by **ground-truth leakage at inference**
-(off-track termination, bridge keep-tests, gap reseeding, coverage normalisation
-all peeked at GT). Removing the four leaks cost ≈ 0.07 F1 but makes the numbers
-trustworthy.
-
-Certification is a **corrupt-GT byte-identity test**: feed the tracer garbage GT
-(`--corrupt-gt`); if the metrics are byte-for-byte identical to the normal run,
-the prediction provably does not depend on GT. Every recordable run has a
-`*_gtcorrupt` twin and a PASS verdict. **Only certified, leak-free numbers are
-reportable.**
-
----
-
 ## Results
 
-Final model **v12** (certified, leak-free; config = repo default):
+Final model:
 
 | split | F1@2px | P@2 | R@2 | clDice | gt_edge_cov80 | Betti-0 | cert |
 |---|---|---|---|---|---|---|---|
@@ -240,47 +204,7 @@ Final model **v12** (certified, leak-free; config = repo default):
 | **test — DRIVE** | **0.666** | 0.778 | 0.589 | 0.483 | 0.662 | 14.8 | PASS |
 | **test — DRHAGIS** | **0.618** | 0.674 | 0.572 | 0.339 | 0.645 | 4.6 | PASS |
 
-Test ≈ val ⇒ the policy generalises to datasets never seen in training.
-
-### Headline findings (full detail in [`ABLATIONS.md`](ABLATIONS.md))
-
-1. **World-frame + step-2 actions** unblocked imitation (BC acc 0.60 → 0.73) and
-   were the precondition for any end-to-end learning.
-2. The inference **vessel-gate is the largest single lever (≈ +0.39 F1)** — an
-   off-vessel false-positive suppressor, not a model change; snap-to-centerline
-   adds ≈ +0.04.
-3. **Removing GT leakage cost ≈ 0.07 F1** but makes the result honest; certified
-   v12 (0.670) recovers nearly the best-ever *leaky* score (0.690).
-4. **Cheap episode termination hurts recall** (the v11 regression): the agent
-   over-traces only when stopping early is costly — the termination penalties are
-   load-bearing.
-5. Recall plateaus at ≈ 0.56 because the result is **perception-rich but
-   trace-poor**: the centerline perception lights up ≈ 95 % of GT, but only
-   ≈ 56 % is traced. The remaining gap is tracer exploration / seeding, not
-   perception or the τ gate — which bounds what reward tuning can buy and points
-   future work at seeding and connectivity.
 
 ---
 
-## Configuration notes
-
-- **Single source of truth.** Edit knobs directly in `MODEL_CONFIG` in
-  [`config.py`](config.py); env-var sweep overrides were removed. The only runtime
-  toggles are `--corrupt-gt` (certification) and `RVT_RUN_NAME` (output namespacing).
-- **Observation stack:** 21 channels — toggled via the `environment.use_*` flags
-  (multi-scale crop, topology memory, U-Net prior, etc.). Changing the channel
-  layout invalidates existing checkpoints.
-- **On-vessel signal:** dense U-Net vesselness with τ = 0.30 drives off-track
-  termination and reward gating (leak-free; the `gt` signal is debug-only).
-- **Workers:** PPO uses `n_envs = 8` — each worker holds a CUDA context for the
-  prior U-Net, so 16 OOMs a 64 GB GPU.
-
----
-
-## Citation / context
-
-Developed as a research project (ZHAW) on policy-based skeleton tracing for
-retinal vasculature. For the complete version history, negative results, and
-ablations, see [`ABLATIONS.md`](ABLATIONS.md) and the `RETRAIN_PLAN_v*.md` notes.
-</content>
-</invoke>
+*This document was created with assistance from AI tools. The content has been reviewed and edited by the project authors.*
