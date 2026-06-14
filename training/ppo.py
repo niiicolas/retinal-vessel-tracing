@@ -890,11 +890,16 @@ class PPOTrainer:
         """
         difficulty = self.curriculum.get_difficulty()
         if not hasattr(self, '_sample_difficulties'):
+            # Score every sample once, evicting as we go so the pass doesn't pin the
+            # whole dataset in the main process's cache.
             self._sample_difficulties = []
+            _cache = getattr(train_samples, '_cache', None)
             for i in range(len(train_samples)):
                 s = train_samples[i]
                 d = self.curriculum.compute_sample_difficulty(s['centerline'], s.get('vessel_mask', s['centerline']))
                 self._sample_difficulties.append(d)
+                if _cache is not None:
+                    _cache.pop(i, None)
 
         valid = [i for i, d in enumerate(self._sample_difficulties) if d <= difficulty]
         if len(valid) < 10:
