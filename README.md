@@ -1,19 +1,10 @@
 # Policy-Based Skeleton Tracing for Retinal Blood Vessels
 
-A reinforcement-learning agent that extracts vessel **centerlines** from retinal
-fundus photographs by *tracing* them, rather than segmenting pixels and
-post-processing. A PPO policy learns to walk along vessels, producing connected
-skeletons by construction.
+This project trains an RL agent to trace blood vessel centerlines in retinal fundus images. The agent learns to navigate along blood vessel structures using a policy, trained via imitation learning followed by PPO fine-tuning. A seed detector predicts starting points, allowing for end-to-end inference without the need for ground-truth labels. The agent was compared against three baseline models: a Frangi vesselness filter, a greedy tracing heuristic, and a UNet CNN.
 
 ---
 
 ## Overview
-
-Traditional pipelines segment vessels per-pixel and then thin/skeletonise, which
-breaks connectivity at crossings and thin vessels. Here the agent instead
-**navigates** the vessel tree: starting from detected seeds, it takes discrete
-steps along the centerline, and the resulting trajectory *is* the skeleton — so
-the output is connected by construction.
 
 ### Pipeline at a glance
 
@@ -89,45 +80,14 @@ weights/<run>/             Checkpoints + logs, namespaced per run (RVT_RUN_NAME)
 results/<run>/             Per-image metrics, summaries, visualisations
 ```
 
----
-
-## Installation
-
-The project targets Python 3.9 on a SLURM cluster (RHEL8, single GPU).
-
-```bash
-module load gcc/9.4.0-pe5.34 python/3.9.12-pe5.34   # cluster modules
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-A conda alternative is provided in [`environment.yml`](environment.yml), and the
-cluster venv build is automated in [`venv.sh`](venv.sh)
-(`sbatch venv.sh`).
-
-Core dependencies: PyTorch ≥ 2.0, Gymnasium, scikit-image, `skan` (skeleton
-analysis), OpenCV, NetworkX, NumPy/SciPy, pandas, matplotlib (see
-[`requirements.txt`](requirements.txt)).
-
----
-
 ## Data
 
-Seven public fundus datasets live under [`data/`](data/). The loader
-([`data/dataloader.py`](data/dataloader.py)) combines five into a balanced
-train/val pool and holds two out entirely as external test sets:
+Training and validation use a balanced combination of five datasets. Testing uses two external datasets the models never see during training.
 
 | role | datasets |
 |---|---|
 | **train / val** | FIVES, STARE, CHASEDB1, HRF, LES-AV |
 | **test (held-out)** | DRIVE, DRHAGIS |
-
-The loader applies FOV cropping, aspect-preserving resize-and-pad, disk-caches
-GT centerlines and U-Net priors, and (for training) uses a
-`WeightedRandomSampler` so each dataset contributes equally despite size
-imbalance. Train/val is a deterministic split of the sorted samples.
 
 ---
 
@@ -142,10 +102,6 @@ Run scripts as modules from the repo root with the venv active.
 ```bash
 python -m scripts.train_seed_detector
 ```
-
-Trains the multi-task Attention U-Net. Its centerline-prob head is reused as
-the RL centerline prior, so the same checkpoint (`weights/<run>/seed_detector.pt`)
-serves both seeding and the observation prior. This must exist before PPO.
 
 ### 2. Train the policy (imitation → PPO)
 
@@ -168,10 +124,6 @@ Outputs land in `results/<run>/RL_tracing_e2e/<split>/` (per-image
 
 ## Baselines
 
-All baselines run at the RL agent's settings and are scored through the shared
-scorer ([`evaluation/scoring.py`](evaluation/scoring.py)), so their numbers are
-directly comparable to the RL agent:
-
 ```bash
 python -m scripts.run_frangi        --eval   # Frangi vesselness + centerline
 python -m scripts.run_greedytracer  --eval   # greedy tracer
@@ -182,11 +134,9 @@ python -m scripts.run_cnn           --eval   # centerline U-Net
 
 ## Evaluation metrics
 
-Reported per image and aggregated (see [`config.py`](config.py) `METRIC_COLS` and
-[`evaluation/metrics.py`](evaluation/metrics.py)):
+Results are saved as per-image CSVs and summary tables under `results/`:
 
-- **F1@τ / precision / recall** at τ ∈ {1, 2, 3} px — centerline overlap at a
-  tolerance band (headline = **F1@2px**).
+- **F1@τ / precision / recall** at τ ∈ {1, 2, 3} px — centerline overlap at a tolerance band (headline = F1@2px).
 - **clDice** — centerline-aware Dice.
 - **Betti-0 error** — connected-component (topology) error, raw and post-processed.
 - **gt_edge_cov80** — fraction of GT edges ≥ 80 % covered (recall of structure).
