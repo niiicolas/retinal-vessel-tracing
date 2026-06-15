@@ -8,7 +8,7 @@ This project trains an RL agent to trace blood vessel centerlines in retinal fun
 
 ### Pipeline at a glance
 
-![Pipeline](img.png)
+![Pipeline](pipeline.png)
 
 ### Key ideas
 
