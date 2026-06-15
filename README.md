@@ -8,23 +8,7 @@ This project trains an RL agent to trace blood vessel centerlines in retinal fun
 
 ### Pipeline at a glance
 
-```
-                 ┌──────────────────────┐
- fundus image →  │  SeedDetector        │  Attention U-Net, multi-task:
-                 │  (centerline U-Net)  │  centerline-prob + endpoint/junction seeds
-                 └──────────┬───────────┘
-                            │  centerline prior + seeds
-                            ▼
- ┌────────────────────────────────────────────────────────────┐
- │  Imitation (BC)  →  PPO (RL)  →  FrontierTracer (inference)  │
- │  warm-start         600 iters     ring seeds + frontier      │
- │  the policy         curriculum     coverage, snap, gate      │
- └────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-              connected centerline skeleton
-              scored: F1@τ, clDice, Betti-0, gt_edge_cov80, HD95
-```
+![Pipeline](img.png)
 
 ### Key ideas
 
