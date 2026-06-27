@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from data.fundus_preprocessor import eroded_fov_mask
 from models.greedy_tracer import GreedyTracer
 from models.unet_blocks import DownBlock, DSConvBlock, UpBlock
 
@@ -223,7 +224,9 @@ class CenterlinePredictor:
             prob = self._infer_full(img_t)
 
         prob_np = prob.numpy()
-        skeleton, _ = self.tracer.trace(prob_np, fov_mask)
+        # FOV-radius-scaled erosion (shared with the RL agent) drops the boundary halo.
+        safe_mask = eroded_fov_mask(fov_mask) if fov_mask is not None else None
+        skeleton, _ = self.tracer.trace(prob_np, safe_mask)
         return prob_np, skeleton
 
 

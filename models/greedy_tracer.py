@@ -3,11 +3,13 @@
 from typing import List, Optional, Tuple
 
 import numpy as np
-from scipy.ndimage import binary_erosion, gaussian_filter
+from scipy.ndimage import gaussian_filter
 from skan import Skeleton as SkanSkeleton
 from skan import summarize
 from skimage import filters
 from skimage.morphology import remove_small_objects, skeletonize
+
+from data.fundus_preprocessor import eroded_fov_mask
 
 
 class GreedyTracer:
@@ -165,11 +167,11 @@ class GreedyTracerBaseline:
 
         self.tracer = GreedyTracer(seed_thresh=seed_thresh, step_thresh=step_thresh, min_length=min_length, thin_output=thin_output)
 
-    def _compute_vesselness(self, preprocessed: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Multi-scale Frangi → normalize → Gaussian smooth → eroded-FOV mask.
+    def _compute_vesselness(self, preprocessed: np.ndarray, safe_mask: np.ndarray) -> np.ndarray:
+        """Multi-scale Frangi → normalize → Gaussian smooth → gate by the (already-eroded) FOV mask.
 
-        Smoothing suppresses noisy background maxima; the FOV is eroded 3× to drop the Frangi
-        edge-halo artifact at the boundary.
+        Smoothing suppresses noisy background maxima; ``safe_mask`` is the FOV-radius-scaled
+        eroded mask (see ``eroded_fov_mask``) that drops the Frangi edge-halo at the boundary.
         """
         sigmas = np.linspace(self.sigma_min, self.sigma_max, self.num_scales)
         vesselness = filters.frangi(preprocessed.astype(np.float64), sigmas=sigmas, black_ridges=True)
@@ -180,10 +182,7 @@ class GreedyTracerBaseline:
         if self.gauss_sigma > 0:
             vesselness = gaussian_filter(vesselness, sigma=self.gauss_sigma)
 
-        # Erode the FOV so the Frangi boundary halo is excluded.
-        safe_mask = binary_erosion(mask > 0, iterations=3)
-
-        vesselness *= safe_mask.astype(np.float32)
+        vesselness *= (safe_mask > 0).astype(np.float32)
 
         return vesselness.astype(np.float32)
 
@@ -201,8 +200,10 @@ class GreedyTracerBaseline:
             ``(skeleton, vesselness or None, traces)``.
         """
         mask = fov_mask if fov_mask is not None else np.ones(preprocessed.shape[:2], dtype=np.uint8) * 255
-        vesselness = self._compute_vesselness(preprocessed, mask)
-        skeleton, traces = self.tracer.trace(vesselness, fov_mask=mask)
+        # FOV-radius-scaled erosion (shared with the RL agent) gates both the vesselness and the trace.
+        safe_mask = eroded_fov_mask(mask)
+        vesselness = self._compute_vesselness(preprocessed, safe_mask)
+        skeleton, traces = self.tracer.trace(vesselness, fov_mask=safe_mask)
 
         if skeleton.any() and self.min_obj_size > 0:
             skeleton_bool = remove_small_objects(skeleton > 0, min_size=self.min_obj_size)

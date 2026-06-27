@@ -9,6 +9,8 @@ from skan import summarize
 from skimage import filters, morphology
 from skimage.morphology import remove_small_objects, skeletonize
 
+from data.fundus_preprocessor import eroded_fov_mask
+
 
 class FrangiBaseline:
     """Classical vessel centerline extractor: Frangi enhancement plus graph-based spur pruning."""
@@ -53,7 +55,8 @@ class FrangiBaseline:
             vesselness = gaussian_filter(vesselness, sigma=self.gauss_sigma)
 
         if fov_mask is not None:
-            vesselness *= fov_mask > 0
+            # FOV-radius-scaled erosion drops the Frangi edge-halo at the boundary.
+            vesselness *= eroded_fov_mask(fov_mask) > 0
 
         binary = vesselness > self.threshold
         binary = morphology.binary_closing(binary, morphology.disk(1))

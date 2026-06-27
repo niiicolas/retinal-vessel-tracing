@@ -15,17 +15,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from data.fundus_preprocessor import FOV_EROSION_FRAC, FOV_EROSION_MAX, FOV_EROSION_MIN
 from models.unet_blocks import DSConvBlock, DownBlock
 
 
 # FOV-scale-invariant seeding constants: seed spacing scales with FOV radius (floor 8 px)
 # so small, tightly-cropped retinas aren't starved of peripheral seeds. See [[fov-scale-invariance]].
+# FOV_EROSION_* live in data.fundus_preprocessor so the baselines reuse the same rim erosion.
 SEED_REF_FOV_RADIUS = 250.0  # reference FOV radius where base spacing applies
 SEED_BASE_SPACING = 22  # min seed spacing at the reference radius
 SEED_FLOOR_SPACING = 8
-FOV_EROSION_FRAC = 0.04  # rim erosion ≈4% of FOV radius
-FOV_EROSION_MIN = 4
-FOV_EROSION_MAX = 17
 
 
 class AttentionGate(nn.Module):
