@@ -5,6 +5,31 @@ from typing import List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
+# FOV-radius-scaled rim erosion, shared with the RL seed detector so the baselines
+# gate vesselness/probability exactly like the RL agent. See [[fov-scale-invariance]].
+FOV_EROSION_FRAC = 0.04  # rim erosion ≈4% of FOV radius
+FOV_EROSION_MIN = 4
+FOV_EROSION_MAX = 17
+
+
+def eroded_fov_mask(fov_mask: np.ndarray) -> np.ndarray:
+    """Erode an FOV mask by an FOV-radius-scaled rim, matching the RL seed detector.
+
+    Drops the bright Frangi edge-halo that hugs the FOV boundary (the step edge left
+    by image masking) instead of letting it survive as a ring of false vessels.
+
+    Args:
+        fov_mask: (H, W) mask, any positive value = inside the retina.
+
+    Returns:
+        (H, W) uint8 {0, 1} eroded mask.
+    """
+    m = (fov_mask > 0).astype(np.uint8)
+    radius = np.sqrt(max(int(m.sum()), 1) / np.pi)
+    erode_px = int(np.clip(round(FOV_EROSION_FRAC * radius), FOV_EROSION_MIN, FOV_EROSION_MAX))
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1, 2 * erode_px + 1))
+    return cv2.erode(m, se, iterations=1)
+
 
 class FundusPreprocessor:
     """Turns a raw RGB fundus photo into a contrast-enhanced, FOV-masked [0, 1] grayscale image."""
