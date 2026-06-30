@@ -11,7 +11,7 @@
 
 Accurate extraction of retinal vessel centrelines is essential for quantifying vascular morphology associated with systemic diseases like diabetic retinopathy and hypertension. Traditional methods and deep segmentation networks typically produce centrelines via per-pixel classification followed by morphological thinning, offering no explicit connectivity guarantee. 
 
-This repository implements a **Reinforcement Learning (RL) framework** that treats centreline extraction as a sequential Markov decision process (MDP). By deploying a PPO-trained actor-critic policy that moves step-by-step along each vessel, this approach constructs connected, topologically faithful skeletons *by design*, outperforming classical and supervised baselines under severe pathological domain shifts.
+This repository implements a **Reinforcement Learning (RL) framework** that treats centreline extraction as  a Sequential Markov Decision Process (MDP). By deploying a PPO-trained actor-critic policy that moves step-by-step along each vessel, this approach constructs connected, topologically faithful skeletons *by design*. The framework provides a robust alternative to per-pixel classification, showing superior topological integrity and spatial precision, especially in pathological environments where traditional methods often fail.
 
 ---
 
