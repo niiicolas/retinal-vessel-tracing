@@ -3,7 +3,7 @@
 > Bachelor Thesis — *Reinforcement Learning for Retinal Vessel Skeletonization: A Policy-Driven Approach*
 > Nicolas Fankhauser & Ravidu Nakandalage · ZHAW Wädenswil, Institute of Computational Life Sciences
 
-This repository implements a reinforcement learning framework that traces retinal vessel **centrelines** as a sequential decision process rather than via per-pixel classification. An attention U-Net seed detector proposes starting points; a PPO-trained actor–critic policy, warm-started with imitation learning, then walks pixel-by-pixel along each vessel, producing a **connected skeleton by construction** — no ground truth required at inference. The agent is benchmarked against a Frangi vesselness filter, a greedy heuristic tracer and a supervised centreline U-Net across five training datasets and two held-out external test sets (DRIVE, DR-HAGIS).
+This repository implements a reinforcement learning framework that traces retinal vessel centre lines as a sequential decision process, rather than using per-pixel classification. An attention U-Net seed detector suggests initial points and a PPO-trained actor–critic policy, which is warm-started using imitation learning and then moves step-by-step along each vessel, is used. This produces a connected skeleton with no ground truth required during inference. The agent is benchmarked against a Frangi vesselness filter, a greedy heuristic tracer and a supervised centreline U-Net, using five training datasets and two external test sets (DRIVE and DR-HAGIS).
 
 ---
 
