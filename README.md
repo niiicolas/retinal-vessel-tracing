@@ -29,39 +29,32 @@ This project trains an RL agent to trace blood vessel centerlines in retinal fun
 
 ---
 
-## Repository layout
+## Repository Structure
 
-```
-config.py                  Single source of truth for all hyperparameters (MODEL_CONFIG)
-data/
-  dataloader.py            Combined multi-dataset loader; train/val split + held-out test
-  centerline_extraction.py GT centerline / skeleton extraction (cached)
-  fundus_preprocessor.py   FOV crop, resize-and-pad, normalisation
-  DRIVE/ FIVES/ HRF/ ...    Raw datasets (images + manual masks)
-environment/
-  vessel_env.py            Gymnasium tracing environment (obs, step, termination)
-  observation.py           ObservationBuilder — the 21-channel egocentric stack
-  reward.py                Per-step + terminal reward terms
-  frontier_tracer.py       Inference-time multi-seed frontier tracer (snap + gate)
-  seeding_utils.py         Seed placement, ring seeds, FOV-scale handling
-  vec_env.py               Vectorised env workers for PPO
-models/
-  policy_network.py        ActorCriticNetwork (CNN/LSTM encoder + policy/value heads)
-  seed_detector.py         Multi-task Attention U-Net (centerline + endpoints/junctions)
-  unet.py / unet_blocks.py U-Net building blocks
-  frangi.py                Frangi vesselness baseline
-  greedy_tracer.py         Greedy steepest-ascent tracer baseline
-training/
-  imitation.py             Behaviour-cloning warm start
-  ppo.py                   PPO trainer (GAE, curriculum, entropy anneal)
-  curriculum.py            easy → medium → full difficulty stages
-  seed_detector_trainer.py Seed-detector training loop
-scripts/                   Entry points (see below)
-evaluation/
-  metrics.py               F1@τ, clDice, Betti-0, gt_edge_cov80, HD95
-  scoring.py               Shared scorer so RL & baselines are metric-comparable
-weights/<run>/             Checkpoints + logs, namespaced per run (RVT_RUN_NAME)
-results/<run>/             Per-image metrics, summaries, visualisations
+```text
+├── config.py                # Single source of truth for all hyperparameters (MODEL_CONFIG)
+├── data/
+│   ├── dataloader.py        # Combined multi-dataset loader; train/val split + held-out test
+│   ├── centerline_ext.py    # GT centerline / skeleton extraction (cached)
+│   └── fundus_prep.py       # FOV crop, resize-and-pad, normalisation
+├── environment/
+│   ├── vessel_env.py        # Gymnasium tracing environment (obs, step, termination)
+│   ├── observation.py       # ObservationBuilder — the 21-channel egocentric stack
+│   ├── reward.py            # Per-step + terminal reward terms
+│   └── frontier_tracer.py   # Inference-time multi-seed frontier tracer (snap + gate)
+├── models/
+│   ├── policy_network.py    # ActorCriticNetwork (CNN encoder + policy/value heads)
+│   ├── seed_detector.py     # Multi-task Attention U-Net
+│   ├── frangi.py            # Frangi vesselness baseline
+│   └── greedy_tracer.py     # Greedy steepest-ascent tracer baseline
+├── training/
+│   ├── imitation.py         # Behaviour-cloning warm start
+│   ├── ppo.py               # PPO trainer (GAE, curriculum, entropy anneal)
+│   └── curriculum.py        # Dynamic difficulty progression stages
+├── scripts/                 # Execution entry points (see Usage)
+└── evaluation/
+    ├── metrics.py           # F1@τ, clDice, Betti-0, HD95 computations
+    └── scoring.py           # Shared scorer so RL & baselines are metric-comparable
 ```
 
 ## Data
