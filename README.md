@@ -1,8 +1,8 @@
 # Policy-Based Skeleton Tracing for Retinal Blood Vessels
 
 ![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/pragyy/datascience-readme-template?include_prereleases)
-![GitHub last commit](https://img.shields.io/github/last-commit/pragyy/datascience-readme-template)
-![Python Version](https://img.shields.io/badge/python-3.8%2B-blue)
+![GitHub last commit](https://img.shields.io/github/last-commit/nicolas-fankhauser/retinal-vessel-rl)
+![Python Version](https://img.shields.io/badge/python-3.10-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 > **Bachelor Thesis** — *Reinforcement Learning for Retinal Vessel Skeletonization: A Policy-Driven Approach*
@@ -172,4 +172,9 @@ This work was supervised by **Dr. Norman Juchler** and **Fabio Muso** from the *
 
 We would also like to thank **Dr. Rui Santos** from the **Stadtspital Zürich (Augenklinik)** for his valuable clinical input and support throughout the project.
 
+---
+
+## License
+
+This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
 
