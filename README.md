@@ -1,7 +1,7 @@
 # Policy-Based Skeleton Tracing for Retinal Blood Vessels
 
 ![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/pragyy/datascience-readme-template?include_prereleases)
-![GitHub last commit](https://img.shields.io/github/last-commit/nicolas-fankhauser/retinal-vessel-rl)
+![GitHub last commit](https://img.shields.io/github/last-commit/niiicolas/retinal-vessel-tracing)
 ![Python Version](https://img.shields.io/badge/python-3.10-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
