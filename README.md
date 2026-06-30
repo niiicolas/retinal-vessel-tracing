@@ -5,7 +5,10 @@
 ![Python Version](https://img.shields.io/badge/python-3.10-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-> **Bachelor Thesis** — *Reinforcement Learning for Retinal Vessel Skeletonization: A Policy-Driven Approach*
+## Research Context
+This repository contains the official implementation for the Bachelor Thesis: 
+*"Reinforcement Learning for Retinal Vessel Skeletonization: A Policy-Driven Approach"* (ZHAW Wädenswil, 2026).
+
 > **Authors:** Nicolas Fankhauser & Ravidu Nakandalage 
 > **Institution:** ZHAW Wädenswil, Institute of Computational Life Sciences
 
