@@ -1,6 +1,9 @@
 # Policy-Based Skeleton Tracing for Retinal Blood Vessels
 
-This project trains an RL agent to trace blood vessel centerlines in retinal fundus images. The agent learns to navigate along blood vessel structures using a policy, trained via imitation learning followed by PPO fine-tuning. A seed detector predicts starting points, allowing for end-to-end inference without the need for ground-truth labels. The agent was compared against three baseline models: a Frangi vesselness filter, a greedy tracing heuristic, and a UNet CNN.
+> Bachelor Thesis — *Reinforcement Learning for Retinal Vessel Skeletonization: A Policy-Driven Approach*
+> Nicolas Fankhauser & Ravidu Nakandalage · ZHAW Wädenswil, Institute of Computational Life Sciences
+
+This repository implements a reinforcement learning framework that traces retinal vessel **centrelines** as a sequential decision process rather than via per-pixel classification. An attention U-Net seed detector proposes starting points; a PPO-trained actor–critic policy, warm-started with imitation learning, then walks pixel-by-pixel along each vessel, producing a **connected skeleton by construction** — no ground truth required at inference. The agent is benchmarked against a Frangi vesselness filter, a greedy heuristic tracer and a supervised centreline U-Net across five training datasets and two held-out external test sets (DRIVE, DR-HAGIS).
 
 ---
 
@@ -55,69 +58,86 @@ This project trains an RL agent to trace blood vessel centerlines in retinal fun
 └── evaluation/
     ├── metrics.py           # F1@τ, clDice, Betti-0, HD95 computations
     └── scoring.py           # Shared scorer so RL & baselines are metric-comparable
+
 ```
 
 ## Data
 
-Training and validation use a balanced combination of five datasets. Testing uses two external datasets the models never see during training.
+Training and validation:
 
-| role | datasets |
-|---|---|
-| **train / val** | FIVES, STARE, CHASEDB1, HRF, LES-AV |
-| **test (held-out)** | DRIVE, DRHAGIS |
+| Dataset |
+|-|
+| FIVES |
+| STARE |
+| CHASE_DB1 |
+| HRF |
+| LES-AV |
+
+External evaluation:
+
+| Dataset | Purpose |
+|-|-|
+| DRIVE | Standard benchmark |
+| DR-HAGIS | Pathological domain shift |
+
+The external datasets are never used during training or hyperparameter tuning.
 
 ---
 
+## Installation
+ 
+```bash
+git clone https://github.com/<org>/<repo>.git
+cd <repo>
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+```
+ 
+---
+ 
 ## Usage
-
-All hyperparameters live in [`config.py`](config.py) (`MODEL_CONFIG`).
-
-Run scripts as modules from the repo root with the venv active.
-
+ 
+All hyperparameters live in [`config.py`](config.py) (`MODEL_CONFIG`). Run scripts as modules from the repo root with the virtual environment active.
+ 
 ### 1. Train the seed detector
-
+ 
 ```bash
 python -m scripts.train_seed_detector
 ```
-
+ 
 ### 2. Train the policy (imitation → PPO)
-
+ 
 ```bash
 python -m scripts.train_imitation   # behaviour-cloning warm start
 python -m scripts.train_ppo         # PPO, curriculum
 ```
-
-### 3. Evaluate / test the traced skeletons
-
+ 
+### 3. Evaluate the traced skeletons
+ 
 ```bash
-python -m scripts.run_rl_tracing --eval            # validation split
-python -m scripts.run_rl_tracing --test            # held-out datasets
+python -m scripts.run_rl_tracing --eval   # validation split
+python -m scripts.run_rl_tracing --test   # held-out datasets (DRIVE, DR-HAGIS)
 ```
-
-Outputs land in `results/<run>/RL_tracing_e2e/<split>/` (per-image
-`metrics_e2e.csv`, a summary, and trajectory visualisations).
-
----
-
-## Baselines
-
+ 
+Outputs land in `results/<run>/RL_tracing_e2e/<split>/`: per-image `metrics_e2e.csv`, a summary table, and trajectory visualisations.
+ 
+### Baselines
+ 
 ```bash
-python -m scripts.run_frangi        --eval   # Frangi vesselness + centerline
+python -m scripts.run_frangi        --eval   # Frangi vesselness + centreline
 python -m scripts.run_greedytracer  --eval   # greedy tracer
-python -m scripts.run_cnn           --eval   # centerline U-Net
+python -m scripts.run_cnn           --eval   # supervised centreline U-Net
 ```
 
 ---
 
 ## Evaluation metrics
-
-Results are saved as per-image CSVs and summary tables under `results/`:
-
-- **F1@τ / precision / recall** at τ ∈ {1, 2, 3} px — centerline overlap at a tolerance band (headline = F1@2px).
-- **clDice** — centerline-aware Dice.
-- **Betti-0 error** — connected-component (topology) error, raw and post-processed.
-- **gt_edge_cov80** — fraction of GT edges ≥ 80 % covered (recall of structure).
+ 
+- **F1@τ / precision / recall** at τ ∈ {1, 2, 3} px — centreline overlap within a tolerance band (headline metric: F1@2 px).
+- **clDice** — centreline-aware Dice; the primary metric for vessel connectivity.
+- **Betti-0 error** — connected-component (topology) error, reported raw and post gap-closing.
 - **HD95** — 95th-percentile Hausdorff distance.
+- **IoU** — region overlap (naturally favours thick, area-filling baselines over a one-pixel-wide skeleton).
 
 ---
 
@@ -133,5 +153,13 @@ Final model:
 
 
 ---
+ 
+## Acknowledgements
 
-*This document was created with assistance from AI tools. The content has been reviewed and edited by the project authors.*
+This work was supervised by **Dr. Norman Juchler** and **Fabio Muso** from the **Institute of Computational Life Sciences, ZHAW Wädenswil**.
+
+We would also like to thank **Dr. Rui Santos** from the **Stadtspital Zürich (Augenklinik)** for his valuable clinical input and support throughout the project.
+---
+ 
+*This document was created with assistance from AI tools. Content has been reviewed and edited by the project authors.*
+
