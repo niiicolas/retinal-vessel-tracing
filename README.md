@@ -9,7 +9,7 @@
 This repository contains the official implementation for the Bachelor Thesis: 
 *"Reinforcement Learning for Retinal Vessel Skeletonization: A Policy-Driven Approach"* (ZHAW Wädenswil, 2026).
 
-> **Authors:** Nicolas Fankhauser & Ravidu Nakandalage 
+> **Authors:** Nicolas Fankhauser & Ravidu Nakandalage
 > **Institution:** ZHAW Wädenswil, Institute of Computational Life Sciences
 
 Accurate extraction of retinal vessel centrelines is essential for quantifying vascular morphology associated with systemic diseases like diabetic retinopathy and hypertension. Traditional methods and deep segmentation networks typically produce centrelines via per-pixel classification followed by morphological thinning, offering no explicit connectivity guarantee. 
