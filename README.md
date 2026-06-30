@@ -63,9 +63,9 @@ This repository implements a **Reinforcement Learning (RL) framework** that trea
 
 ```
 
-## Data
+## Datasets
 
-Training and validation:
+Training and validation sets are sourced from publicly available retinal fundus databases:
 
 | Dataset |
 |-|
@@ -82,7 +82,7 @@ External evaluation:
 | DRIVE | Standard benchmark |
 | DR-HAGIS | Pathological domain shift |
 
-The external datasets are never used during training or hyperparameter tuning.
+> **Note:** All datasets are publicly available for research purposes. The external datasets (DRIVE and DR-HAGIS) are strictly held-out and were never used during training or hyperparameter tuning to ensure robust evaluation.
 
 ---
 
