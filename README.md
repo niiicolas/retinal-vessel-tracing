@@ -159,6 +159,7 @@ Final model:
 This work was supervised by **Dr. Norman Juchler** and **Fabio Muso** from the **Institute of Computational Life Sciences, ZHAW Wädenswil**.
 
 We would also like to thank **Dr. Rui Santos** from the **Stadtspital Zürich (Augenklinik)** for his valuable clinical input and support throughout the project.
+
 ---
  
 *This document was created with assistance from AI tools. Content has been reviewed and edited by the project authors.*
