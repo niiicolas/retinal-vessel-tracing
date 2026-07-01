@@ -20,7 +20,7 @@ This repository implements a **Reinforcement Learning (RL) framework** that trea
 
 ## Overview
 
-### Pipeline at a glance
+### Pipeline
 
 ![Pipeline](pipeline.png)
 
